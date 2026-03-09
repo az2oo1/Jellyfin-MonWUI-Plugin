@@ -15,6 +15,8 @@ const TOKEN_STORE_PREFIX = "jf_profile_tokens_v1::";
 const TOKEN_STORE_REV_KEY = "jf_profile_tokens_rev::";
 const AUTOOPEN_FLAG = "jf_profileChooser_autoopened";
 const LAST_PICK_KEY = "jf_profileChooser_lastUser";
+const LAST_ACTIVE_KEY_PREFIX = "jf_profileChooser_lastActive::";
+const AUTOOPEN_INACTIVITY_MS = 6 * 60 * 60 * 1000;
 
 let headerHideMo = null;
 
@@ -104,6 +106,22 @@ function tokenStoreRevKey() {
   return TOKEN_STORE_REV_KEY + getServerIdentity();
 }
 
+function lastActiveKey() {
+  return LAST_ACTIVE_KEY_PREFIX + getServerIdentity();
+}
+
+function readLastActiveTs() {
+  try {
+    return parseInt(localStorage.getItem(lastActiveKey()) || "0", 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeLastActiveTs(ts = Date.now()) {
+  try { localStorage.setItem(lastActiveKey(), String(ts)); } catch {}
+}
+
 function bumpTokenStoreRev() {
   try {
     const k = tokenStoreRevKey();
@@ -149,6 +167,15 @@ function getRememberedToken(userId) {
   const store = readTokenStore();
   const rec = store?.[userId] || null;
   return rec?.accessToken ? rec : null;
+}
+
+function hasRememberedQuickLogin() {
+  try {
+    const store = readTokenStore();
+    return Object.values(store || {}).some(rec => !!String(rec?.accessToken || "").trim());
+  } catch {
+    return false;
+  }
 }
 
 function forgetRememberedToken(userId) {
@@ -368,6 +395,33 @@ async function fetchUserByIdAuthed(userId, { signal } = {}) {
   const res = await fetchWithTimeout(url, { headers, signal, credentials: "same-origin" }, 7000);
   if (!res.ok) return null;
   return await res.json().catch(() => null);
+}
+
+async function fetchSessionsAuthed({ signal } = {}) {
+  try {
+    const ac = window.ApiClient || window.apiClient || null;
+    if (ac && typeof ac.getSessions === "function") {
+      const data = await ac.getSessions().catch(() => null);
+      if (Array.isArray(data)) return data;
+      const filtered = await ac.getSessions({ ControllableByUserId: "" }).catch(() => null);
+      if (Array.isArray(filtered)) return filtered;
+    }
+  } catch {}
+
+  const url = withServer("/Sessions");
+  const headers = { Accept: "application/json" };
+  try {
+    const ah = getAuthHeader?.();
+    if (ah) headers["X-Emby-Authorization"] = ah;
+  } catch {}
+  try {
+    const res = await fetchWithTimeout(url, { headers, signal, credentials: "same-origin" }, 7000);
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => null);
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
 }
 
 function goToMyPreferencesMenu() {
@@ -672,6 +726,7 @@ export function initProfileChooser(options = {}) {
   ensureLegacyHeaderUserButtonHidden();
 
   const autoOpen = options.autoOpen ?? (cfg.profileChooserAutoOpen !== false);
+  const autoOpenRequireQuickLogin = cfg.profileChooserAutoOpenRequireQuickLogin !== false;
   const rememberTokens = cfg.profileChooserRememberTokens !== false;
 
   let overlay = null;
@@ -681,6 +736,17 @@ export function initProfileChooser(options = {}) {
   let currentUserId = "";
   let currentUserName = "";
   let refreshInFlight = null;
+  const presenceByUserId = new Map();
+  let overlayPresenceTimer = null;
+
+  function presenceScore(p) {
+    if (!p) return 0;
+    if (p.isPlaying) return 4;
+    if (p.isPaused) return 3;
+    if (p.title) return 2;
+    if (p.online) return 1;
+    return 0;
+  }
 
   const state = {
     mode: "grid",
@@ -723,6 +789,8 @@ export function initProfileChooser(options = {}) {
 
   const close = () => {
     if (!overlay) return;
+    try { clearInterval(overlayPresenceTimer); } catch {}
+    overlayPresenceTimer = null;
 
     try { window.removeEventListener("keydown", onKeydown); } catch {}
     try { overlay.removeEventListener("click", onOverlayClick); } catch {}
@@ -796,6 +864,44 @@ export function initProfileChooser(options = {}) {
         }];
       }
 
+      presenceByUserId.clear();
+      try {
+        const ready = (typeof isAuthReadyStrict === "function" ? isAuthReadyStrict() : false);
+        if (ready) {
+          const sessions = await fetchSessionsAuthed().catch(() => []);
+          for (const s of (Array.isArray(sessions) ? sessions : [])) {
+            const sid = String(s?.UserId || "").trim();
+            if (!sid) continue;
+            const nowPlaying = s?.NowPlayingItem || null;
+            const isPaused = !!s?.PlayState?.IsPaused;
+            const isPlaying = !!(nowPlaying && !isPaused);
+            const mediaType = String(nowPlaying?.MediaType || "").trim().toLowerCase();
+            const itemType = String(nowPlaying?.Type || "").trim().toLowerCase();
+            const isAudio = mediaType === "audio" || itemType === "audio";
+            const series = String(nowPlaying?.SeriesName || "").trim();
+            const name = String(nowPlaying?.Name || "").trim();
+            const original = String(nowPlaying?.OriginalTitle || "").trim();
+            const album = String(nowPlaying?.Album || "").trim();
+            const title = [series, name, original, album].filter(Boolean)[0] || "";
+            const next = {
+              online: true,
+              isPlaying,
+              isPaused: !!(nowPlaying && isPaused),
+              isAudio,
+              title: String(title).trim(),
+            };
+
+            const prev = presenceByUserId.get(sid) || null;
+            if (!prev || presenceScore(next) >= presenceScore(prev)) {
+              presenceByUserId.set(sid, next);
+            } else if (prev.online !== true) {
+              prev.online = true;
+              presenceByUserId.set(sid, prev);
+            }
+          }
+        }
+      } catch {}
+
       if (rememberTokens && currentUserId && currentUserName) {
         try {
           const store = readTokenStore();
@@ -827,6 +933,13 @@ export function initProfileChooser(options = {}) {
       const name = u.Name;
       const isCurrent = currentUserId && id === currentUserId;
       const remembered = !!store?.[id]?.accessToken;
+      const presence = presenceByUserId.get(id) || null;
+      const isOnline = !!presence?.online;
+      const isPlaying = !!presence?.isPlaying;
+      const isPaused = !!presence?.isPaused;
+      const isAudio = !!presence?.isAudio;
+      const statusTitle = String(presence?.title || "").trim();
+      const showPlayback = !!(statusTitle || isPlaying || isPaused);
 
       const tag = store?.[id]?.primaryImageTag || u.PrimaryImageTag || "";
       const avatar = userAvatarUrl({ Id: id, PrimaryImageTag: tag }, 240);
@@ -844,6 +957,12 @@ export function initProfileChooser(options = {}) {
           <div class="jf-profile-name">${escapeHtml(name)}</div>
 
           <div class="jf-profile-badges">
+            ${isOnline ? `
+              <span class="jf-profile-badge-active jfpc-chip">
+                <span class="jf-profile-dot-online" aria-hidden="true"></span>
+                ${escapeHtml(L("cevrimici", "Çevrimiçi"))}
+              </span>
+            ` : ``}
             ${remembered ? `
               <span class="jf-profile-badge jfpc-chip">${escapeHtml(L("hizli", "Hızlı"))}</span>
               <span
@@ -857,6 +976,16 @@ export function initProfileChooser(options = {}) {
               >✕ </span>
             ` : ``}
           </div>
+          ${showPlayback ? `
+            <div class="jf-profile-now-playing" title="${escapeHtml(statusTitle || "")}">
+              ${escapeHtml(
+                isPaused
+                  ? L("duraklatildi", "Duraklatıldı")
+                  : (isAudio ? L("dinliyor", "Dinliyor") : L("izliyor", "İzliyor"))
+              )}
+              ${statusTitle ? `: ${escapeHtml(statusTitle)}` : ""}
+            </div>
+          ` : ``}
         </button>
       `;
     }).join("");
@@ -1068,6 +1197,15 @@ export function initProfileChooser(options = {}) {
     await syncCurrentUserAvatarTagOnce().catch(() => {});
     showGrid();
 
+    try { clearInterval(overlayPresenceTimer); } catch {}
+    overlayPresenceTimer = setInterval(async () => {
+      try {
+        if (!overlay || state.mode !== "grid") return;
+        await refreshUsers().catch(() => {});
+        renderGridOnce();
+      } catch {}
+    }, 15000);
+
     (async () => {
       try {
         if (!overlay) return;
@@ -1089,14 +1227,28 @@ export function initProfileChooser(options = {}) {
   cleanupHeader = installHeaderButton(open, L, { isOverlayOpen });
 
   const onHashSync = () => { syncCurrentUserAvatarTagOnce().catch(() => {}); };
-  const onFocusSync = () => { syncCurrentUserAvatarTagOnce().catch(() => {}); };
-  const onVisSync = () => {
-    try { if (!document.hidden) syncCurrentUserAvatarTagOnce().catch(() => {}); } catch {}
+  const onFocusSync = () => {
+    writeLastActiveTs();
+    syncCurrentUserAvatarTagOnce().catch(() => {});
   };
+  const onVisSync = () => {
+    try {
+      if (!document.hidden) {
+        writeLastActiveTs();
+        syncCurrentUserAvatarTagOnce().catch(() => {});
+      }
+    } catch {}
+  };
+
+  const markActive = rafThrottle(() => writeLastActiveTs());
 
   window.addEventListener("hashchange", onHashSync);
   window.addEventListener("focus", onFocusSync);
   document.addEventListener("visibilitychange", onVisSync);
+  window.addEventListener("pointerdown", markActive, { passive: true });
+  window.addEventListener("keydown", markActive);
+  window.addEventListener("mousemove", markActive, { passive: true });
+  window.addEventListener("scroll", markActive, { passive: true });
 
   const avatarSyncInterval = setInterval(() => {
     syncCurrentUserAvatarTagOnce().catch(() => {});
@@ -1107,7 +1259,10 @@ export function initProfileChooser(options = {}) {
   if (autoOpen) {
     try {
       const already = sessionStorage.getItem(AUTOOPEN_FLAG) === "1";
-      if (!already) {
+      const lastActive = readLastActiveTs();
+      const inactiveLongEnough = !lastActive || (Date.now() - lastActive) >= AUTOOPEN_INACTIVITY_MS;
+      const quickLoginReady = !autoOpenRequireQuickLogin || hasRememberedQuickLogin();
+      if (!already && inactiveLongEnough && quickLoginReady) {
         const authReadyNow = (typeof isAuthReadyStrict === "function" ? isAuthReadyStrict() : false);
         if (authReadyNow) {
           try { sessionStorage.setItem(AUTOOPEN_FLAG, "1"); } catch {}
@@ -1125,6 +1280,8 @@ export function initProfileChooser(options = {}) {
       }
     } catch {}
   }
+
+  writeLastActiveTs();
 
   const onStorage = timeoutThrottle((e) => {
     if (!e) return;
@@ -1145,7 +1302,12 @@ export function initProfileChooser(options = {}) {
     try { window.removeEventListener("hashchange", onHashSync); } catch {}
     try { window.removeEventListener("focus", onFocusSync); } catch {}
     try { document.removeEventListener("visibilitychange", onVisSync); } catch {}
+    try { window.removeEventListener("pointerdown", markActive); } catch {}
+    try { window.removeEventListener("keydown", markActive); } catch {}
+    try { window.removeEventListener("mousemove", markActive); } catch {}
+    try { window.removeEventListener("scroll", markActive); } catch {}
     try { clearInterval(avatarSyncInterval); } catch {}
+    try { clearInterval(overlayPresenceTimer); } catch {}
     try { cleanupHeader?.(); } catch {}
     try { window.removeEventListener("keydown", onKeydown); } catch {}
     try { cleanupLegacyHeaderUserButtonHidden(); } catch {}

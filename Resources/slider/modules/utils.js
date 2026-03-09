@@ -219,7 +219,6 @@ export function ensureJmsDetailsOverlay({
     position: "absolute",
     left: "clamp(10px, 1vw, 22px)",
     bottom: "clamp(10px, 1vw, 22px)",
-    zIndex: "999999",
     pointerEvents: "none",
     display: "flex",
     gap: "10px",
@@ -250,9 +249,7 @@ export function ensureJmsDetailsOverlay({
     borderRadius: "50%",
     padding: "16px",
     border: "2px solid rgba(255,255,255,0.25)",
-    background: "rgba(15,23,42,.62)",
-    backdropFilter: "blur(12px)",
-    WebkitBackdropFilter: "blur(12px)",
+    background: "rgba(15,23,42)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -301,9 +298,7 @@ export function ensureJmsDetailsOverlay({
       borderRadius: "50%",
       padding: "16px",
       border: "2px solid rgba(255,255,255,0.25)",
-      background: "rgba(15,23,42,.62)",
-      backdropFilter: "blur(12px)",
-      WebkitBackdropFilter: "blur(12px)",
+      background: "rgba(15,23,42)",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -343,7 +338,17 @@ export function ensureJmsDetailsOverlay({
   return wrap;
 }
 
-export function createTrailerIframe({ config, RemoteTrailers, slide, backdropImg, itemId, serverId, detailsUrl, detailsText }) {
+export function createTrailerIframe({
+  config,
+  RemoteTrailers,
+  slide,
+  backdropImg,
+  itemId,
+  serverId,
+  detailsUrl,
+  detailsText,
+  showDetailsOverlay = true,
+}) {
   if (config?.disableAllPlayback === true) {
     try {
       slide?.classList.remove("video-active", "intro-active", "trailer-active");
@@ -364,6 +369,7 @@ export function createTrailerIframe({ config, RemoteTrailers, slide, backdropImg
   let arrowIntervalId = null;
 
   function ensureDetailsOverlay() {
+    if (!showDetailsOverlay) return null;
     if (!_detailsHref || !slide) return null;
     const wrap = ensureJmsDetailsOverlay({
       hostEl: slide,
@@ -458,15 +464,7 @@ export function createTrailerIframe({ config, RemoteTrailers, slide, backdropImg
 
   const videoContainer = document.createElement("div");
   videoContainer.className = "intro-video-container";
-  Object.assign(videoContainer.style, {
-    width: "70%",
-    height: "100%",
-    border: "none",
-    display: "none",
-    position: "absolute",
-    top: "0%",
-    right: "0%",
-  });
+  videoContainer.style.display = "none";
 
   const videoElement = document.createElement("video");
   videoElement.controls = true;
@@ -508,6 +506,46 @@ function clearPreviewPlaybackFlag() {
   let abortController = new AbortController();
   let enterTimeout = null;
   let detachGuards = null;
+  let ytRevealTimer = null;
+  let videoHideTimer = null;
+
+  const clearYtRevealTimer = () => {
+    if (!ytRevealTimer) return;
+    clearTimeout(ytRevealTimer);
+    ytRevealTimer = null;
+  };
+
+  const clearVideoHideTimer = () => {
+    if (!videoHideTimer) return;
+    clearTimeout(videoHideTimer);
+    videoHideTimer = null;
+  };
+
+  const showBackdrop = () => {
+    try {
+      if (backdropImg) backdropImg.style.opacity = "1";
+    } catch {}
+  };
+
+  const hideBackdrop = () => {
+    try {
+      if (backdropImg) backdropImg.style.opacity = "0";
+    } catch {}
+  };
+
+  videoElement.addEventListener("ended", () => {
+    clearVideoHideTimer();
+    clearPreviewPlaybackFlag();
+    try { videoElement.style.opacity = "0"; } catch {}
+    showBackdrop();
+    slide.classList.remove("video-active", "intro-active", "trailer-active");
+    setTimeout(() => {
+      try {
+        if (videoElement.ended || videoElement.paused) videoContainer.style.display = "none";
+      } catch {}
+    }, 200);
+    playingKind = null;
+  });
 
   const _detailsCache = new Map();
 
@@ -580,23 +618,38 @@ function clearPreviewPlaybackFlag() {
     }
   };
 
-  const hardStopVideo = () => {
+  const hardStopVideo = ({ immediate = false } = {}) => {
     clearPreviewPlaybackFlag();
-    try {
-      videoElement.pause();
-    } catch {}
-    destroyHlsIfAny();
-    try {
-      videoElement.removeAttribute("src");
-      videoElement.load();
-    } catch {}
-    videoContainer.style.display = "none";
-    videoElement.style.opacity = "0";
-    slide.classList.remove("video-active", "intro-active", "trailer-active");
+    clearVideoHideTimer();
+    try { videoElement.pause(); } catch {}
+
+    const finalize = () => {
+      destroyHlsIfAny();
+      try {
+        videoElement.removeAttribute("src");
+        videoElement.load();
+      } catch {}
+      videoContainer.style.display = "none";
+      videoElement.style.opacity = "0";
+      slide.classList.remove("video-active", "intro-active", "trailer-active");
+    };
+
+    const shouldFadeOut = !immediate && videoContainer.style.display !== "none";
+    if (!shouldFadeOut) {
+      finalize();
+      return;
+    }
+
+    try { videoElement.style.opacity = "0"; } catch {}
+    videoHideTimer = setTimeout(() => {
+      videoHideTimer = null;
+      finalize();
+    }, 220);
   };
 
   const hardStopIframe = () => {
     clearPreviewPlaybackFlag();
+    clearYtRevealTimer();
     if (ytIframe) {
       try { stopYoutube(ytIframe); } catch {}
       try { ytIframe.src = "about:blank"; } catch {}
@@ -609,11 +662,9 @@ function clearPreviewPlaybackFlag() {
   const fullCleanup = () => {
     clearPreviewPlaybackFlag();
     hideDetailsOverlay();
-    hardStopVideo();
+    showBackdrop();
+    hardStopVideo({ immediate: false });
     hardStopIframe();
-    try {
-      if (backdropImg) backdropImg.style.opacity = "1";
-    } catch {}
     if (arrowIntervalId) { clearInterval(arrowIntervalId); arrowIntervalId = null; }
     playingKind = null;
   };
@@ -655,6 +706,7 @@ function clearPreviewPlaybackFlag() {
           .play()
           .then(() => {
             videoElement.style.opacity = "1";
+            hideBackdrop();
           })
           .catch(() => {});
       });
@@ -676,6 +728,7 @@ function clearPreviewPlaybackFlag() {
           .play()
           .then(() => {
             videoElement.style.opacity = "1";
+            hideBackdrop();
           })
           .catch(() => {});
       };
@@ -692,8 +745,8 @@ function clearPreviewPlaybackFlag() {
     if (!best?.Id) return false;
 
     if (!isActiveSlide()) return false;
-    if (backdropImg) backdropImg.style.opacity = "0";
     hardStopIframe();
+    clearVideoHideTimer();
     videoContainer.style.display = "block";
     showDetailsOverlay();
     slide.classList.add("video-active", "intro-active", "trailer-active");
@@ -711,8 +764,7 @@ function clearPreviewPlaybackFlag() {
     const url = getYoutubeEmbedUrl(trailer.Url);
     if (!isValidUrl(url) || !isActiveSlide()) return false;
 
-    if (backdropImg) backdropImg.style.opacity = "0";
-    hardStopVideo();
+    hardStopVideo({ immediate: true });
 
     if (!ytIframe) {
       ytIframe = document.createElement("iframe");
@@ -737,6 +789,17 @@ function clearPreviewPlaybackFlag() {
     }
 
     if (!isActiveSlide()) return false;
+    clearYtRevealTimer();
+    ytIframe.onload = () => {
+      clearYtRevealTimer();
+      if (!isMouseOver || !isActiveSlide()) return;
+      hideBackdrop();
+    };
+    ytRevealTimer = setTimeout(() => {
+      ytRevealTimer = null;
+      if (!isMouseOver || !isActiveSlide()) return;
+      hideBackdrop();
+    }, 900);
     ytIframe.style.display = "block";
     ytIframe.src = url;
     showDetailsOverlay();
@@ -748,8 +811,8 @@ function clearPreviewPlaybackFlag() {
 
   async function playMainVideo(hoverId) {
     if (!isActiveSlide()) return false;
-    if (backdropImg) backdropImg.style.opacity = "0";
     hardStopIframe();
+    clearVideoHideTimer();
     videoContainer.style.display = "block";
     showDetailsOverlay();
     slide.classList.add("video-active", "intro-active", "trailer-active");
@@ -977,6 +1040,58 @@ function clearPreviewPlaybackFlag() {
 }
 
 const _bestBackdropCache = new Map();
+const BEST_BACKDROP_STORE_KEY = "jms_best_backdrop_idx_v1";
+let _bestBackdropStore = null;
+
+function getBackdropSignature(details) {
+  const tags = Array.isArray(details?.BackdropImageTags) ? details.BackdropImageTags : [];
+  return tags.join("|");
+}
+
+function loadBestBackdropStore() {
+  if (_bestBackdropStore) return _bestBackdropStore;
+  try {
+    const raw = localStorage.getItem(BEST_BACKDROP_STORE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    _bestBackdropStore = (parsed && typeof parsed === "object") ? parsed : {};
+  } catch {
+    _bestBackdropStore = {};
+  }
+  return _bestBackdropStore;
+}
+
+function saveBestBackdropStore(store) {
+  try {
+    const entries = Object.entries(store || {});
+    const MAX = 2000;
+    if (entries.length > MAX) {
+      entries.sort((a, b) => (Number(a[1]?.ts) || 0) - (Number(b[1]?.ts) || 0));
+      const trimmed = Object.fromEntries(entries.slice(entries.length - MAX));
+      _bestBackdropStore = trimmed;
+    } else {
+      _bestBackdropStore = store || {};
+    }
+    localStorage.setItem(BEST_BACKDROP_STORE_KEY, JSON.stringify(_bestBackdropStore));
+  } catch {}
+}
+
+function readBestBackdropFromStore(itemId, signature = "") {
+  if (!itemId) return null;
+  const store = loadBestBackdropStore();
+  const rec = store?.[itemId];
+  if (!rec) return null;
+  if (signature && rec.sig !== signature) return null;
+  const idx = rec.idx;
+  if (idx == null) return null;
+  return String(idx);
+}
+
+function writeBestBackdropToStore(itemId, signature = "", idx = "0") {
+  if (!itemId) return;
+  const store = loadBestBackdropStore();
+  store[itemId] = { idx: String(idx), sig: signature || "", ts: Date.now() };
+  saveBestBackdropStore(store);
+}
 
 export function ensureImagePreconnect() {
   let host = "";
@@ -1047,19 +1162,38 @@ export function buildBackdropResponsive(item, index = "0", cfg = getConfig()) {
    return { src, srcset, sizes: "100vw" };
  }
 
-export async function getHighestQualityBackdropIndex(itemId, { signal } = {}) {
+export async function getHighestQualityBackdropIndex(itemId, { signal, itemDetails = null } = {}) {
   const cfg = getConfig();
   if (cfg.indexZeroSelection) return "0";
+  if (cfg.manualBackdropSelection) return "0";
   if (_bestBackdropCache.has(itemId)) return _bestBackdropCache.get(itemId);
-  let details;
-  try {
-    details = await fetchItemDetails(itemId, { signal });
-  } catch {
-    return "0";
+
+  let details = itemDetails;
+  const hasBackdropTags = Array.isArray(details?.BackdropImageTags);
+  if (!hasBackdropTags) {
+    try {
+      details = await fetchItemDetails(itemId, { signal });
+    } catch {
+      return "0";
+    }
   }
+
   const tags = details?.BackdropImageTags || [];
   if (!tags.length) return "0";
-  if (cfg.manualBackdropSelection) return "0";
+  const signature = getBackdropSignature(details);
+
+  const persisted = readBestBackdropFromStore(itemId, signature);
+  if (persisted != null) {
+    _bestBackdropCache.set(itemId, persisted);
+    return persisted;
+  }
+
+  if (tags.length <= 1) {
+    _bestBackdropCache.set(itemId, "0");
+    writeBestBackdropToStore(itemId, signature, "0");
+    return "0";
+  }
+
   const maxProbe = Number(cfg.limit ?? 6);
   const idxList = Array.from({ length: Math.min(maxProbe, tags.length) }, (_, i) => String(i));
   const results = [];
@@ -1077,7 +1211,11 @@ export async function getHighestQualityBackdropIndex(itemId, { signal } = {}) {
     );
   }
 
-  if (!results.length) return "0";
+  if (!results.length) {
+    _bestBackdropCache.set(itemId, "0");
+    writeBestBackdropToStore(itemId, signature, "0");
+    return "0";
+  }
   const useSizeFilter = Boolean(cfg.enableImageSizeFilter ?? false);
   const minKB = Number(cfg.minImageSizeKB ?? 800);
   const maxKB = Number(cfg.maxImageSizeKB ?? 1500);
@@ -1096,6 +1234,7 @@ export async function getHighestQualityBackdropIndex(itemId, { signal } = {}) {
 
   const chosen = best?.index ?? "0";
   _bestBackdropCache.set(itemId, chosen);
+  writeBestBackdropToStore(itemId, signature, chosen);
   return chosen;
 }
 

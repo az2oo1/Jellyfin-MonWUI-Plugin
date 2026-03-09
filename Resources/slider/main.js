@@ -5,28 +5,30 @@ import { getCurrentIndex, setCurrentIndex } from "./modules/sliderState.js";
 import { startSlideTimer, stopSlideTimer, pauseSlideTimer, resumeSlideTimer } from "./modules/timer.js";
 import { ensureProgressBarExists, resetProgressBar, pauseProgressBar, resumeProgressBar } from "./modules/progressBar.js";
 import { createSlide } from "./modules/slideCreator.js";
-import { changeSlide, createDotNavigation, primePeakFirstPaint, updatePeakClasses } from "./modules/navigation.js";
+import { changeSlide, createDotNavigation, primePeakFirstPaint, schedulePeakStructureSync, updatePeakClasses } from "./modules/navigation.js";
 import { attachMouseEvents } from "./modules/events.js";
 import { fetchItemDetails as fetchItemDetailsNet, getSessionInfo, getAuthHeader, waitForAuthReadyStrict, isAuthReadyStrict } from "./modules/api.js";
 import { cachedFetchJson, cachedFetchText, createCachedItemDetailsFetcher, startLibraryDeltaWatcher } from "./modules/sliderCache.js";
 import { forceHomeSectionsTop, forceSkinHeaderPointerEvents } from "./modules/positionOverrides.js";
 import { setupPauseScreen } from "./modules/pauseModul.js";
-import { updateHeaderUserAvatar, initAvatarSystem } from "./modules/userAvatar.js";
+import { initAvatarSystem } from "./modules/userAvatar.js";
 import { initializeQualityBadges, primeQualityFromItems, annotateDomWithQualityHints } from "./modules/qualityBadges.js";
 import { initNotifications, forcejfNotifBtnPointerEvents } from "./modules/notifications.js";
 import { startUpdatePolling } from "./modules/update.js";
 import { ensureStudioHubsMounted } from "./modules/studioHubs.js";
 import { updateSlidePosition } from "./modules/positionUtils.js";
 import { renderPersonalRecommendations } from "./modules/personalRecommendations.js";
-import { mountDirectorRowsLazy } from "./modules/directorRows.js";
+import { mountDirectorRowsLazy, warmDirectorRowsDb } from "./modules/directorRows.js";
 import { setupHoverForAllItems  } from "./modules/hoverTrailerModal.js";
 import { teardownAnimations } from "./modules/animations.js";
 import { mountRecentRowsLazy, cleanupRecentRows } from "./modules/recentRows.js";
 import { withServer } from "./modules/jfUrl.js";
 import { initUserProfileAvatarPicker } from "./modules/avatarPicker.js";
 import { startGlobalDbFullscanScheduler } from "./modules/player/ui/artistModal.js";
-import { startBackgroundCollectionIndexer } from "./modules/collectionIndexer.js";
-import { initProfileChooser } from "./modules/profileChooser.js"
+import { startBackgroundCollectionIndexer, getBackgroundCollectionIndexerStatus } from "./modules/collectionIndexer.js";
+import { initProfileChooser } from "./modules/profileChooser.js";
+import { initSubtitleCustomizer } from "./modules/subtitleCustomizer.js";
+import { initOsdHeaderRatings } from "./modules/osdHeaderRatings.js";
 
 const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 0));
 
@@ -141,6 +143,38 @@ window.__cycleStartAt = 0;
 window.__cycleArmTimeout = null;
 window.__cycleExpired = window.__cycleExpired || false;
 window.__peakBooting = true;
+window.__jmsFirstSlideReady = window.__jmsFirstSlideReady || false;
+window.__jmsNonCriticalBooted = window.__jmsNonCriticalBooted || false;
+window.__jmsNotificationsBooted = window.__jmsNotificationsBooted || false;
+window.__jmsMusicSchedulerBooted = window.__jmsMusicSchedulerBooted || false;
+
+function markFirstSlideReady() {
+  if (window.__jmsFirstSlideReady) return;
+  window.__jmsFirstSlideReady = true;
+  try {
+    document.dispatchEvent(new CustomEvent("jms:first-slide-ready"));
+  } catch {}
+}
+
+function whenFirstSlideReadyOrTimeout(cb, timeoutMs = 7000) {
+  let done = false;
+  let to = null;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    try { clearTimeout(to); } catch {}
+    try { document.removeEventListener("jms:first-slide-ready", onReady); } catch {}
+    try { cb(); } catch {}
+  };
+  const onReady = () => finish();
+
+  if (window.__jmsFirstSlideReady) {
+    finish();
+    return;
+  }
+  document.addEventListener("jms:first-slide-ready", onReady, { once: true });
+  to = setTimeout(finish, Math.max(1000, timeoutMs | 0));
+}
 
 (function earlyCssBoot(){
   const D = document;
@@ -206,12 +240,14 @@ window.__peakBooting = true;
   addCSS('/slider/src/studioHubsMini.css', 'jms-css-studioHubsMini');
   addCSS('/slider/src/avatarPicker.css', 'jms-css-avatarPicker');
   addCSS('/slider/src/profileChooser.css', 'jms-css-profileChooser');
+  addCSS('/slider/src/subtitleCustomizer.css', 'jms-css-subtitleCustomizer');
 
   const vmap = {
     peakslider: '/slider/src/peakslider.css',
     fullslider: '/slider/src/fullslider.css',
     normalslider: '/slider/src/normalslider.css',
-    slider: '/slider/src/slider.css'
+    slider: '/slider/src/slider.css',
+    auroraslider: '/slider/src/auroraSlider.css'
   };
   addCSS(vmap[variant] || vmap.normalslider, 'jms-css-variant');
 
@@ -486,6 +522,24 @@ function uniqueByIdStable(arr) {
   return out;
 }
 
+async function mapLimit(arr, limit, mapper) {
+  const list = Array.isArray(arr) ? arr : [];
+  const out = new Array(list.length);
+  let i = 0;
+  const workers = new Array(Math.max(1, limit | 0)).fill(0).map(async () => {
+    while (i < list.length) {
+      const idx = i++;
+      try {
+        out[idx] = await mapper(list[idx], idx);
+      } catch {
+        out[idx] = null;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 function setupGlobalModalInit() {
   setupHoverForAllItems();
   idle(() => {
@@ -497,24 +551,84 @@ function setupGlobalModalInit() {
 const cleanupModalObserver = setupGlobalModalInit();
 window.cleanupModalObserver = cleanupModalObserver;
 
+function runNonCriticalUiBootOnce() {
+  if (window.__jmsNonCriticalBooted) return;
+  window.__jmsNonCriticalBooted = true;
+
+  whenFirstSlideReadyOrTimeout(() => {
+    idle(() => {
+      try {
+        if (!window.cleanupProfileChooser) {
+          window.cleanupProfileChooser = initProfileChooser();
+        }
+      } catch {}
+
+      try {
+        if (!window.cleanupAvatarSystem) {
+          window.cleanupAvatarSystem = initAvatarSystem();
+        }
+      } catch {}
+
+      try {
+        if (config && config.enableNotifications) {
+          if (!window.__jmsNotificationsBooted) {
+            window.__jmsNotificationsBooted = true;
+            initNotifications();
+          }
+        } else {
+          document.getElementById("jfNotifBtn")?.remove();
+          document.getElementById("jfNotifModal")?.remove();
+          document.querySelector(".jf-notif-panel")?.remove();
+          document.documentElement.dataset.jmsNotif = "0";
+        }
+      } catch {}
+
+      if (config.enableQualityBadges && !window.__qualityBadgesBooted) {
+        window.__qualityBadgesBooted = true;
+        try { window.cleanupQualityBadges = initializeQualityBadges(); } catch {}
+      }
+
+      try {
+        if (!window.__jmsMusicSchedulerBooted) {
+          window.__jmsMusicSchedulerBooted = true;
+          startGlobalDbFullscanScheduler();
+        }
+      } catch (e) {
+        console.warn("startGlobalDbFullscanScheduler hata:", e);
+      }
+    });
+  }, 7000);
+}
+
 forceSkinHeaderPointerEvents();
 forceHomeSectionsTop();
 const cleanupAvatarPicker = initUserProfileAvatarPicker();
 window.cleanupAvatarPicker = cleanupAvatarPicker;
+const cleanupSubtitleCustomizer = initSubtitleCustomizer();
+window.cleanupSubtitleCustomizer = cleanupSubtitleCustomizer;
+const cleanupOsdHeaderRatings = initOsdHeaderRatings();
+window.cleanupOsdHeaderRatings = cleanupOsdHeaderRatings;
 
 const NOTIF_ENABLED = !!(config && config.enableNotifications);
- forcejfNotifBtnPointerEvents();
- updateHeaderUserAvatar();
- const cleanupProfileChooser = initProfileChooser();
-  window.cleanupProfileChooser = cleanupProfileChooser;
- if (NOTIF_ENABLED) {
-   initNotifications();
- } else {
-   document.getElementById('jfNotifBtn')?.remove();
-   document.getElementById('jfNotifModal')?.remove();
-   document.querySelector('.jf-notif-panel')?.remove();
-   document.documentElement.dataset.jmsNotif = '0';
- }
+forcejfNotifBtnPointerEvents();
+try {
+  if (!window.cleanupProfileChooser) {
+    window.cleanupProfileChooser = initProfileChooser();
+  }
+} catch {}
+
+if (NOTIF_ENABLED) {
+  try {
+    if (!window.__jmsNotificationsBooted) {
+      window.__jmsNotificationsBooted = true;
+      initNotifications();
+    }
+  } catch {}
+}
+
+if (!NOTIF_ENABLED) {
+  document.documentElement.dataset.jmsNotif = "0";
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   if (config.enableQualityBadges && !window.__qualityBadgesBooted) {
@@ -526,6 +640,68 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 window.__recsRebuildTimer = window.__recsRebuildTimer || null;
+window.__dirRowsWarmupRetryTimer = window.__dirRowsWarmupRetryTimer || null;
+window.__dirRowsWarmupInFlight = window.__dirRowsWarmupInFlight || false;
+window.__dirRowsWarmupDone = window.__dirRowsWarmupDone || false;
+window.__jmsIndexerRetryTimer = window.__jmsIndexerRetryTimer || null;
+window.__jmsIndexerRetryInFlight = window.__jmsIndexerRetryInFlight || false;
+
+function scheduleDirectorRowsWarmupRetry(delayMs = 1200) {
+  if (window.__dirRowsWarmupDone) return;
+  if (window.__dirRowsWarmupRetryTimer) return;
+  window.__dirRowsWarmupRetryTimer = setTimeout(() => {
+    window.__dirRowsWarmupRetryTimer = null;
+    kickDirectorRowsWarmup({ force: true });
+  }, Math.max(500, delayMs | 0));
+}
+
+function kickDirectorRowsWarmup({ force = false } = {}) {
+  try {
+    const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
+    if (!cfg.enableDirectorRows || typeof warmDirectorRowsDb !== "function") return;
+    if (window.__dirRowsWarmupDone && !force) return;
+    if (window.__dirRowsWarmupInFlight) return;
+
+    window.__dirRowsWarmupInFlight = true;
+
+    (async () => {
+      let ready = false;
+      let result = null;
+
+      try { ready = await waitAuthWarmupFallback(force ? 12000 : 1500); } catch {}
+      if (ready) {
+        try { result = await warmDirectorRowsDb({ force }); } catch (e) {
+          console.warn("directorRows early warmup hata:", e);
+        }
+      }
+
+      if (result && !result.skipped) {
+        window.__dirRowsWarmupDone = true;
+        if (window.__dirRowsWarmupRetryTimer) {
+          clearTimeout(window.__dirRowsWarmupRetryTimer);
+          window.__dirRowsWarmupRetryTimer = null;
+        }
+      } else {
+        scheduleDirectorRowsWarmupRetry(force ? 1500 : 1000);
+      }
+    })().finally(() => {
+      window.__dirRowsWarmupInFlight = false;
+    });
+  } catch {}
+}
+
+if (!window.__dirRowsWarmupVisBound) {
+  window.__dirRowsWarmupVisBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) kickDirectorRowsWarmup();
+  }, { passive: true });
+  window.addEventListener("pageshow", () => {
+    kickDirectorRowsWarmup();
+  }, { passive: true });
+  window.addEventListener("focus", () => {
+    kickDirectorRowsWarmup();
+  }, { passive: true });
+}
 
 function schedulePersonalRecsReinit(delayMs = 10000) {
   try { clearTimeout(window.__recsRebuildTimer); } catch {}
@@ -574,6 +750,7 @@ function fullSliderReset() {
   cleanupSlider();
   clearCycleArm();
   try { window.__peakBooting = true; } catch {}
+  window.__jmsFirstSlideReady = false;
   window.__cycleStartAt = 0;
   window.__cycleExpired = false;
   window.mySlider = {};
@@ -691,17 +868,6 @@ function hydrateSlideMedia(slide) {
         img.removeAttribute("data-image");
       }
     });
-  const overlay = slide.querySelector(".gradient-overlay");
-  let bg =
-    slide.getAttribute("data-backdrop") ||
-    slide.getAttribute("data-bg") ||
-    slide.getAttribute("data-bg-src") ||
-    overlay?.getAttribute("data-backdrop") ||
-    overlay?.getAttribute("data-bg") ||
-    overlay?.getAttribute("data-bg-src");
-    if (overlay && bg && !overlay.style.backgroundImage) {
-    overlay.style.backgroundImage = `url("${bg}")`;
-  }
   slide.querySelectorAll("[data-backdrop],[data-bg],[data-bg-src]").forEach((el) => {
     const u = el.getAttribute("data-backdrop") || el.getAttribute("data-bg") || el.getAttribute("data-bg-src");
     if (u && !el.style.backgroundImage) el.style.backgroundImage = `url("${u}")`;
@@ -964,10 +1130,22 @@ function restartSlideTimerDeterministic() {
 
 function watchActiveSlideChanges() {
   let lastActive = document.querySelector("#indexPage:not(.hide) .slide.active, #homePage:not(.hide) .slide.active");
+  let resetRafA = 0;
+  let resetRafB = 0;
+
+  const cancelPendingReset = () => {
+    if (resetRafA) cancelAnimationFrame(resetRafA);
+    if (resetRafB) cancelAnimationFrame(resetRafB);
+    resetRafA = 0;
+    resetRafB = 0;
+  };
 
   const hardResetNextFrame = () => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
+    cancelPendingReset();
+    resetRafA = requestAnimationFrame(() => {
+      resetRafA = 0;
+      resetRafB = requestAnimationFrame(() => {
+        resetRafB = 0;
         hardProgressReset();
         restartSlideTimerDeterministic();
         try { warmUpcomingBackdrops(4); } catch {}
@@ -975,18 +1153,22 @@ function watchActiveSlideChanges() {
     });
   };
 
-  const handleChange = () => {
-    const cur = document.querySelector("#indexPage:not(.hide) .slide.active, #homePage:not(.hide) .slide.active");
+  const handleChange = (ev) => {
+    const eventSlide = ev?.target?.closest?.('.slide');
+    const cur = eventSlide?.classList?.contains('active')
+      ? eventSlide
+      : document.querySelector("#indexPage:not(.hide) .slide.active, #homePage:not(.hide) .slide.active");
     if (!cur || cur === lastActive) return;
-    hardResetNextFrame();
-    const curIdx = getSlideIndex(cur);
     lastActive = cur;
+    hardResetNextFrame();
   };
 
-  const mo = new MutationObserver(handleChange);
-  mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
+  document.addEventListener("slideActive", handleChange, true);
   handleChange();
-  return () => mo.disconnect();
+  return () => {
+    cancelPendingReset();
+    document.removeEventListener("slideActive", handleChange, true);
+  };
 }
 
 function warmUpcomingBackdrops(count = 3) {
@@ -1143,6 +1325,7 @@ export async function slidesInit() {
             "DateCreated",
             "ProviderIds",
             "ExternalUrls",
+            "RemoteTrailers",
             "TrailerUrls"
           ].join(",")
         );
@@ -1288,8 +1471,14 @@ export async function slidesInit() {
         }
 
         if (queryString.includes("IncludeItemTypes=Season") || queryString.includes("IncludeItemTypes=Episode")) {
-          const detailedSeasons = await Promise.all(
-            allItems.map(async (item) => {
+          const seasonDetailConcurrency = Math.max(
+            1,
+            Number(config?.seasonDetailFetchConcurrency) || 4
+          );
+          const detailedSeasons = await mapLimit(
+            allItems,
+            seasonDetailConcurrency,
+            async (item) => {
               try {
                 const seasonRes = await safeFetch(`/Users/${userId}/Items/${item.Id}`, { headers: authHeaders });
                 const seasonData = await seasonRes.json();
@@ -1302,7 +1491,7 @@ export async function slidesInit() {
                 console.error("Season detay alınırken hata:", error);
                 return item;
               }
-            })
+            }
           );
           allItems = detailedSeasons.filter((item) => item && item.Id);
         }
@@ -1462,6 +1651,7 @@ export async function slidesInit() {
 
     const first = items[0];
     await createSlide(first);
+    markFirstSlideReady();
     try { annotateDomWithQualityHints(document); } catch {}
     markSlideCreated();
 
@@ -1482,19 +1672,7 @@ export async function slidesInit() {
             markSlideCreated();
             if (config.peakSlider) {
             const idxPage = document.querySelector('#indexPage:not(.hide), #homePage:not(.hide)');
-            const sc = idxPage?.querySelector('#slides-container');
-            const slides = idxPage?.querySelectorAll('.slide');
-            if (sc && slides?.length) {
-            const spanLeft  = Number(config?.peakSpanLeft  ?? 2);
-            const spanRight = Number(config?.peakSpanRight ?? spanLeft);
-            const diagonal  = !!config?.peakDiagonal;
-
-            if (sc.classList.contains('peak-ready')) {
-                updatePeakClasses(slides, getCurrentIndex(), { spanLeft, spanRight, diagonal });
-                } else {
-                primePeakFirstPaint(slides, getCurrentIndex(), sc, { spanLeft, spanRight, diagonal });
-                }
-              }
+            if (idxPage) schedulePeakStructureSync(idxPage);
             }
           } catch (e) {
             console.warn("Arka plan slayt oluşturma hatası:", e);
@@ -1741,6 +1919,7 @@ function setupNavigationObserver() {
 
 function initializeSliderOnHome() {
   try { window.__jmsHomeTabPaused = false; } catch {}
+  try { kickDirectorRowsWarmup(); } catch {}
 
   if (!isSliderEnabled()) {
     try { cleanupSlider(); } catch {}
@@ -1809,8 +1988,13 @@ function initializeSliderOnHome() {
     }
     setTimeout(() => { if (!__recsBooted) onAllReady(); }, 5000);
     document.addEventListener("jms:slide-enter", () => { onAllReady(); }, { once: true });
-
-    Promise.resolve().then(onAllReady);
+    if (window.__jmsFirstSlideReady) {
+      idle(() => onAllReady());
+    } else {
+      document.addEventListener("jms:first-slide-ready", () => {
+        idle(() => onAllReady());
+      }, { once: true });
+    }
   }
 
   if (willEarlyReturn) {
@@ -1920,30 +2104,20 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
       if (window.__JMS_INDEXER_BOOTED__) return;
       window.__JMS_INDEXER_BOOTED__ = true;
 
-      console.log("[JMS][INDEXER] boot requested…");
-
       try { await waitAuthWarmupFallback(5000); } catch {}
-
-      try {
-        const s = getSessionInfo?.();
-        console.log("[JMS][INDEXER] session after auth=", {
-          userId: s?.userId,
-          hasToken: !!s?.accessToken,
-        });
-      } catch (e) {
-        console.warn("[JMS][INDEXER] session read failed:", e);
-      }
 
       try {
         await new Promise(r => setTimeout(r, 2000));
 
-        const ret = startBackgroundCollectionIndexer({
+        const ret = await startBackgroundCollectionIndexer({
           mode: "boxsetFirst",
           aggressive: true,
           boxsetThrottleMs: 120,
         });
-        console.log("[JMS][INDEXER] started ✅ return=", ret);
-        window.__JMS_INDEXER_STARTED__ = true;
+        window.__JMS_INDEXER_STARTED__ = !!ret?.started;
+        if (ret?.started) {
+          markIndexerRunNow();
+        }
       } catch (e) {
         console.error("[JMS][INDEXER] crashed ❌", e);
         window.__JMS_INDEXER_STARTED__ = false;
@@ -1967,55 +2141,102 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
       return !Number.isFinite(last) || last <= 0 || (now - last) >= intervalMs;
     }
 
+    async function getIndexerGateDecision(intervalMs) {
+      const status = await getBackgroundCollectionIndexerStatus?.().catch(() => null);
+      if (status?.dbLikelyEmpty || !status?.doneAt) {
+        return {
+          shouldRun: true,
+          resumePending: true,
+          status,
+        };
+      }
+
+      if (status?.resumePending) {
+        return {
+          shouldRun: true,
+          resumePending: true,
+          status,
+        };
+      }
+
+      return {
+        shouldRun: shouldRunIndexerNow(intervalMs),
+        resumePending: false,
+        status,
+      };
+    }
+
     function markIndexerRunNow() {
       const key = getIndexerGateKey();
       try { localStorage.setItem(key, String(Date.now())); } catch {}
     }
 
+    function scheduleIndexerRetry(delayMs = 2000, reason = "retry") {
+      if (window.__jmsIndexerRetryTimer) return;
+      window.__jmsIndexerRetryTimer = setTimeout(() => {
+        window.__jmsIndexerRetryTimer = null;
+        if (window.__jmsIndexerRetryInFlight) return;
+        window.__jmsIndexerRetryInFlight = true;
+        runIndexerIfDue({ intervalMs: 2 * 60 * 60 * 1000, reason }).finally(() => {
+          window.__jmsIndexerRetryInFlight = false;
+        });
+      }, Math.max(1000, delayMs | 0));
+    }
+
     async function runIndexerIfDue({ intervalMs = 2 * 60 * 60 * 1000, reason = "scheduled" } = {}) {
       try {
-        if (!shouldRunIndexerNow(intervalMs)) {
-          console.log("[JMS][INDEXER] skip (not due) reason=", reason);
+        const gate = await getIndexerGateDecision(intervalMs);
+        if (!gate.shouldRun) {
           return false;
         }
-        markIndexerRunNow();
-
-        console.log("[JMS][INDEXER] due ✅ reason=", reason);
 
         try { await waitAuthWarmupFallback(5000); } catch {}
         await new Promise(r => setTimeout(r, 1500));
 
         try {
-          const ret = startBackgroundCollectionIndexer({
+          const ret = await startBackgroundCollectionIndexer({
             mode: "boxsetFirst",
             aggressive: true,
             boxsetThrottleMs: 120,
           });
-          console.log("[JMS][INDEXER] started ✅ return=", ret);
-          window.__JMS_INDEXER_STARTED__ = true;
-          return true;
+          window.__JMS_INDEXER_STARTED__ = !!ret?.started;
+          if (ret?.started) {
+            if (window.__jmsIndexerRetryTimer) {
+              clearTimeout(window.__jmsIndexerRetryTimer);
+              window.__jmsIndexerRetryTimer = null;
+            }
+            markIndexerRunNow();
+            return true;
+          }
+          if (ret?.reason !== "already-running") {
+            scheduleIndexerRetry(
+              gate.resumePending ? 2000 : 3000,
+              gate.resumePending ? "resume-retry" : "start-retry"
+            );
+          }
+          return false;
         } catch (e) {
           console.error("[JMS][INDEXER] crashed ❌", e);
           window.__JMS_INDEXER_STARTED__ = false;
+          scheduleIndexerRetry(
+            gate.resumePending ? 3000 : 4000,
+            gate.resumePending ? "resume-crash-retry" : "crash-retry"
+          );
           return false;
         }
       } catch (e) {
         console.warn("[JMS][INDEXER] runIndexerIfDue error:", e);
+        scheduleIndexerRetry(3000, "runIndexerIfDue-error");
         return false;
       }
     }
-
-    try {
-      await waitAuthWarmupFallback(1000);
-    } catch {}
-    try {
-      startGlobalDbFullscanScheduler();
-    } catch (e) { console.warn("startGlobalDbFullscanScheduler hata:", e); }
 
     try { window.__jmsBootIndexer = bootIndexerOnce; } catch {}
 
     (function scheduleIndexerStart() {
       const INTERVAL_MS = 2 * 60 * 60 * 1000;
+
+      runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "boot-check" });
 
       const onReady = () => {
         runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "all-slides-ready" });
@@ -2032,6 +2253,19 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
       }, 5 * 60 * 1000);
     })();
 
+    if (!window.__jmsIndexerResumeHooksBound) {
+      window.__jmsIndexerResumeHooksBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) scheduleIndexerRetry(1200, "visible-retry");
+      }, { passive: true });
+      window.addEventListener("focus", () => {
+        scheduleIndexerRetry(1200, "focus-retry");
+      }, { passive: true });
+      window.addEventListener("pageshow", () => {
+        scheduleIndexerRetry(1200, "pageshow-retry");
+      }, { passive: true });
+    }
+
     const fastIndex = document.querySelector("#indexPage:not(.hide), #homePage:not(.hide)");
     if (fastIndex) {
       startPauseOverlayOnce();
@@ -2043,6 +2277,8 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
         stop();
       }, 15000);
     }
+
+    kickDirectorRowsWarmup();
 
     idle(async () => {
       try {
@@ -2056,22 +2292,7 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
           remindEveryMs: 12 * 60 * 60 * 1000,
         });
       } catch {}
-      idle(() => {
-        try {
-          if (config && config.enableNotifications) {
-            initNotifications();
-          } else {
-            document.getElementById('jfNotifBtn')?.remove();
-            document.getElementById('jfNotifModal')?.remove();
-            document.querySelector('.jf-notif-panel')?.remove();
-            document.documentElement.dataset.jmsNotif = '0';
-          }
-        } catch {}
-        if (config.enableQualityBadges && !window.__qualityBadgesBooted) {
-          window.__qualityBadgesBooted = true;
-          try { window.cleanupQualityBadges = initializeQualityBadges(); } catch {}
-        }
-      });
+      runNonCriticalUiBootOnce();
     });
 
     setupNavigationObserver();
@@ -2104,8 +2325,6 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 window.slidesInit = slidesInit;
-const cleanupAvatarSystem = initAvatarSystem();
-window.cleanupAvatarSystem = cleanupAvatarSystem;
 
 (function installCardOverlayFixEverywhere(){
   const KEY = "jms-cardOverlay-after-fix";
@@ -2123,6 +2342,7 @@ window.cleanupAvatarSystem = cleanupAvatarSystem;
   `.trim();
 
   const injectedRoots = new WeakSet();
+  const lockedRows = new WeakSet();
 
   function lockLayoutInlineImportant() {
     try {
@@ -2135,17 +2355,11 @@ window.cleanupAvatarSystem = cleanupAvatarSystem;
       ];
       const nodes = document.querySelectorAll(sels.join(","));
       nodes.forEach((el) => {
+        if (lockedRows.has(el)) return;
         el.style.setProperty("display", "grid", "important");
-        el.style.setProperty("gap", "16px", "important");
-        el.style.setProperty("grid-auto-columns", "minmax(195px,210px)", "important");
-        el.style.setProperty("grid-auto-flow", "column", "important");
-        el.style.setProperty("min-width", "0", "important");
         el.style.setProperty("overflow-x", "auto", "important");
-        el.style.setProperty("width", "100%", "important");
-        el.style.setProperty("-webkit-overflow-scrolling", "touch", "important");
-        el.style.setProperty("box-sizing", "border-box", "important");
-        el.style.setProperty("scroll-snap-type", "x mandatory", "important");
-        el.style.setProperty("scrollbar-width", "none", "important");
+        el.style.setProperty("overflow-y", "hidden", "important");
+        lockedRows.add(el);
       });
     } catch {}
   }
@@ -2165,6 +2379,13 @@ window.cleanupAvatarSystem = cleanupAvatarSystem;
 
     try {
       const doc = root.ownerDocument || document;
+      const host =
+        (root instanceof ShadowRoot)
+          ? root
+          : (doc.head || doc.documentElement);
+      const existing = host.querySelector?.(`style[data-jms="${KEY}"]`);
+      if (existing) return;
+
       const style = doc.createElement("style");
       style.setAttribute("data-jms", KEY);
       style.textContent = CSS;
@@ -2188,9 +2409,15 @@ window.cleanupAvatarSystem = cleanupAvatarSystem;
   scanAndInject();
   lockLayoutInlineImportant();
 
+  let __rafLock = 0;
+  const runPatchPass = () => {
+    __rafLock = 0;
+    scanAndInject();
+    lockLayoutInlineImportant();
+  };
   const mo = new MutationObserver(() => {
-  scanAndInject();
-  lockLayoutInlineImportant();
+    if (__rafLock) return;
+    __rafLock = requestAnimationFrame(runPatchPass);
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 })();

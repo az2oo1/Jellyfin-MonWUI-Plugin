@@ -1,5 +1,5 @@
 import { getConfig } from "../config.js";
-import { createCheckbox, createSection } from "../settings.js";
+import { bindCheckboxKontrol, createCheckbox, createSection } from "../settings.js";
 
 export function createPausePanel(_config, labels) {
   const config = getConfig();
@@ -108,6 +108,46 @@ export function createPausePanel(_config, labels) {
     labels.pauseOverlayMinVideoMinutesDesc
     || 'Bu değerden kısa (dk) videolarda üst-badge ve duraklatma ekranı gösterilmez.';
   section.appendChild(minDurDesc);
+
+  const osdHeaderRatingsHeader = document.createElement('h3');
+  osdHeaderRatingsHeader.className = 'settings-subheader';
+  osdHeaderRatingsHeader.textContent = labels.osdHeaderRatingsHeader || 'OSD Başlık Puanları';
+  section.appendChild(osdHeaderRatingsHeader);
+
+  const showOsdHeaderRatingsCheckbox = createCheckbox(
+    'pauseOverlayShowOsdHeaderRatings',
+    labels.showOsdHeaderRatings || 'OSD başlığındaki puanları göster',
+    config.pauseOverlay?.showOsdHeaderRatings !== false
+  );
+  section.appendChild(showOsdHeaderRatingsCheckbox);
+
+  const osdHeaderRatingsSubOptions = document.createElement('div');
+  osdHeaderRatingsSubOptions.className = 'sub-options pause-osd-header-rating-sub-options';
+  osdHeaderRatingsSubOptions.appendChild(createCheckbox(
+    'pauseOverlayShowOsdHeaderCommunityRating',
+    labels.showCommunityRating || 'Topluluk',
+    config.pauseOverlay?.showOsdHeaderCommunityRating !== false
+  ));
+  osdHeaderRatingsSubOptions.appendChild(createCheckbox(
+    'pauseOverlayShowOsdHeaderCriticRating',
+    labels.showCriticRating || 'Rotten Tomato',
+    config.pauseOverlay?.showOsdHeaderCriticRating !== false
+  ));
+  osdHeaderRatingsSubOptions.appendChild(createCheckbox(
+    'pauseOverlayShowOsdHeaderOfficialRating',
+    labels.showOfficialRating || 'Sertifikasyon',
+    config.pauseOverlay?.showOsdHeaderOfficialRating !== false
+  ));
+  section.appendChild(osdHeaderRatingsSubOptions);
+
+  const osdHeaderRatingsDesc = document.createElement('div');
+  osdHeaderRatingsDesc.className = 'description-text';
+  osdHeaderRatingsDesc.textContent =
+    labels.osdHeaderRatingsDescription ||
+    'Oynatma ekranındaki üst başlıkta, içerik adının yanında görünen puanları kontrol eder.';
+  section.appendChild(osdHeaderRatingsDesc);
+
+  bindCheckboxKontrol('#pauseOverlayShowOsdHeaderRatings', '.pause-osd-header-rating-sub-options');
 
   const ageBadgeHeader = document.createElement('h3');
   ageBadgeHeader.className = 'settings-subheader';

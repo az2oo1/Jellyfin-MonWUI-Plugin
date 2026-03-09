@@ -903,8 +903,19 @@ function setupScroller(row) {
     if (btnL) btnL.setAttribute("aria-disabled", atStart ? "true" : "false");
     if (btnR) btnR.setAttribute("aria-disabled", atEnd   ? "true" : "false");
   };
-  if (btnL) btnL.onclick = () => row.scrollBy({ left: -step(), behavior: "smooth" });
-  if (btnR) btnR.onclick = () => row.scrollBy({ left:  step(), behavior: "smooth" });
+  const blurAfterPointerClick = (btn, e) => {
+    if (!btn) return;
+    if ((e?.detail || 0) <= 0) return;
+    requestAnimationFrame(() => { try { btn.blur(); } catch {} });
+  };
+  if (btnL) btnL.onclick = (e) => {
+    row.scrollBy({ left: -step(), behavior: "smooth" });
+    blurAfterPointerClick(btnL, e);
+  };
+  if (btnR) btnR.onclick = (e) => {
+    row.scrollBy({ left: step(), behavior: "smooth" });
+    blurAfterPointerClick(btnR, e);
+  };
 
   row.addEventListener("scroll", updateButtons, { passive: true });
   const ro = new ResizeObserver(() => updateButtons());

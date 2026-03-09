@@ -14,11 +14,39 @@ let frameLockRaf = null;
 let __pbInited = false;
 let __paused = false;
 let secondsRunId = 0;
+let __pbStartRafA = 0;
+let __pbStartRafB = 0;
 
 function now() { return performance.now(); }
 
 function getSlidesContainer() {
-  return document.querySelector("#indexPage:not(.hide) #slides-container");
+  return document.querySelector(
+    "#indexPage:not(.hide) #slides-container, #homePage:not(.hide) #slides-container, #slides-container"
+  );
+}
+
+function getCurrentSlideHost() {
+  const sc = getSlidesContainer();
+  if (!sc) return null;
+  const active = sc.querySelector(".slide.active");
+  if (active) return active;
+  return null;
+}
+
+function mountSecondsToActiveSlide(el) {
+  if (!el) return;
+  const host = getCurrentSlideHost();
+  if (host && el.parentElement !== host) {
+    host.appendChild(el);
+    return;
+  }
+  if (host) return;
+  if (el.parentElement) return;
+
+  const sc = getSlidesContainer();
+  if (sc && el.parentElement !== sc) {
+    sc.appendChild(el);
+  }
 }
 
 export function useSecondsMode() {
@@ -33,17 +61,44 @@ function clearRaf() {
   }
 }
 
-function frameLock(fixedScale) {
+function cancelProgressStartRafs() {
+  if (__pbStartRafA) cancelAnimationFrame(__pbStartRafA);
+  if (__pbStartRafB) cancelAnimationFrame(__pbStartRafB);
+  __pbStartRafA = 0;
+  __pbStartRafB = 0;
+}
+
+function isPeakProgressMode(slidesContainer = getSlidesContainer()) {
+  return !!slidesContainer?.classList?.contains('peak-mode');
+}
+
+function queueProgressAnimation(bar, {
+  duration,
+  startScale = 0,
+  endScale = 1,
+  syncLayout = true
+} = {}) {
+  if (!bar) return;
+  cancelProgressStartRafs();
   clearRaf();
-  const tick = () => {
-    if (modalState.progressBarEl && modalState.progressBarEl.isConnected) {
-      modalState.progressBarEl.style.transform = `scaleX(${fixedScale})`;
-      frameLockRaf = requestAnimationFrame(tick);
-    } else {
-      clearRaf();
-    }
-  };
-  frameLockRaf = requestAnimationFrame(tick);
+
+  if (syncLayout) updateProgressBarPosition();
+
+  bar.classList.remove('is-paused');
+  bar.classList.add('is-animating');
+  bar.style.animationPlayState = 'paused';
+  bar.style.transition = 'none';
+  bar.style.transform = `scaleX(${startScale})`;
+
+  __pbStartRafA = requestAnimationFrame(() => {
+    __pbStartRafA = 0;
+    __pbStartRafB = requestAnimationFrame(() => {
+      __pbStartRafB = 0;
+      if (!bar.isConnected) return;
+      bar.style.transition = `transform ${Math.max(0, duration | 0)}ms linear`;
+      bar.style.transform = `scaleX(${endScale})`;
+    });
+  });
 }
 
 function getComputedScaleX(el) {
@@ -75,6 +130,8 @@ function targetScaleFromCfg() {
 
 export function ensureProgressBarExists() {
   if (!getConfig().showProgressBar || useSecondsMode()) {
+    cancelProgressStartRafs();
+    clearRaf();
     if (modalState.progressBarEl && document.body.contains(modalState.progressBarEl)) {
       modalState.progressBarEl.remove();
       modalState.progressBarEl = null;
@@ -89,19 +146,19 @@ export function ensureProgressBarExists() {
   if (!modalState.progressBarEl) {
     modalState.progressBarEl = document.querySelector(".slide-progress-bar");
     if (!modalState.progressBarEl) {
+      const sc = getSlidesContainer();
       modalState.progressBarEl = document.createElement("div");
       modalState.progressBarEl.className = "slide-progress-bar";
 
       Object.assign(modalState.progressBarEl.style, {
         position: 'absolute',
         transformOrigin: '0 50%',
-        willChange: 'transform',
+        willChange: isPeakProgressMode(sc) ? 'auto' : 'transform',
         animationPlayState: 'paused',
         width: '100%',
         transition: 'left 0.3s ease, width 0.3s ease'
       });
 
-      const sc = getSlidesContainer();
       if (sc) sc.appendChild(modalState.progressBarEl);
     }
     __pbInited = true;
@@ -112,6 +169,8 @@ export function ensureProgressBarExists() {
     }
   }
 
+  modalState.progressBarEl.style.willChange = isPeakProgressMode() ? 'auto' : 'transform';
+
   updateProgressBarPosition();
   return modalState.progressBarEl;
 }
@@ -119,7 +178,7 @@ export function ensureProgressBarExists() {
 function getUntransformedSlidePosition(slide, slidesContainer) {
   if (!slide || !slidesContainer) return { left: 0, width: 0 };
 
-  const isPeak = slidesContainer.classList.contains('peak-mode');
+  const isPeak = isPeakProgressMode(slidesContainer);
 
   if (!isPeak) {
     const slideRect = slide.getBoundingClientRect();
@@ -130,12 +189,9 @@ function getUntransformedSlidePosition(slide, slidesContainer) {
     };
   }
 
-  const containerRect = slidesContainer.getBoundingClientRect();
-  const containerWidth = containerRect.width;
-  const computedStyle = getComputedStyle(slidesContainer);
-  const peakActiveScale = parseFloat(computedStyle.getPropertyValue('--peak-active-scale')) || 0.7;
-  const activeWidth = containerWidth * peakActiveScale;
-  const activeLeft = (containerWidth - activeWidth) / 2;
+  const containerWidth = slidesContainer.clientWidth || slidesContainer.getBoundingClientRect().width || 0;
+  const activeWidth = slide.offsetWidth || slide.getBoundingClientRect().width || 0;
+  const activeLeft = Math.max(0, (containerWidth - activeWidth) / 2);
 
   return {
     left: activeLeft,
@@ -146,17 +202,23 @@ function getUntransformedSlidePosition(slide, slidesContainer) {
 export function updateProgressBarPosition() {
   if (!modalState.progressBarEl || useSecondsMode()) return;
 
-  const activeSlide = document.querySelector('.slide.active');
-  if (!activeSlide) return;
-
   const slidesContainer = getSlidesContainer();
   if (!slidesContainer) return;
+  const activeSlide = slidesContainer.querySelector('.slide.active');
+  if (!activeSlide) return;
 
   const position = getUntransformedSlidePosition(activeSlide, slidesContainer);
+  const leftPx = `${Math.round(position.left)}px`;
+  const widthPx = `${Math.round(position.width)}px`;
+  if (modalState.progressBarEl.__lastLeft === leftPx && modalState.progressBarEl.__lastWidth === widthPx) {
+    return;
+  }
+  modalState.progressBarEl.__lastLeft = leftPx;
+  modalState.progressBarEl.__lastWidth = widthPx;
 
   Object.assign(modalState.progressBarEl.style, {
-    left: `${position.left}px`,
-    width: `${position.width}px`
+    left: leftPx,
+    width: widthPx
   });
 }
 
@@ -176,12 +238,10 @@ function ensureSecondsExists() {
       secondsEl = document.createElement("div");
       secondsEl.className = "slide-progress-seconds";
       applyContainerStyles(secondsEl, 'progressSeconds');
-      const sc = getSlidesContainer();
-      if (sc) sc.appendChild(secondsEl);
+      mountSecondsToActiveSlide(secondsEl);
     }
   } else {
-    const sc = getSlidesContainer();
-    if (sc && secondsEl.parentElement !== sc) sc.appendChild(secondsEl);
+    mountSecondsToActiveSlide(secondsEl);
   }
   return secondsEl;
 }
@@ -224,21 +284,14 @@ export function resetProgressBar() {
   if (!bar) return;
 
   __paused = false;
+  cancelProgressStartRafs();
   clearRaf();
+  bar.classList.remove('is-paused', 'is-animating');
   bar.style.animationPlayState = 'paused';
   bar.style.transition = "none";
   bar.style.transform = "scaleX(0)";
 
-  const isPeak = document.querySelector('#slides-container')?.classList.contains('peak-mode');
-  if (isPeak) {
-    setTimeout(() => {
-      updateProgressBarPosition();
-      void bar.offsetWidth;
-    }, 10);
-  } else {
-    updateProgressBarPosition();
-    void bar.offsetWidth;
-  }
+  updateProgressBarPosition();
 
   setSlideStartTime(now());
   setRemainingTime(dur);
@@ -280,42 +333,27 @@ export function startProgressBarWithDuration(duration) {
   if (!bar) return;
 
   __paused = false;
+  cancelProgressStartRafs();
   clearRaf();
+  bar.classList.remove('is-paused');
+  bar.classList.add('is-animating');
 
   const targetScale = 1;
   const t0 = now();
   setSlideStartTime(t0);
   setRemainingTime(dur);
   pausedProgressPct = 0;
-
-  const isPeak = document.querySelector('#slides-container')?.classList.contains('peak-mode');
-  if (isPeak) {
-    setTimeout(() => {
-      updateProgressBarPosition();
-
-      bar.style.animationPlayState = 'paused';
-      bar.style.transition = 'none';
-      bar.style.transform = 'scaleX(0)';
-      requestAnimationFrame(() => {
-        bar.style.transition = `transform ${dur}ms linear`;
-        bar.style.transform = `scaleX(${targetScale})`;
-      });
-    }, 10);
-  } else {
-    updateProgressBarPosition();
-
-    bar.style.animationPlayState = 'paused';
-    bar.style.transition = 'none';
-    bar.style.transform = 'scaleX(0)';
-    requestAnimationFrame(() => {
-      bar.style.transition = `transform ${dur}ms linear`;
-      bar.style.transform = `scaleX(${targetScale})`;
-    });
-  }
+  queueProgressAnimation(bar, {
+    duration: dur,
+    startScale: 0,
+    endScale: targetScale,
+    syncLayout: true
+  });
 }
 
 export function pauseProgressBar() {
   const dur = (typeof getSlideDuration === 'function' ? (getSlideDuration() || SLIDE_DURATION) : SLIDE_DURATION);
+  if (__paused) return;
 
   if (useSecondsMode()) {
     const el = ensureSecondsExists();
@@ -335,6 +373,7 @@ export function pauseProgressBar() {
   const bar = ensureProgressBarExists();
   if (!bar) return;
 
+  cancelProgressStartRafs();
   const t0 = getSlideStartTime?.() || now();
   const elapsed = Math.max(0, Math.min(dur, now() - t0));
   const doneFrac = dur > 0 ? (elapsed / dur) : 0;
@@ -347,7 +386,8 @@ export function pauseProgressBar() {
   bar.style.animationPlayState = 'paused';
   bar.style.transition = 'none';
   bar.style.transform = `scaleX(${currentScale})`;
-  frameLock(currentScale);
+  bar.classList.remove('is-animating');
+  bar.classList.add('is-paused');
 
   setRemainingTime(dur - elapsed);
   __paused = true;
@@ -355,6 +395,7 @@ export function pauseProgressBar() {
 
 export function resumeProgressBar() {
   const dur = (typeof getSlideDuration === 'function' ? (getSlideDuration() || SLIDE_DURATION) : SLIDE_DURATION);
+  if (!__paused) return;
 
   if (useSecondsMode()) {
     const el = ensureSecondsExists();
@@ -387,6 +428,7 @@ export function resumeProgressBar() {
   const bar = ensureProgressBarExists();
   if (!bar) return;
 
+  cancelProgressStartRafs();
   clearRaf();
 
   const prevRemaining = getRemainingTime?.();
@@ -403,16 +445,13 @@ export function resumeProgressBar() {
       ? Math.max(0, Math.min(targetScale, computedScale))
       : Math.max(0, Math.min(1, (1 - (remainingTime / total)) * targetScale));
 
-  bar.style.animationPlayState = 'paused';
-  bar.style.transition = 'none';
-  bar.style.transform = `scaleX(${startScale})`;
-
   const t0 = now();
   setSlideStartTime(t0 - (total - remainingTime));
-
-  requestAnimationFrame(() => {
-    bar.style.transition = `transform ${remainingTime}ms linear`;
-    bar.style.transform = `scaleX(${targetScale})`;
+  queueProgressAnimation(bar, {
+    duration: remainingTime,
+    startScale,
+    endScale: targetScale,
+    syncLayout: isPeakProgressMode()
   });
 
   __paused = false;

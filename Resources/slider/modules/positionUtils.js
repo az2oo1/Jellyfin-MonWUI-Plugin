@@ -3,6 +3,16 @@ import { forceHomeSectionsTop } from './positionOverrides.js';
 
 const config = getConfig();
 
+function setImportantStyle(element, property, value) {
+  if (!element) return;
+
+  if (value !== undefined && value !== null && value !== '') {
+    element.style.setProperty(property, value, 'important');
+  } else {
+    element.style.removeProperty(property);
+  }
+}
+
 export function applyContainerStyles(container, type = '') {
   const config = getConfig();
   let prefix;
@@ -17,17 +27,17 @@ export function applyContainerStyles(container, type = '') {
     prefix = 'slide';
   }
 
-  container.style.top    = config[`${prefix}Top`]    ? `${config[`${prefix}Top`]}%`    : '';
-  container.style.left   = config[`${prefix}Left`]   ? `${config[`${prefix}Left`]}%`   : '';
-  container.style.width  = config[`${prefix}Width`]  ? `${config[`${prefix}Width`]}%`  : '';
-  container.style.height = config[`${prefix}Height`] ? `${config[`${prefix}Height`]}%` : '';
+  setImportantStyle(container, 'top',    config[`${prefix}Top`]    ? `${config[`${prefix}Top`]}%`    : '');
+  setImportantStyle(container, 'left',   config[`${prefix}Left`]   ? `${config[`${prefix}Left`]}%`   : '');
+  setImportantStyle(container, 'width',  config[`${prefix}Width`]  ? `${config[`${prefix}Width`]}%`  : '');
+  setImportantStyle(container, 'height', config[`${prefix}Height`] ? `${config[`${prefix}Height`]}%` : '');
 
   if (type && type !== 'slide' && type !== 'progressSeconds' && type !== 'progress') {
-    container.style.display        = config[`${prefix}Display`]        || '';
-    container.style.flexDirection  = config[`${prefix}FlexDirection`]  || '';
-    container.style.justifyContent = config[`${prefix}JustifyContent`] || '';
-    container.style.alignItems     = config[`${prefix}AlignItems`]     || '';
-    container.style.flexWrap       = config[`${prefix}FlexWrap`]       || '';
+    setImportantStyle(container, 'display',         config[`${prefix}Display`]        || '');
+    setImportantStyle(container, 'flex-direction',  config[`${prefix}FlexDirection`]  || '');
+    setImportantStyle(container, 'justify-content', config[`${prefix}JustifyContent`] || '');
+    setImportantStyle(container, 'align-items',     config[`${prefix}AlignItems`]     || '');
+    setImportantStyle(container, 'flex-wrap',       config[`${prefix}FlexWrap`]       || '');
   }
 }
 
@@ -38,9 +48,9 @@ export function updateSlidePosition() {
   if (slidesContainer) applyContainerStyles(slidesContainer);
 
   const containerTypes = [
-    'logo','meta','status','rating','plot',
-    'title','director','info','button',
-    'existingDot','provider','providericons'
+    'logo', 'meta', 'status', 'rating', 'plot',
+    'title', 'director', 'info', 'button',
+    'existingDot', 'provider', 'providericons'
   ];
 
   containerTypes.forEach(type => {
@@ -60,6 +70,10 @@ export function updateSlidePosition() {
 
   const homeSectionsContainer = document.querySelector(".homeSectionsContainer");
   if (homeSectionsContainer) {
-    homeSectionsContainer.style.top = config.homeSectionsTop ? `${config.homeSectionsTop}vh` : '';
+    setImportantStyle(
+      homeSectionsContainer,
+      'top',
+      config.homeSectionsTop ? `${config.homeSectionsTop}vh` : ''
+    );
   }
 }

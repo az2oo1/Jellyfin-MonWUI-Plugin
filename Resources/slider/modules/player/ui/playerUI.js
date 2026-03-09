@@ -29,6 +29,25 @@ function trackGlobalTimeout(id) {
   if (!musicPlayerState.__timeouts) musicPlayerState.__timeouts = new Set();
   musicPlayerState.__timeouts.add(id);
 }
+
+function setPageScrollLocked(lock) {
+  const html = document.documentElement;
+  const body = document.body;
+
+  if (lock) {
+    if (!body.dataset._prevOverflow) body.dataset._prevOverflow = body.style.overflow || '';
+    if (!html.dataset._prevOverflow) html.dataset._prevOverflow = html.style.overflow || '';
+
+    body.style.overflow = 'hidden';
+    html.style.overflow = 'hidden';
+  } else {
+    body.style.overflow = body.dataset._prevOverflow || '';
+    html.style.overflow = html.dataset._prevOverflow || '';
+    delete body.dataset._prevOverflow;
+    delete html.dataset._prevOverflow;
+  }
+}
+
 function clearGlobalTimeouts() {
   const set = musicPlayerState.__timeouts;
   if (!set) return;
@@ -387,6 +406,7 @@ export function createModernPlayerUI() {
   initializePlayerStyle();
 
   const teardown = () => {
+    try { setPageScrollLocked(false); } catch {}
     if (musicPlayerState.nextTracksObserver) {
       try {
         const list = musicPlayerState.nextTracksList;
@@ -587,6 +607,7 @@ async function toggleFavorite() {
     }
 
     const isFavorite = track.UserData?.IsFavorite || false;
+    const method = isFavorite ? "DELETE" : "POST";
     const userId = await window.ApiClient.getCurrentUserId();
     const url = withServer(`/Users/${userId}/FavoriteItems/${track.Id}`);
 
@@ -770,41 +791,34 @@ export async function updateAlbumArt(artUrl) {
 
 function toggleFullscreenMode() {
   const config = getConfig();
+
+  if (!isMobileDevice()) {
+    localStorage.setItem('fullscreenMode', 'false');
+    updateConfig({ ...config, fullscreenMode: false });
+    setPageScrollLocked(false);
+
+    const player = document.getElementById('modern-music-player');
+    player?.classList.remove('fullscreen-mode');
+    loadCSS();
+    return;
+  }
+
   const newMode = !config.fullscreenMode;
-  localStorage.setItem('fullscreenMode', newMode);
+  localStorage.setItem('fullscreenMode', String(newMode));
 
-  const updatedConfig = { ...config, fullscreenMode: newMode };
-
-  updateConfig(updatedConfig);
+  updateConfig({ ...config, fullscreenMode: newMode });
   loadCSS();
 
   const player = document.getElementById('modern-music-player');
   if (player) {
     if (newMode) {
       player.classList.add('fullscreen-mode');
-      document.body.style.overflow = 'hidden';
+      setPageScrollLocked(true);
     } else {
       player.classList.remove('fullscreen-mode');
-      document.body.style.overflow = '';
+      setPageScrollLocked(false);
     }
   }
-
-  const fullscreenBtn = document.querySelector('.fullscreen-btn i');
-  if (fullscreenBtn) {
-    fullscreenBtn.className = newMode
-      ? 'fa-solid fa-minimize'
-      : 'fa-solid fa-maximize';
-  }
-
-  showNotification(
-    `<i class="fa-solid fa-${newMode ? 'maximize' : 'minimize'}"></i> ${
-      newMode
-        ? config.languageLabels.fullscreenEnabled || 'Tam ekran modu etkin'
-        : config.languageLabels.fullscreenDisabled || 'Tam ekran modu devre dışı'
-    }`,
-    2000,
-    'info'
-  );
 }
 
 function initializePlayerStyle() {
@@ -830,18 +844,21 @@ function initializeFullscreen() {
   const player = document.getElementById('modern-music-player');
   const fullscreenBtn = document.querySelector('.fullscreen-btn i');
 
+  if (!isMobileDevice()) {
+    setPageScrollLocked(false);
+    player?.classList.remove('fullscreen-mode');
+    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-maximize';
+    return;
+  }
+
   if (config.fullscreenMode) {
     player?.classList.add('fullscreen-mode');
-    document.body.style.overflow = 'hidden';
-    if (fullscreenBtn) {
-      fullscreenBtn.className = 'fa-solid fa-minimize';
-    }
+    setPageScrollLocked(true);
+    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-minimize';
   } else {
     player?.classList.remove('fullscreen-mode');
-    document.body.style.overflow = '';
-    if (fullscreenBtn) {
-      fullscreenBtn.className = 'fa-solid fa-maximize';
-    }
+    setPageScrollLocked(false);
+    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-maximize';
   }
 }
 

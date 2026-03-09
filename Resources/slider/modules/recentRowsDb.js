@@ -11,11 +11,25 @@ function idle(cb, { timeout = 1500 } = {}) {
   }, 1);
 }
 
+function normalizeUserData(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const playedPct = Number(raw.PlayedPercentage);
+  const posTicks = Number(raw.PlaybackPositionTicks);
+  const out = {
+    Played: raw.Played === true,
+    PlayedPercentage: Number.isFinite(playedPct) ? playedPct : null,
+    PlaybackPositionTicks: Number.isFinite(posTicks) ? posTicks : null,
+    LastPlayedDate: raw.LastPlayedDate || raw.LastPlayedDateUtc || null,
+  };
+  return out;
+}
+
 function normalizeCachedItem(rec) {
   if (!rec) return null;
 
   const Id   = rec.Id   || rec.itemId || null;
   if (!Id) return null;
+  const userData = normalizeUserData(rec.UserData || rec.UserDataDto || rec.userData || rec.userDataDto || null);
 
   return {
     Id,
@@ -39,6 +53,8 @@ function normalizeCachedItem(rec) {
     RemoteTrailers: rec.RemoteTrailers || rec.remoteTrailers || [],
     DateCreatedTicks: rec.DateCreatedTicks ?? rec.dateCreatedTicks ?? 0,
     People: rec.People || rec.people || [],
+    UserData: userData,
+    UserDataDto: userData,
   };
 }
 
@@ -160,6 +176,7 @@ export async function upsertItem(db, scope, item) {
   if (!item?.Id) return;
   const tx = db.transaction(['items'], 'readwrite');
   const store = tx.objectStore('items');
+  const userData = normalizeUserData(item.UserData || item.UserDataDto || null);
 
   const rec = {
     key: `${scope}|${item.Id}`,
@@ -184,6 +201,8 @@ export async function upsertItem(db, scope, item) {
     CumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
     RemoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
     DateCreatedTicks: item.DateCreatedTicks || 0,
+    UserData: userData,
+    UserDataDto: userData,
 
     itemId: item.Id,
     type: item.Type || '',
@@ -205,6 +224,8 @@ export async function upsertItem(db, scope, item) {
     cumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
     remoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
     dateCreatedTicks: item.DateCreatedTicks || 0,
+    userData,
+    userDataDto: userData,
     updatedAt: Date.now(),
   };
 
@@ -220,6 +241,7 @@ export async function upsertItemsBatch(db, scope, items) {
   const store = tx.objectStore('items');
 
   for (const item of list) {
+    const userData = normalizeUserData(item.UserData || item.UserDataDto || null);
     const rec = {
       key: `${scope}|${item.Id}`,
       scope,
@@ -243,6 +265,8 @@ export async function upsertItemsBatch(db, scope, items) {
       CumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
       RemoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
       DateCreatedTicks: item.DateCreatedTicks || 0,
+      UserData: userData,
+      UserDataDto: userData,
 
       itemId: item.Id,
       type: item.Type || '',
@@ -264,6 +288,8 @@ export async function upsertItemsBatch(db, scope, items) {
       cumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
       remoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
       dateCreatedTicks: item.DateCreatedTicks || 0,
+      userData,
+      userDataDto: userData,
       updatedAt: Date.now(),
     };
     store.put(rec);

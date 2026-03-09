@@ -23,12 +23,73 @@ function attachGlobalMenuCloser() {
 }
 attachGlobalMenuCloser();
 
+function normalizeTrailerEntry(entry) {
+  if (!entry) return null;
+
+  if (typeof entry === "string") {
+    const url = entry.trim();
+    return url ? { Url: url, Name: "" } : null;
+  }
+
+  if (typeof entry !== "object") return null;
+
+  const url = String(
+    entry.Url ||
+    entry.url ||
+    entry.Path ||
+    entry.path ||
+    entry.Link ||
+    entry.link ||
+    ""
+  ).trim();
+  if (!url) return null;
+
+  const name = String(
+    entry.Name ||
+    entry.name ||
+    entry.Title ||
+    entry.title ||
+    ""
+  ).trim();
+
+  return {
+    ...entry,
+    Url: url,
+    Name: name
+  };
+}
+
+function collectTrailers(...candidates) {
+  const trailers = [];
+  const seen = new Set();
+
+  for (const list of candidates) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      const normalized = normalizeTrailerEntry(raw);
+      if (!normalized?.Url) continue;
+      const key = normalized.Url.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      trailers.push(normalized);
+    }
+  }
+
+  return trailers;
+}
+
+function pickTrailers(RemoteTrailers, item) {
+  return collectTrailers(
+    RemoteTrailers,
+    item?.RemoteTrailers,
+    item?.RemoteTrailerItems,
+    item?.RemoteTrailerUrls,
+    item?.TrailerUrls
+  );
+}
+
 export function createButtons(slide, config, UserData, itemId, RemoteTrailers, updatePlayedStatus, updateFavoriteStatus, openTrailerModal, item) {
-    const trailers =
-      (Array.isArray(RemoteTrailers) && RemoteTrailers.length) ? RemoteTrailers :
-      (Array.isArray(item?.RemoteTrailers) && item.RemoteTrailers.length) ? item.RemoteTrailers :
-      (Array.isArray(item?.TrailerUrls) && item.TrailerUrls.length) ? item.TrailerUrls :
-      [];
+    const trailers = pickTrailers(RemoteTrailers, item);
     const mainContainer = document.createElement('div');
     mainContainer.className = 'main-button-container';
     applyContainerStyles(mainContainer, 'button');
@@ -43,7 +104,7 @@ export function createButtons(slide, config, UserData, itemId, RemoteTrailers, u
     mainButton.className = 'main-btn';
     mainButton.innerHTML = `
         <span class="icon-wrapper">
-            <i class="fa-solid fa-ellipsis fa-xl"></i>
+            <i class="fa-solid fa-ellipsis"></i>
         </span>
     `;
 
@@ -148,7 +209,7 @@ export function createButtons(slide, config, UserData, itemId, RemoteTrailers, u
 
     const watchBtnContainer = createButtonWithBackground(
         "watch",
-        '<i class="fa-regular fa-circle-play fa-xl icon"></i>',
+        '<i class="fa-regular fa-circle-play icon"></i>',
         isResumable
             ? config.languageLabels.devamet
             : config.languageLabels.izle,
@@ -166,46 +227,67 @@ export function createButtons(slide, config, UserData, itemId, RemoteTrailers, u
     buttonContainer.appendChild(watchBtnContainer);
 }
 
-  if (config.showTrailerButton && trailers.length > 0) {
-  const trailer = trailers[0];
+    let trailerButtonMounted = false;
+    const appendTrailerButton = (trailer) => {
+      if (!config.showTrailerButton || trailerButtonMounted) return;
+      if (!trailer?.Url) return;
 
-  const trailerBtnContainer = createButtonWithBackground(
-    "trailer",
-    '<i class="fa-solid fa-film fa-xl icon"></i>',
-    config.languageLabels.fragman,
-    async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      let isFav = false;
-      try {
-        const details = await fetchItemDetails(item.Id);
-        isFav = Boolean(details.UserData?.IsFavorite);
-      } catch (err) {
-        console.warn("Favori durumu alınamadı, varsayılan false ile açılıyor", err);
-      }
-      openTrailerModal(
-        (trailer?.Url || trailer?.url),
-        (trailer?.Name || trailer?.name || ""),
-        item.Name || item.OriginalTitle,
-        item.Type,
-        isFav,
-        item.Id,
-        updateFavoriteStatus,
-        item.CommunityRating,
-        item.CriticRating,
-        item.OfficialRating
+      trailerButtonMounted = true;
+      const trailerBtnContainer = createButtonWithBackground(
+        "trailer",
+        '<i class="fa-solid fa-film icon"></i>',
+        config.languageLabels.fragman,
+        async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const effectiveItemId = item?.Id || itemId;
+          let isFav = false;
+          if (effectiveItemId) {
+            try {
+              const details = await fetchItemDetails(effectiveItemId);
+              isFav = Boolean(details?.UserData?.IsFavorite);
+            } catch (err) {
+              console.warn("Favori durumu alınamadı, varsayılan false ile açılıyor", err);
+            }
+          }
+
+          openTrailerModal(
+            trailer.Url,
+            trailer.Name || "",
+            item?.Name || item?.OriginalTitle || "",
+            item?.Type || "",
+            isFav,
+            effectiveItemId || null,
+            updateFavoriteStatus,
+            item?.CommunityRating,
+            item?.CriticRating,
+            item?.OfficialRating
+          );
+        }
       );
-    }
-  );
+      buttonContainer.appendChild(trailerBtnContainer);
+    };
 
-  buttonContainer.appendChild(trailerBtnContainer);
-}
+    appendTrailerButton(trailers[0]);
+
+    if (config.showTrailerButton && !trailerButtonMounted && itemId) {
+      (async () => {
+        try {
+          const details = await fetchItemDetails(itemId);
+          const enrichedTrailers = pickTrailers(null, details);
+          appendTrailerButton(enrichedTrailers[0]);
+        } catch (err) {
+          console.warn("Fragman butonu için detay zenginleştirme başarısız:", err);
+        }
+      })();
+    }
 
     if (config.showPlayedButton) {
     const isPlayed = UserData && UserData.Played;
     const playedBtnContainer = createButtonWithBackground(
         "played",
-        isPlayed ? '<i class="fa-solid fa-check fa-xl" style="color: #FFC107;"></i>' : '<i class="fa-light fa-check fa-xl"></i>',
+        isPlayed ? '<i class="fa-solid fa-check" style="color: #FFC107;"></i>' : '<i class="fa-light fa-check"></i>',
         isPlayed ? config.languageLabels.izlendi : config.languageLabels.izlenmedi,
         (event, buttonElement) => {
             const iconWrapper = buttonElement.querySelector('.icon-wrapper');
@@ -213,12 +295,12 @@ export function createButtons(slide, config, UserData, itemId, RemoteTrailers, u
 
             if (buttonElement.classList.contains("played")) {
                 buttonElement.classList.remove("played");
-                iconWrapper.innerHTML = '<i class="fa-light fa-check fa-xl"></i>';
+                iconWrapper.innerHTML = '<i class="fa-light fa-check"></i>';
                 textSpan.textContent = config.languageLabels.izlenmedi;
                 updatePlayedStatus(itemId, false);
             } else {
                 buttonElement.classList.add("played");
-                iconWrapper.innerHTML = '<i class="fa-solid fa-check fa-xl" style="color: #FFC107;"></i>';
+                iconWrapper.innerHTML = '<i class="fa-solid fa-check" style="color: #FFC107;"></i>';
                 textSpan.textContent = config.languageLabels.izlendi;
                 updatePlayedStatus(itemId, true);
             }
@@ -232,7 +314,7 @@ if (config.showFavoriteButton) {
     const isFavorited = UserData && UserData.IsFavorite;
     const favoriteBtnContainer = createButtonWithBackground(
         "favorite",
-        isFavorited ? '<i class="fa-solid fa-heart fa-xl" style="color: #FFC107;"></i>' : '<i class="fa-light fa-heart fa-xl"></i>',
+        isFavorited ? '<i class="fa-solid fa-heart" style="color: #FFC107;"></i>' : '<i class="fa-light fa-heart"></i>',
         isFavorited ? config.languageLabels.favorilendi : config.languageLabels.favori,
         (event, buttonElement) => {
             const iconWrapper = buttonElement.querySelector('.icon-wrapper');
@@ -240,12 +322,12 @@ if (config.showFavoriteButton) {
 
             if (buttonElement.classList.contains("favorited")) {
                 buttonElement.classList.remove("favorited");
-                iconWrapper.innerHTML = '<i class="fa-light fa-heart fa-xl"></i>';
+                iconWrapper.innerHTML = '<i class="fa-light fa-heart"></i>';
                 textSpan.textContent = config.languageLabels.favori;
                 updateFavoriteStatus(itemId, false);
             } else {
                 buttonElement.classList.add("favorited");
-                iconWrapper.innerHTML = '<i class="fa-solid fa-heart fa-xl" style="color: #FFC107;"></i>';
+                iconWrapper.innerHTML = '<i class="fa-solid fa-heart" style="color: #FFC107;"></i>';
                 textSpan.textContent = config.languageLabels.favorilendi;
                 updateFavoriteStatus(itemId, true);
             }
@@ -306,11 +388,7 @@ async function startNowPlayback(itemId, sessionId) {
 }
 
 export function createProviderContainer({ config, ProviderIds, RemoteTrailers, itemId, slide, item } = {}) {
-  const trailers =
-    (Array.isArray(RemoteTrailers) && RemoteTrailers.length) ? RemoteTrailers :
-    (Array.isArray(item?.RemoteTrailers) && item.RemoteTrailers.length) ? item.RemoteTrailers :
-    (Array.isArray(item?.TrailerUrls) && item.TrailerUrls.length) ? item.TrailerUrls :
-    [];
+  const trailers = pickTrailers(RemoteTrailers, item);
 
   const pids = ProviderIds || item?.ProviderIds;
   const container = document.createElement("div");
@@ -438,7 +516,7 @@ export function createProviderContainer({ config, ProviderIds, RemoteTrailers, i
   }
 
   if (config.showTrailerIcon && trailers.length > 0) {
-    addTrailerIcon(trailers[0]?.Url || trailers[0]?.url);
+    addTrailerIcon(trailers[0]?.Url);
   }
 
   if (pids) addProviderIcons(pids);
@@ -447,12 +525,11 @@ export function createProviderContainer({ config, ProviderIds, RemoteTrailers, i
     (async () => {
       try {
         const details = await fetchItemDetails(itemId);
-        const dTrailers = (details?.RemoteTrailers?.length ? details.RemoteTrailers :
-                          details?.TrailerUrls?.length ? details.TrailerUrls : []);
+        const dTrailers = pickTrailers(null, details);
         const dPids = details?.ProviderIds;
 
         if (config.showTrailerIcon && !trailers.length && dTrailers.length) {
-          addTrailerIcon(dTrailers[0]?.Url || dTrailers[0]?.url);
+          addTrailerIcon(dTrailers[0]?.Url);
         }
         if (config.showProviderInfo && !pids && dPids) {
           addProviderIcons(dPids);

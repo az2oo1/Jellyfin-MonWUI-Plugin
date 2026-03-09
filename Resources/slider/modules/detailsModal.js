@@ -29,6 +29,14 @@ let _ytApiPromise = null;
 const _boxSetCache = new Map();
 const TTL_MOVIE_BOXSET = 7 * 24 * 60 * 60 * 1000;
 
+function notifyDetailsModalPlay(itemId) {
+  try {
+    window.dispatchEvent(new CustomEvent("jms:details-modal-play", {
+      detail: { itemId: String(itemId || "") },
+    }));
+  } catch {}
+}
+
 function isStale(ts, maxAgeMs) {
   const t = Number(ts || 0);
   if (!t) return true;
@@ -1347,6 +1355,10 @@ function localizeItemType(rawType) {
     Series: ll.dizi,
     Episode: ll.episode,
     Season: ll.season,
+    BoxSet: ll.boxset || ll.collectionTitle || ll.collection,
+    MusicAlbum: ll.album,
+    Audio: ll.track,
+    MusicArtist: ll.artist,
   };
 
   const byKey = ll[`type_${t}`] || ll[`type${t}`];
@@ -1429,6 +1441,29 @@ function getPrimaryImageUrlMini(it) {
   );
 }
 
+function getHeroPrimaryImageUrl(it, { maxWidth = 1280 } = {}) {
+  try {
+    if (!it?.Id) return "";
+
+    const primaryTag = it?.ImageTags?.Primary || it?.PrimaryImageTag;
+    if (primaryTag) {
+      return withServer(
+        `/Items/${encodeURIComponent(it.Id)}/Images/Primary?tag=${encodeURIComponent(primaryTag)}&quality=90&maxWidth=${encodeURIComponent(maxWidth)}`
+      );
+    }
+
+    const albumPrimaryTag = it?.AlbumPrimaryImageTag;
+    const albumId = it?.AlbumId || it?.ParentId;
+    if (albumPrimaryTag && albumId) {
+      return withServer(
+        `/Items/${encodeURIComponent(albumId)}/Images/Primary?tag=${encodeURIComponent(albumPrimaryTag)}&quality=90&maxWidth=${encodeURIComponent(maxWidth)}`
+      );
+    }
+  } catch {}
+
+  return "";
+}
+
 function getEpisodeImageUrlMini(ep, { maxWidth = 280 } = {}) {
   try {
     if (!ep?.Id) return "";
@@ -1455,6 +1490,29 @@ function getEpisodeImageUrlMini(ep, { maxWidth = 280 } = {}) {
           `/Items/${encodeURIComponent(parent)}/Images/Backdrop/0?tag=${encodeURIComponent(pbt)}&quality=85&maxWidth=${encodeURIComponent(maxWidth)}`
         );
       }
+    }
+  } catch {}
+
+  return "";
+}
+
+function getAudioImageUrlMini(track, { maxWidth = 260, fallbackAlbumId = "" } = {}) {
+  try {
+    if (!track?.Id) return "";
+
+    const primaryTag = track?.ImageTags?.Primary || track?.PrimaryImageTag;
+    if (primaryTag) {
+      return withServer(
+        `/Items/${encodeURIComponent(track.Id)}/Images/Primary?tag=${encodeURIComponent(primaryTag)}&quality=85&maxWidth=${encodeURIComponent(maxWidth)}`
+      );
+    }
+
+    const albumPrimaryTag = track?.AlbumPrimaryImageTag;
+    const albumId = track?.AlbumId || fallbackAlbumId || track?.ParentId;
+    if (albumPrimaryTag && albumId) {
+      return withServer(
+        `/Items/${encodeURIComponent(albumId)}/Images/Primary?tag=${encodeURIComponent(albumPrimaryTag)}&quality=85&maxWidth=${encodeURIComponent(maxWidth)}`
+      );
     }
   } catch {}
 
@@ -1919,6 +1977,254 @@ async function fetchCollectionItemsAll(boxsetId, { signal } = {}) {
   return out;
 }
 
+async function fetchOtherCollections(currentId, { signal, limit = 12 } = {}) {
+  try {
+    const userId = (window.ApiClient?.getCurrentUserId?.() || window.ApiClient?._currentUserId) || "";
+    if (!userId) return [];
+
+    const qp = new URLSearchParams();
+    qp.set("UserId", userId);
+    qp.set("IncludeItemTypes", "BoxSet");
+    qp.set("Recursive", "true");
+    qp.set("Limit", String(Math.max(limit * 3, 40)));
+    qp.set("Fields", "Id,Name,ProductionYear,ImageTags,PrimaryImageAspectRatio,UserData,CommunityRating");
+    qp.set("SortBy", "SortName");
+    qp.set("SortOrder", "Ascending");
+
+    const r = await makeApiRequest(`/Items?${qp.toString()}`, { signal });
+    const items = Array.isArray(r?.Items) ? r.Items : [];
+    return items
+      .filter(x => x?.Id && String(x.Id) !== String(currentId))
+      .slice(0, limit);
+  } catch (e) {
+    if (!signal?.aborted) console.warn("fetchOtherCollections error:", e);
+    return [];
+  }
+}
+
+async function fetchAlbumTracks(albumId, { signal, limit = 300 } = {}) {
+  try {
+    const userId = (window.ApiClient?.getCurrentUserId?.() || window.ApiClient?._currentUserId) || "";
+    if (!userId || !albumId) return [];
+
+    const qp = new URLSearchParams();
+    qp.set("UserId", userId);
+    qp.set("ParentId", String(albumId));
+    qp.set("IncludeItemTypes", "Audio");
+    qp.set("Recursive", "true");
+    qp.set("Limit", String(limit));
+    qp.set("Fields", "Id,Name,RunTimeTicks,IndexNumber,ImageTags,UserData,AlbumId,AlbumPrimaryImageTag,PrimaryImageTag");
+    qp.set("SortBy", "IndexNumber,SortName");
+    qp.set("SortOrder", "Ascending");
+
+    const r = await makeApiRequest(`/Items?${qp.toString()}`, { signal });
+    const items = Array.isArray(r?.Items) ? r.Items : [];
+    return items;
+  } catch (e) {
+    if (!signal?.aborted) console.warn("fetchAlbumTracks error:", e);
+    return [];
+  }
+}
+
+async function fetchOtherAlbums(seedItem, { signal, limit = 12 } = {}) {
+  try {
+    const userId = (window.ApiClient?.getCurrentUserId?.() || window.ApiClient?._currentUserId) || "";
+    if (!userId) return [];
+
+    const isTrackSeed = String(seedItem?.Type || "") === "Audio";
+    const currentAlbumId =
+      seedItem?.Type === "MusicAlbum"
+        ? String(seedItem.Id || "")
+        : String(seedItem?.AlbumId || seedItem?.ParentId || "");
+
+    const byArtist =
+      safeText(seedItem?.AlbumArtist, "") ||
+      (Array.isArray(seedItem?.Artists) ? safeText(seedItem.Artists[0], "") : "");
+
+    const artistIdCandidates = [
+      seedItem?.AlbumArtistId,
+      seedItem?.ArtistId,
+      ...(Array.isArray(seedItem?.ArtistIds) ? seedItem.ArtistIds : []),
+      ...(Array.isArray(seedItem?.ArtistItems) ? seedItem.ArtistItems.map(x => x?.Id) : []),
+    ]
+      .map(x => String(x || "").trim())
+      .filter(Boolean);
+
+    const runQuery = async ({ searchTerm = "", artistId = "", albumArtistId = "" } = {}) => {
+      const qp = new URLSearchParams();
+      qp.set("UserId", userId);
+      qp.set("IncludeItemTypes", "MusicAlbum");
+      qp.set("Recursive", "true");
+      qp.set("Limit", String(Math.max(limit * 3, 40)));
+      qp.set("Fields", "Id,Name,ProductionYear,ImageTags,PrimaryImageAspectRatio,UserData,CommunityRating,AlbumArtist,Artists");
+      qp.set("SortBy", "DateCreated,SortName");
+      qp.set("SortOrder", "Descending");
+      if (artistId) qp.set("ArtistIds", artistId);
+      if (albumArtistId) qp.set("AlbumArtistIds", albumArtistId);
+      if (searchTerm) qp.set("SearchTerm", searchTerm);
+      const r = await makeApiRequest(`/Items?${qp.toString()}`, { signal });
+      return Array.isArray(r?.Items) ? r.Items : [];
+    };
+
+    let items = [];
+
+    if (isTrackSeed && artistIdCandidates.length) {
+      for (const aid of artistIdCandidates) {
+        items = await runQuery({ albumArtistId: aid });
+        if (items.length) break;
+      }
+
+      if (!items.length) {
+        for (const aid of artistIdCandidates) {
+          items = await runQuery({ artistId: aid });
+          if (items.length) break;
+        }
+      }
+    }
+
+    if (!items.length && byArtist) items = await runQuery({ searchTerm: byArtist });
+    if (!items.length && byArtist) items = await runQuery({});
+
+    const artistNameSet = new Set(
+      [
+        safeText(seedItem?.AlbumArtist, ""),
+        ...(Array.isArray(seedItem?.Artists) ? seedItem.Artists : []),
+      ]
+        .map(x => String(x || "").trim().toLocaleLowerCase())
+        .filter(Boolean)
+    );
+
+    if (isTrackSeed && artistNameSet.size) {
+      items = items.filter((it) => {
+        const names = [
+          safeText(it?.AlbumArtist, ""),
+          ...(Array.isArray(it?.Artists) ? it.Artists : []),
+        ]
+          .map(x => String(x || "").trim().toLocaleLowerCase())
+          .filter(Boolean);
+        if (!names.length) return false;
+        return names.some(n => artistNameSet.has(n));
+      });
+    }
+
+    const seen = new Set();
+    const out = [];
+    for (const it of items) {
+      const id = it?.Id ? String(it.Id) : "";
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      if (currentAlbumId && id === currentAlbumId) continue;
+      out.push(it);
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch (e) {
+    if (!signal?.aborted) console.warn("fetchOtherAlbums error:", e);
+    return [];
+  }
+}
+
+function renderAudioTracksHtml(items = [], { activeTrackId = "", fallbackAlbumId = "" } = {}) {
+  if (!items.length) {
+    return `<div style="color:rgba(255,255,255,.75);font-size:13px;line-height:1.5;">${config.languageLabels.noTracks || "Şarkı bulunamadı."}</div>`;
+  }
+
+  return `
+    <div class="jmsdm-episodes">
+      ${items.map((track, i) => {
+        const num = (track?.IndexNumber ?? (i + 1));
+        const trackName = safeText(track?.Name, config.languageLabels.track || "Şarkı");
+        const trackRuntime = fmtRuntime(track?.RunTimeTicks);
+        const img = getAudioImageUrlMini(track, { maxWidth: 260, fallbackAlbumId });
+        const activeClass = (activeTrackId && String(track?.Id) === String(activeTrackId)) ? " active" : "";
+
+        return `
+          <div class="jmsdm-ep${activeClass}" data-epid="${track?.Id || ""}">
+            <div class="jmsdm-ep-thumb">
+              ${
+                img
+                  ? `<img src="${img}" alt="${escapeHtml(trackName)}" loading="lazy" decoding="async">`
+                  : `<div class="jmsdm-skeleton" style="width:100%;height:100%;"></div>`
+              }
+            </div>
+
+            <div class="jmsdm-ep-num">${escapeHtml(String(num))}</div>
+
+            <div class="jmsdm-ep-main">
+              <div class="jmsdm-ep-name">${escapeHtml(trackName)}</div>
+              <div class="jmsdm-ep-over">${escapeHtml(trackRuntime || "")}</div>
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function startBoxSetLoad(root, boxsetItem, { signal } = {}) {
+  (async () => {
+    try {
+      if (!root || !boxsetItem?.Id) return;
+      const itemsHost = root.querySelector(".jmsdm-boxset-items-host");
+      const otherHost = root.querySelector(".jmsdm-boxset-other-host");
+      if (!itemsHost || !otherHost) return;
+
+      const [items, others] = await Promise.all([
+        fetchCollectionItemsAll(boxsetItem.Id, { signal }),
+        fetchOtherCollections(boxsetItem.Id, { signal, limit: 12 }),
+      ]);
+      if (!_open || signal?.aborted) return;
+
+      itemsHost.innerHTML = renderMiniCards((items || []).slice(0, 12));
+      otherHost.innerHTML = renderMiniCards(others || []);
+    } catch (e) {
+      if (!signal?.aborted) console.warn("boxset load error:", e);
+      try {
+        const itemsHost = root?.querySelector?.(".jmsdm-boxset-items-host");
+        const otherHost = root?.querySelector?.(".jmsdm-boxset-other-host");
+        if (itemsHost) itemsHost.innerHTML = renderMiniCards([]);
+        if (otherHost) otherHost.innerHTML = renderMiniCards([]);
+      } catch {}
+    }
+  })();
+}
+
+function startMusicLoad(root, musicItem, { signal } = {}) {
+  (async () => {
+    try {
+      if (!root || !musicItem?.Id) return;
+      const tracksHost = root.querySelector(".jmsdm-music-tracks-host");
+      const albumsHost = root.querySelector(".jmsdm-music-albums-host");
+      if (!tracksHost || !albumsHost) return;
+
+      const albumId =
+        musicItem?.Type === "MusicAlbum"
+          ? musicItem.Id
+          : (musicItem?.AlbumId || musicItem?.ParentId || null);
+
+      const [tracks, albums] = await Promise.all([
+        albumId ? fetchAlbumTracks(albumId, { signal }) : Promise.resolve([]),
+        fetchOtherAlbums(musicItem, { signal, limit: 12 }),
+      ]);
+      if (!_open || signal?.aborted) return;
+
+      tracksHost.innerHTML = renderAudioTracksHtml(tracks || [], {
+        activeTrackId: musicItem?.Type === "Audio" ? musicItem.Id : "",
+        fallbackAlbumId: albumId || "",
+      });
+      albumsHost.innerHTML = renderMiniCards(albums || []);
+    } catch (e) {
+      if (!signal?.aborted) console.warn("music load error:", e);
+      try {
+        const tracksHost = root?.querySelector?.(".jmsdm-music-tracks-host");
+        const albumsHost = root?.querySelector?.(".jmsdm-music-albums-host");
+        if (tracksHost) tracksHost.innerHTML = renderAudioTracksHtml([]);
+        if (albumsHost) albumsHost.innerHTML = renderMiniCards([]);
+      } catch {}
+    }
+  })();
+}
+
 function startCollectionLoad(root, movieItem, { signal } = {}) {
   (async () => {
     try {
@@ -2125,6 +2431,11 @@ export async function openDetailsModal({ itemId, serverId = "", preferBackdropIn
   const backdropUrl = btTag
     ? withServer(`/Items/${encodeURIComponent(displayItem.Id)}/Images/Backdrop/${encodeURIComponent(btIndex)}?tag=${encodeURIComponent(btTag)}&quality=90&maxWidth=1920`)
     : "";
+  const heroPrimaryUrl =
+    getHeroPrimaryImageUrl(displayItem, { maxWidth: 1400 }) ||
+    getHeroPrimaryImageUrl(baseItem, { maxWidth: 1400 }) ||
+    "";
+  const heroImageUrl = backdropUrl || heroPrimaryUrl;
 
   const detailsHref = getDetailsUrl(baseItem.Id);
   const isSeries = baseItem.Type === "Series";
@@ -2136,6 +2447,15 @@ export async function openDetailsModal({ itemId, serverId = "", preferBackdropIn
 
   const episodeSeasonId = isEpisode ? (baseItem.SeasonId || baseItem.ParentId || null) : null;
   const isMovie = baseItem.Type === "Movie";
+  const isBoxSet = baseItem.Type === "BoxSet";
+  const isMusicAlbum = baseItem.Type === "MusicAlbum";
+  const isAudio = baseItem.Type === "Audio";
+  const isMusicType = isMusicAlbum || isAudio;
+  const supportsTmdbReviews =
+    baseItem.Type === "Movie" ||
+    baseItem.Type === "Series" ||
+    baseItem.Type === "Season" ||
+    baseItem.Type === "Episode";
   const isFavInitial = !!(baseItem?.UserData?.IsFavorite || displayItem?.UserData?.IsFavorite);
 
   let isFavorite = isFavInitial;
@@ -2266,6 +2586,63 @@ wireMiniCardDelegation();
       `;
     }
 
+    if (isBoxSet) {
+      const collectionItemsTitle =
+        config.languageLabels.collectionItemsTitle ||
+        config.languageLabels.collectionTitle ||
+        "Koleksiyon İçeriği";
+      const otherCollectionsTitle =
+        config.languageLabels.otherCollectionsTitle ||
+        "Diğer Koleksiyonlar";
+
+      return `
+        <div class="jmsdm-section-title">${collectionItemsTitle}</div>
+        <div class="jmsdm-epwrap">
+          <div class="jmsdm-boxset-items-host">
+            <div class="jmsdm-skeleton" style="width:55%;height:12px;margin-top:6px;"></div>
+            <div class="jmsdm-skeleton" style="width:100%;height:86px;margin-top:10px;"></div>
+          </div>
+        </div>
+
+        <div class="jmsdm-section-title" style="margin-top:16px;">${otherCollectionsTitle}</div>
+        <div class="jmsdm-epwrap">
+          <div class="jmsdm-boxset-other-host">
+            <div class="jmsdm-skeleton" style="width:55%;height:12px;margin-top:6px;"></div>
+            <div class="jmsdm-skeleton" style="width:100%;height:86px;margin-top:10px;"></div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (isMusicType) {
+      const tracksTitle = isAudio
+        ? (config.languageLabels.albumTracksTitle || "Albümdeki Şarkılar")
+        : (config.languageLabels.tracksTitle || "Şarkılar");
+      const otherAlbumsTitle =
+        isAudio
+          ? (config.languageLabels.artistAlbumsTitle || "Sanatçının Albümleri")
+          : (config.languageLabels.otherAlbumsTitle || "Diğer Albümler");
+
+      return `
+        <div class="jmsdm-section-title">${tracksTitle}</div>
+        <div class="jmsdm-epwrap">
+          <div class="jmsdm-music-tracks-host">
+            <div class="jmsdm-skeleton" style="width:55%;height:12px;margin-top:6px;"></div>
+            <div class="jmsdm-skeleton" style="width:100%;height:68px;margin-top:10px;"></div>
+            <div class="jmsdm-skeleton" style="width:100%;height:68px;margin-top:8px;"></div>
+          </div>
+        </div>
+
+        <div class="jmsdm-section-title" style="margin-top:16px;">${otherAlbumsTitle}</div>
+        <div class="jmsdm-epwrap">
+          <div class="jmsdm-music-albums-host">
+            <div class="jmsdm-skeleton" style="width:55%;height:12px;margin-top:6px;"></div>
+            <div class="jmsdm-skeleton" style="width:100%;height:86px;margin-top:10px;"></div>
+          </div>
+        </div>
+      `;
+    }
+
     const showSeasonUi = seasons.length > 0;
     return `
       <div class="jmsdm-section-title">${seriesId ? (config.languageLabels.episodesTitle || "Bölümler") : (config.languageLabels.infoTitle || "Bilgi")}</div>
@@ -2310,7 +2687,7 @@ wireMiniCardDelegation();
       <div class="jmsdm-card" tabindex="-1">
         <div class="jmsdm-content">
           <div class="jmsdm-hero">
-            ${backdropUrl ? `<img src="${backdropUrl}" alt="">` : ""}
+            ${heroImageUrl ? `<img src="${heroImageUrl}" alt="">` : ""}
             <div class="jmsdm-topbar">
               <button class="jmsdm-close" aria-label="${config.languageLabels.closeButton || "Kapat"}">✕</button>
             </div>
@@ -2347,7 +2724,7 @@ wireMiniCardDelegation();
                 </button>
               </div>
               <div class="jmsdm-overview">${overview}</div>
-              <div class="jmsdm-tmdb-reviews" style="margin-top:14px;"></div>
+              ${supportsTmdbReviews ? `<div class="jmsdm-tmdb-reviews" style="margin-top:14px;"></div>` : ""}
             </div>
 
             <div class="jmsdm-right">
@@ -2366,11 +2743,17 @@ wireMiniCardDelegation();
   if (isMovie) {
     startRecoLoad(root, baseItem, { signal: _abort.signal });
     startCollectionLoad(root, baseItem, { signal: _abort.signal });
+  } else if (isBoxSet) {
+    startBoxSetLoad(root, baseItem, { signal: _abort.signal });
+  } else if (isMusicType) {
+    startMusicLoad(root, baseItem, { signal: _abort.signal });
   }
 
   wireOverviewToggle(root);
   startHeroTrailer(root, displayItem, { signal: _abort.signal }).catch(() => {});
-  loadTmdbReviewsInto(root, displayItem, { signal: _abort.signal });
+  if (supportsTmdbReviews) {
+    loadTmdbReviewsInto(root, displayItem, { signal: _abort.signal });
+  }
 
   const playBtn = root.querySelector(".jmsdm-play");
   const initialResumeTicks = getResumeTicksFromItem(baseItem);
@@ -2409,7 +2792,8 @@ wireMiniCardDelegation();
     try {
       playBtn.disabled = true;
       await playNow(baseItem.Id);
-      closeDetailsModal();
+      await closeDetailsModal();
+      notifyDetailsModalPlay(baseItem.Id);
     } catch (err) {
       console.error("Modal play error:", err);
       window.showMessage?.(config.languageLabels.playStartFailed || "Oynatma başlatılamadı", "error");
@@ -2466,21 +2850,26 @@ wireMiniCardDelegation();
   }
 
   function wireEpisodeClicks() {
-    root.querySelectorAll(".jmsdm-ep").forEach((el) => {
-      const clickHandler = async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const epId = el.getAttribute("data-epid");
-        if (!epId) return;
-        try {
-          await playNow(epId);
-          closeDetailsModal();
-        } catch (err) {
-          console.error("Episode play error:", err);
-          window.showMessage?.(config.languageLabels.episodePlayFailed || "Bölüm oynatılamadı", "error");
-        }
-      };
-      addEventListener(el, "click", clickHandler);
+    if (root.__episodeDelegated) return;
+    root.__episodeDelegated = true;
+
+    addEventListener(root, "click", async (e) => {
+      const el = e.target?.closest?.(".jmsdm-ep");
+      if (!el || !root.contains(el)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      const epId = el.getAttribute("data-epid");
+      if (!epId) return;
+      try {
+        await playNow(epId);
+        await closeDetailsModal();
+        notifyDetailsModalPlay(epId);
+      } catch (err) {
+        console.error("Episode play error:", err);
+        window.showMessage?.(config.languageLabels.episodePlayFailed || "Bölüm oynatılamadı", "error");
+      }
     });
   }
 
@@ -2509,7 +2898,7 @@ wireMiniCardDelegation();
     const currentScroll = right.scrollTop;
 
     right.innerHTML = renderRightPanelHtml();
-    if (isMovie) {
+    if (isMovie || isBoxSet || isMusicType) {
       wireMiniCardClicks();
       right.scrollTop = currentScroll;
       return;

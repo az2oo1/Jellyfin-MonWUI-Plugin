@@ -362,6 +362,13 @@ export function createStudioHubsPanel(config, labels) {
   recentSubWrap.style.marginBottom = "10px";
   section.appendChild(recentSubWrap);
 
+  const showRecentRowsHeroCards = createCheckbox(
+    'showRecentRowsHeroCards',
+    labels?.showRecentRowsHeroCards || 'Hero kartını göster (Son Eklenenler)',
+    config.showRecentRowsHeroCards !== false
+  );
+  recentSubWrap.appendChild(showRecentRowsHeroCards);
+
   const enableRecentMoviesRow = createCheckbox(
     'enableRecentMoviesRow',
     labels?.enableRecentMoviesRow || 'Son eklenen filmler satırı',
@@ -885,6 +892,13 @@ export function createStudioHubsPanel(config, labels) {
   );
   becauseYouWatchedSection.appendChild(enableBecauseYouWatched);
 
+  const showPersonalRecsHeroCards = createCheckbox(
+    'showPersonalRecsHeroCards',
+    labels?.showPersonalRecsHeroCards || 'Hero kartını göster (İzlediğin İçin Öneriler)',
+    config.showPersonalRecsHeroCards !== false
+  );
+  becauseYouWatchedSection.appendChild(showPersonalRecsHeroCards);
+
   const bywRowCountWrap = createNumberInput(
     'becauseYouWatchedRowCount',
     labels?.becauseYouWatchedRowCount || 'Ekranda gösterilecek Öneri sırası sayısı',
@@ -983,6 +997,13 @@ export function createStudioHubsPanel(config, labels) {
     !!config.enableDirectorRows
   );
   dirSection.appendChild(enableDirectorRows);
+
+  const showDirectorRowsHeroCards = createCheckbox(
+    'showDirectorRowsHeroCards',
+    labels?.showDirectorRowsHeroCards || 'Hero kartını göster (Yönetmen Koleksiyonları)',
+    config.showDirectorRowsHeroCards !== false
+  );
+  dirSection.appendChild(showDirectorRowsHeroCards);
 
   const directorRowsUseTopGenres = createCheckbox(
     'directorRowsUseTopGenres',

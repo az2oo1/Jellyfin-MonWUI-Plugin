@@ -145,6 +145,14 @@ export function getConfig() {
     }
   }
   function readPauseOverlay() {
+  const fallbackShowOsdHeaderRatings = localStorage.getItem('showRatingInfo') !== 'false';
+  const fallbackShowOsdHeaderCommunityRating = localStorage.getItem('showCommunityRating') !== 'false';
+  const fallbackShowOsdHeaderCriticRating = localStorage.getItem('showCriticRating') !== 'false';
+  const fallbackShowOsdHeaderOfficialRating = localStorage.getItem('showOfficialRating') !== 'false';
+  const readPauseBool = (obj, key, fallback) =>
+    Object.prototype.hasOwnProperty.call(obj || {}, key)
+      ? obj[key] !== false
+      : fallback;
   const raw = localStorage.getItem('pauseOverlay');
   if (raw && raw.trim().startsWith('{') && raw !== '[object Object]') {
     try {
@@ -161,6 +169,10 @@ export function getConfig() {
         showLogo: j.showLogo !== false,
         closeOnMouseMove: j.closeOnMouseMove !== false,
         showBackdrop: j.showBackdrop !== false,
+        showOsdHeaderRatings: readPauseBool(j, 'showOsdHeaderRatings', fallbackShowOsdHeaderRatings),
+        showOsdHeaderCommunityRating: readPauseBool(j, 'showOsdHeaderCommunityRating', fallbackShowOsdHeaderCommunityRating),
+        showOsdHeaderCriticRating: readPauseBool(j, 'showOsdHeaderCriticRating', fallbackShowOsdHeaderCriticRating),
+        showOsdHeaderOfficialRating: readPauseBool(j, 'showOsdHeaderOfficialRating', fallbackShowOsdHeaderOfficialRating),
         minVideoMinutes: safeMin,
         ageBadgeDurationMs: _num(j.ageBadgeDurationMs, 12000),
         ageBadgeLockMs: _num(j.ageBadgeLockMs, 6000),
@@ -169,7 +181,15 @@ export function getConfig() {
         badgeDelayResumeMs: _num(j.badgeDelayResumeMs, 2000),
         ageBadgeDurationResumeMs: _num(j.ageBadgeDurationResumeMs, 10000),
       };
-      if (safeMin !== mv) { try { localStorage.setItem('pauseOverlay', JSON.stringify(cfg)); } catch {} }
+      const missingOsdRatingKeys = [
+        'showOsdHeaderRatings',
+        'showOsdHeaderCommunityRating',
+        'showOsdHeaderCriticRating',
+        'showOsdHeaderOfficialRating'
+      ].some(key => !Object.prototype.hasOwnProperty.call(j, key));
+      if (safeMin !== mv || missingOsdRatingKeys) {
+        try { localStorage.setItem('pauseOverlay', JSON.stringify(cfg)); } catch {}
+      }
       return cfg;
     } catch {}
   }
@@ -197,6 +217,10 @@ export function getConfig() {
     showBackdrop: rawShowBackdrop !== 'false',
     requireWebSocket: rawRequireWebSocket !== 'false',
     closeOnMouseMove: rawCloseOnMouse !== 'false',
+    showOsdHeaderRatings: fallbackShowOsdHeaderRatings,
+    showOsdHeaderCommunityRating: fallbackShowOsdHeaderCommunityRating,
+    showOsdHeaderCriticRating: fallbackShowOsdHeaderCriticRating,
+    showOsdHeaderOfficialRating: fallbackShowOsdHeaderOfficialRating,
     minVideoMinutes: safeMinLegacy,
     ageBadgeDurationMs: 12000,
     ageBadgeLockMs: 6000,
@@ -246,10 +270,10 @@ export function getConfig() {
     showProgressBar: localStorage.getItem('showProgressBar') !== 'false',
     showProgressAsSeconds: localStorage.getItem('showProgressAsSeconds') === 'true',
     showQualityDetail: localStorage.getItem('showQualityDetail') !== 'false',
-    showActorInfo: localStorage.getItem('showActorInfo') !== 'false',
-    showActorAll: localStorage.getItem('showActorAll') === 'true',
-    showActorImg: localStorage.getItem('showActorImg') !== 'false',
-    showActorRole: localStorage.getItem('showActorRole') !== 'false',
+    showActorInfo: localStorage.getItem('showActorInfo') === 'true',
+    showActorAll: localStorage.getItem('showActorAll') !== 'false',
+    showActorImg: localStorage.getItem('showActorImg') === 'true',
+    showActorRole: localStorage.getItem('showActorRole') === 'true',
     showDescriptions: localStorage.getItem('showDescriptions') !== 'false',
     showPlotInfo: localStorage.getItem('showPlotInfo') !== 'false',
     showbPlotInfo: localStorage.getItem('showbPlotInfo') !== 'false',
@@ -273,9 +297,8 @@ export function getConfig() {
     showCast: localStorage.getItem('showCast') !== 'false',
     detailUrl: localStorage.getItem('detailUrl') !== 'false',
     hideOriginalTitleIfSame: localStorage.getItem('hideOriginalTitleIfSame') === 'true',
-    gradientOverlayImageType: localStorage.getItem('gradientOverlayImageType') || 'backdropUrl',
     backdropImageType: localStorage.getItem('backdropImageType') || 'backdropUrl',
-    enableTrailerPlayback: localStorage.getItem('enableTrailerPlayback') !== 'false',
+    enableTrailerPlayback: localStorage.getItem('enableTrailerPlayback') === 'true',
     enableVideoPlayback: localStorage.getItem('enableVideoPlayback') === 'true',
     dotBackgroundImageType: localStorage.getItem('dotBackgroundImageType') || 'none',
     trailerBackgroundImageType: localStorage.getItem('trailerBackgroundImageType') || 'trailerBgImage',
@@ -289,7 +312,7 @@ export function getConfig() {
     useRandomContent: localStorage.getItem('useRandomContent') !== 'false',
     fullscreenMode: localStorage.getItem('fullscreenMode') === 'true' ? true : false,
     listLimit: 20,
-    version: "v1.9.0",
+    version: "v2.0.0",
     historySize: 20,
     updateInterval: 300000,
     nextTracksSource: localStorage.getItem('nextTracksSource') || 'playlist',
@@ -376,6 +399,7 @@ export function getConfig() {
     enableCounterSystem: localStorage.getItem('enableCounterSystem') !== 'false',
 
     enableDirectorRows: localStorage.getItem('enableDirectorRows') !== 'false',
+    showDirectorRowsHeroCards: localStorage.getItem('showDirectorRowsHeroCards') !== 'false',
     directorRowsCount: parseInt(localStorage.getItem("directorRowsCount"), 10) || 4,
     directorRowsMinItemsPerDirector: parseInt(localStorage.getItem("directorRowsMinItemsPerDirector"), 10) || 8,
     directorRowCardCount: parseInt(localStorage.getItem("directorRowCardCount"), 10) || 10,
@@ -383,6 +407,7 @@ export function getConfig() {
     directorRowsUseTopGenres: localStorage.getItem('directorRowsUseTopGenres') !== 'false',
 
     enableRecentRows: (localStorage.getItem('enableRecentRows') || 'true') !== 'false',
+    showRecentRowsHeroCards: (localStorage.getItem('showRecentRowsHeroCards') || 'true') !== 'false',
 
     enableContinueMovies: (localStorage.getItem('enableContinueMovies') || 'true') !== 'false',
     continueMoviesCardCount: parseInt(localStorage.getItem('continueMoviesCardCount'), 10) || 10,
@@ -449,9 +474,11 @@ export function getConfig() {
 
     enableProfileChooser: localStorage.getItem('enableProfileChooser') !== 'false',
     profileChooserAutoOpen: localStorage.getItem('profileChooserAutoOpen') !== 'false',
+    profileChooserAutoOpenRequireQuickLogin: localStorage.getItem('profileChooserAutoOpenRequireQuickLogin') !== 'false',
     profileChooserRememberTokens: localStorage.getItem('profileChooserRememberTokens') !== 'false',
 
     enablePersonalRecommendations: localStorage.getItem('enablePersonalRecommendations') !== 'false',
+    showPersonalRecsHeroCards: localStorage.getItem('showPersonalRecsHeroCards') !== 'false',
     personalRecsCacheTtlMs: parseInt(localStorage.getItem('personalRecsCacheTtlMs'), 10) || 3600000,
     enableStudioHubs: localStorage.getItem('enableStudioHubs') !== 'false',
     placePersonalRecsUnderStudioHubs: localStorage.getItem('placePersonalRecsUnderStudioHubs') !== 'false',

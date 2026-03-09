@@ -629,18 +629,12 @@ export function attachMiniPosterHover(cardEl, itemLike) {
 
     if (!details) {
       hideMiniPopover();
-      if (allowTrailerPopover()) {
-        try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: false }); } catch {}
-      }
       return;
     }
 
     const hasContent = fillMiniContent(pop, itemLike, details || {});
     if (!hasContent) {
       hideMiniPopover();
-      if (allowTrailerPopover()) {
-        try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: false }); } catch {}
-      }
       return;
     }
 
@@ -665,7 +659,7 @@ export function attachMiniPosterHover(cardEl, itemLike) {
     await new Promise(requestAnimationFrame);
 
     if (allowTrailerPopover()) {
-      try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: false }); } catch {}
+      try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: true }); } catch {}
     }
   };
 
@@ -684,7 +678,10 @@ export function attachMiniPosterHover(cardEl, itemLike) {
     scheduleOpen();
   }, { passive: true });
 
-  cardEl.addEventListener("pointerleave", () => {
+  cardEl.addEventListener("pointerleave", (e) => {
+    const to = e?.relatedTarget || null;
+    const intoPreview = !!(to && to.closest?.(".mini-poster-popover, .mini-trailer-popover"));
+    if (intoPreview) return;
     if (__activeHoverCard === cardEl) __activeHoverCard = null;
     cancelOpen();
     scheduleHideMini(120);
@@ -740,9 +737,9 @@ export function attachMiniPosterHover(cardEl, itemLike) {
   };
 
   const markWake = () => {
-    __miniTombstoneUntil = Date.now() + 1500;
+    __miniTombstoneUntil = Date.now() + 450;
     window.__studioMiniKillToken = (window.__studioMiniKillToken || 0) + 1;
-    closeAll(true);
+    closeAll(false);
   };
 
   ["pushState", "replaceState"].forEach((fn) => {
@@ -768,11 +765,13 @@ export function attachMiniPosterHover(cardEl, itemLike) {
     else markWake();
   }, true);
 
-  window.addEventListener("focus", markWake, true);
+  window.addEventListener("focus", () => {
+    __miniTombstoneUntil = Date.now() + 250;
+  }, true);
   window.addEventListener("blur", () => markNav(), true);
   window.addEventListener("scroll", () => {
-    scheduleHideMini(0);
-    try { hideTrailerPopover(0); } catch {}
+    scheduleHideMini(80);
+    try { hideTrailerPopover(80); } catch {}
   }, { passive: true, capture: true });
 
   document.addEventListener("click", (e) => {
@@ -833,7 +832,7 @@ export async function openMiniPopoverFor(cardEl, itemLikeOrId) {
 
     requestAnimationFrame(async () => {
       if (allowTrailerPopover()) {
-        try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: false }); } catch {}
+        try { await tryOpenTrailerPopover(cardEl, itemLike.Id, { requireMini: true }); } catch {}
       }
     });
   });

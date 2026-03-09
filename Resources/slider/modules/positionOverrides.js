@@ -18,9 +18,9 @@ function normalizeVariant(x) {
   if (!s) return 'slider';
 
   if (s.includes('normalslider') || s.includes('normal')) return 'normalslider';
-  if (s.includes('fullslider')   || s.includes('full'))   return 'fullslider';
-  if (s.includes('peakslider')   || s.includes('peak'))   return 'peakslider';
-  if (s.includes('slider'))                                   return 'slider';
+  if (s.includes('fullslider') || s.includes('full'))   return 'fullslider';
+  if (s.includes('peakslider') || s.includes('peak'))   return 'peakslider';
+  if (s.includes('slider')) return 'slider';
   return 'slider';
 }
 
@@ -33,8 +33,8 @@ function detectCssVariantFromDom() {
   const has = (s) => !!document.querySelector(`link[href*="${s}"]`);
   if (has('peakslider.css'))   return 'peakslider';
   if (has('normalslider.css')) return 'normalslider';
-  if (has('fullslider.css'))   return 'fullslider';
-  if (has('slider.css'))       return 'slider';
+  if (has('fullslider.css')) return 'fullslider';
+  if (has('slider.css')) return 'slider';
   return 'slider';
 }
 
@@ -42,6 +42,7 @@ function computeEffectiveTop() {
   const cfg = (typeof getConfig === 'function') ? getConfig() : {};
   const userTop = readUserTopFromLocalStorage();
   if (userTop !== null) return userTop;
+  if (cfg?.enableSlider === false || cfg?.enableSlider === 'false') return 0;
 
   const rawVariant = (cfg && 'cssVariant' in cfg) ? cfg.cssVariant : undefined;
   const variant = normalizeVariant(rawVariant ?? detectCssVariantFromDom());
@@ -56,18 +57,18 @@ function getDefaultTopByVariant(variant) {
   const mobile = isMobileDevice();
   if (mobile) {
     switch (variant) {
-      case 'normalslider': return -20;
+      case 'normalslider': return -12;
       case 'fullslider': return -16;
-      case 'peakslider': return 0;
-      case 'slider': return 0;
+      case 'peakslider': return 2;
+      case 'slider': return 4;
       default: return 0;
     }
   } else {
     switch (variant) {
-      case 'normalslider': return -23;
-      case 'fullslider': return 4;
-      case 'peakslider': return -7;
-      case 'slider': return -3;
+      case 'normalslider': return -15;
+      case 'fullslider': return 6;
+      case 'peakslider': return -2;
+      case 'slider': return 2;
       default: return 0;
     }
   }
@@ -82,12 +83,30 @@ function readUserTopFromLocalStorage() {
   return n;
 }
 
-function applyTopToElements(vh) {
+function coerceBoolean(value, fallback = true) {
+  if (value === true || value === false) return value;
+  if (typeof value === 'string') {
+    const s = value.trim().toLowerCase();
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+  }
+  return fallback;
+}
+
+function shouldAffectFavoritesTab(cfg) {
+  const raw = localStorage.getItem('onlyShowSliderOnHomeTab');
+  if (raw === 'true' || raw === 'false') return raw === 'false';
+  return !coerceBoolean(cfg?.onlyShowSliderOnHomeTab, true);
+}
+
+function applyTopToElements(vh, affectFavoritesTab = true) {
   const value = `${vh}vh`;
-  const targets = [
-    ...document.querySelectorAll('.homeSectionsContainer'),
-    document.querySelector('#favoritesTab')
-  ];
+  const targets = [...document.querySelectorAll('.homeSectionsContainer')]
+    .filter(el => affectFavoritesTab || el?.id !== 'favoritesTab');
+  if (affectFavoritesTab) {
+    const fav = document.querySelector('#favoritesTab');
+    if (fav && !targets.includes(fav)) targets.push(fav);
+  }
   for (const el of targets) {
     if (!el) continue;
     if (el.style.top !== value) {
@@ -96,9 +115,18 @@ function applyTopToElements(vh) {
   }
 }
 
+function clearFavoritesTabTopOverride() {
+  const el = document.querySelector('#favoritesTab');
+  if (!el) return;
+  el.style.removeProperty('top');
+}
+
 function waitForFavoritesTabAndApply(topValue) {
   let tries = 0;
   function attempt() {
+    const cfg = (typeof getConfig === 'function') ? getConfig() : {};
+    if (!shouldAffectFavoritesTab(cfg)) return;
+
     const el = document.querySelector('#favoritesTab');
     if (el) {
       el.style.setProperty('top', `${topValue}vh`, 'important');
@@ -112,8 +140,15 @@ function waitForFavoritesTabAndApply(topValue) {
 export function forceHomeSectionsTop() {
   const applyAlways = () => {
     const top = computeEffectiveTop();
-    applyTopToElements(top);
-    waitForFavoritesTabAndApply(top);
+    const cfg = (typeof getConfig === 'function') ? getConfig() : {};
+    const affectFavoritesTab = shouldAffectFavoritesTab(cfg);
+
+    applyTopToElements(top, affectFavoritesTab);
+    if (affectFavoritesTab) {
+      waitForFavoritesTabAndApply(top);
+    } else {
+      clearFavoritesTabTopOverride();
+    }
   };
 
   if (!homeTopObserver) {

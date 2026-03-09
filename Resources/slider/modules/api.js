@@ -636,18 +636,70 @@ function pickActiveServerEntry(creds) {
   }
 }
 
+function pickFirstString(...values) {
+  for (const value of values) {
+    const out = String(value || "").trim();
+    if (out) return out;
+  }
+  return "";
+}
+
 export function getSessionInfo() {
   try {
     const raw = localStorage.getItem("jellyfin_credentials") || localStorage.getItem("emby_credentials") || "";
     const creds = raw ? JSON.parse(raw) : {};
     const active = pickActiveServerEntry(creds);
-    const accessToken = String(active?.AccessToken || creds?.AccessToken || "");
-    const userId = String(active?.UserId || creds?.User?.Id || creds?.userId || "");
+    const hints = (typeof getWebClientHints === "function" ? getWebClientHints() : null) || {};
+
+    const accessToken = pickFirstString(
+      active?.AccessToken,
+      creds?.AccessToken,
+      hints?.accessToken
+    );
+
+    const userId = pickFirstString(
+      active?.UserId,
+      creds?.User?.Id,
+      creds?.userId,
+      hints?.userId,
+      getStoredUserId(),
+      safeGet("persist_user_id")
+    );
+
+    const sessionId = pickFirstString(
+      hints?.sessionId,
+      creds?.SessionId,
+      creds?.sessionId
+    );
+
+    const deviceId = pickFirstString(
+      hints?.deviceId,
+      creds?.DeviceId,
+      creds?.ClientDeviceId,
+      getStoredDeviceId(),
+      safeGet("persist_device_id")
+    );
+
+    const clientName = pickFirstString(
+      hints?.clientName,
+      creds?.Client,
+      "Jellyfin Web Client"
+    );
+
+    const clientVersion = pickFirstString(
+      hints?.clientVersion,
+      creds?.Version,
+      "1.0.0"
+    );
 
     return {
       ...creds,
       accessToken,
       userId,
+      sessionId,
+      deviceId,
+      clientName,
+      clientVersion,
       serverId: String(active?.Id || creds?.ServerId || ""),
       serverAddress: String(active?.ManualAddress || active?.LocalAddress || getServerAddress?.() || "")
     };
@@ -885,6 +937,8 @@ const ITEM_FULL_FIELDS = [
   "ImageTags","BackdropImageTags",
   "UserData","MediaStreams","Series", "CollectionIds",
   "ProviderIds", "People", "RemoteTrailers", "Studios", "Taglines",
+  "AlbumId", "Album", "AlbumArtist", "AlbumArtistId", "Artists", "ArtistId", "ArtistIds", "ArtistItems",
+  "AlbumPrimaryImageTag", "PrimaryImageTag",
 ];
 
 export async function fetchItemDetailsFull(itemId, { signal } = {}) {
@@ -1013,45 +1067,480 @@ export async function getImageDimensions(url) {
   });
 }
 
-function scoreSessionCandidate(s, self) {
+function normalizeIdentityToken(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function addIdentityToken(set, value) {
+  const normalized = normalizeIdentityToken(value);
+  if (!normalized) return;
+  set.add(normalized);
+}
+
+function buildRequesterIdentity(self = {}) {
+  const hints = (typeof getWebClientHints === "function" ? getWebClientHints() : null) || {};
+  const userIds = new Set();
+  const sessionIds = new Set();
+  const deviceIds = new Set();
+
+  addIdentityToken(userIds, self?.userId);
+  addIdentityToken(userIds, getStoredUserId());
+  addIdentityToken(userIds, safeGet("persist_user_id"));
+
+  addIdentityToken(sessionIds, self?.sessionId);
+  addIdentityToken(sessionIds, hints?.sessionId);
+  try {
+    addIdentityToken(sessionIds, window.ApiClient?._sessionId);
+  } catch {}
+
+  addIdentityToken(deviceIds, self?.deviceId);
+  addIdentityToken(deviceIds, hints?.deviceId);
+  addIdentityToken(deviceIds, getStoredDeviceId());
+  addIdentityToken(deviceIds, safeGet("persist_device_id"));
+  addIdentityToken(deviceIds, readApiClientDeviceId());
+
+  const clientHints = [
+    self?.clientName,
+    hints?.clientName,
+    self?.Client
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+
+  return {
+    userIds,
+    sessionIds,
+    deviceIds,
+    clientHints
+  };
+}
+
+function scoreSessionCandidate(session, identity) {
   let score = 0;
-  const storedUserId = getStoredUserId();
-  const apiDev = getStoredDeviceId();
-  if (apiDev && s?.DeviceId === apiDev) score += 200;
+  const sessionId = normalizeIdentityToken(session?.Id);
+  const deviceId = normalizeIdentityToken(session?.DeviceId);
+  const userId = normalizeIdentityToken(session?.UserId);
 
+  if (sessionId && identity.sessionIds.has(sessionId)) score += 1200;
+  if (deviceId && identity.deviceIds.has(deviceId)) score += 1000;
+  if (userId && identity.userIds.has(userId)) score += 220;
 
-  if (s?.Id && self.sessionId && s.Id === self.sessionId) score += 120;
-  if (s?.DeviceId && self.deviceId && s.DeviceId === self.deviceId) score += 100;
-  if (s?.AccessToken && self.accessToken && s.AccessToken === self.accessToken) score += 60;
-  if (s?.UserId && s.UserId === self.userId) score += 30;
-  if (storedUserId && s?.UserId === storedUserId) score += 40;
+  const sessionClient = String(session?.Client || "").toLowerCase();
+  if (sessionClient && identity.clientHints.some((hint) => sessionClient.includes(hint))) score += 20;
 
-  const sClient = (s?.Client || "").toLowerCase();
-  const myClient = (self.clientName || "").toLowerCase();
-  if (sClient && myClient && (sClient.includes("web") || sClient.includes(myClient))) score += 15;
-
-  const last = s?.LastActivityDate ? new Date(s.LastActivityDate).getTime() : 0;
+  const last = session?.LastActivityDate ? new Date(session.LastActivityDate).getTime() : 0;
   if (last && Date.now() - last < 2 * 60 * 1000) score += 10;
-  if (s?.SupportsRemoteControl) score += 6;
+  if (session?.SupportsRemoteControl !== false) score += 6;
 
   return score;
 }
 
-function resolveSelfSession(videoClients, self, { allowLastActiveFallback = false } = {}) {
-  const ranked = videoClients
-    .map((s) => ({ s, score: scoreSessionCandidate(s, self) }))
+function resolveSelfSession(sessions, identity, { allowWeakFallback = false } = {}) {
+  const ranked = (Array.isArray(sessions) ? sessions : [])
+    .filter((session) => session?.Id)
+    .map((session) => ({ session, score: scoreSessionCandidate(session, identity) }))
     .sort((a, b) => b.score - a.score);
 
-  const MIN_SCORE = 100;
-  if (ranked.length && ranked[0].score >= MIN_SCORE) {
-    return ranked[0].s;
+  if (!ranked.length) return null;
+
+  const best = ranked[0].session;
+  const bestSessionId = normalizeIdentityToken(best?.Id);
+  const bestDeviceId = normalizeIdentityToken(best?.DeviceId);
+  const hasHardMatch =
+    (bestSessionId && identity.sessionIds.has(bestSessionId)) ||
+    (bestDeviceId && identity.deviceIds.has(bestDeviceId));
+
+  if (hasHardMatch) return best;
+
+  if (!allowWeakFallback) return null;
+
+  const bestUserId = normalizeIdentityToken(best?.UserId);
+  if (bestUserId && identity.userIds.has(bestUserId) && ranked[0].score >= 180) {
+    return best;
+  }
+  return null;
+}
+
+function collectPlaybackManagersForPlayNow() {
+  const out = [];
+  const seen = new Set();
+  const add = (candidate) => {
+    if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push(candidate);
+  };
+
+  [
+    window.playbackManager,
+    window.MediaBrowser?.playbackManager,
+    window.MediaBrowser?.PlaybackManager,
+    window.Emby?.playbackManager,
+    window.Emby?.PlaybackManager,
+    window.appRouter?.playbackManager,
+    window.__playbackManager,
+    window.__jellyfinPlaybackManager,
+    window.__jmsPlaybackManager
+  ].forEach(add);
+
+  try {
+    const keys = Object.getOwnPropertyNames(window);
+    for (const key of keys) {
+      if (!/playback/i.test(key)) continue;
+      try {
+        add(window[key]);
+      } catch {}
+    }
+  } catch {}
+
+  return out;
+}
+
+function collectLocalPlayerTargetsForPlayNow(managers = []) {
+  const out = [];
+  const seen = new Set();
+  const add = (candidate) => {
+    if (!candidate || typeof candidate !== "object") return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push(candidate);
+  };
+
+  add(window.MediaPlayer?.getActivePlayer?.());
+  add(window.MediaBrowser?.MediaPlayer?.getActivePlayer?.());
+  add(window.player);
+  add(window.currentPlayer);
+  add(window.__jmsPlayer);
+
+  for (const manager of managers) {
+    try { add(manager?.getActivePlayer?.()); } catch {}
+    try { add(manager?._currentPlayer); } catch {}
   }
 
-  if (allowLastActiveFallback && ranked.length) {
-    return ranked[0].s;
+  return out;
+}
+
+async function waitForLocalMainVideoStart(timeoutMs = 2400) {
+  const deadline = Date.now() + Math.max(250, Number(timeoutMs) || 2400);
+  while (Date.now() < deadline) {
+    const video = document.querySelector(
+      ".videoPlayerContainer video.htmlvideoplayer, .videoPlayerContainer video"
+    );
+    if (video && video.readyState >= 2 && !video.paused) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60));
   }
+  return false;
+}
+
+function getWebpackRequireForPlayNow() {
+  try {
+    if (window.__jmsWebpackRequire) return window.__jmsWebpackRequire;
+  } catch {}
+
+  try {
+    const chunkGlobal = window.webpackChunk = window.webpackChunk || [];
+    let captured = null;
+    const chunkId = `jms-playnow-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    chunkGlobal.push([[chunkId], {}, (req) => {
+      captured = req;
+    }]);
+    if (typeof captured === "function") {
+      try { window.__jmsWebpackRequire = captured; } catch {}
+      return captured;
+    }
+  } catch {}
 
   return null;
+}
+
+function readServerIdForPlayNow(item = null) {
+  const api = (typeof window !== "undefined" && window.ApiClient) ? window.ApiClient : null;
+  return pickFirstString(
+    item?.ServerId,
+    item?.serverId,
+    getSessionInfo()?.serverId,
+    api?._serverInfo?.Id,
+    api?._serverInfo?.SystemId,
+    typeof api?.serverId === "function" ? api.serverId() : null
+  );
+}
+
+function buildLocalPlaybackItemStub(item = null, itemId = "", startPositionTicks = 0) {
+  const stub = item && typeof item === "object" ? { ...item } : {};
+  stub.Id = String(item?.Id || itemId || "").trim();
+  stub.ServerId = readServerIdForPlayNow(item);
+  stub.Type = String(item?.Type || stub.Type || "");
+  stub.MediaType = String(item?.MediaType || stub.MediaType || "");
+  stub.ChannelId = item?.ChannelId || stub.ChannelId || null;
+  stub.CollectionType = item?.CollectionType || stub.CollectionType || null;
+  stub.IsFolder = Boolean(item?.IsFolder || stub.IsFolder);
+  stub.UserData = {
+    ...(item?.UserData && typeof item.UserData === "object" ? item.UserData : {}),
+    PlaybackPositionTicks: Math.max(0, Math.floor(Number(startPositionTicks) || 0))
+  };
+  return stub;
+}
+
+async function tryWebpackShortcutPlaybackStart(itemId, { startPositionTicks = 0, item = null } = {}) {
+  const attempts = [];
+  const req = getWebpackRequireForPlayNow();
+  if (!req) {
+    attempts.push({ target: "webpack", method: "require", ok: false, err: "webpack require yok" });
+    return { tried: true, started: false, attempts };
+  }
+
+  try {
+    const shortcutsMod = req(22832);
+    const shortcuts = shortcutsMod?.Ay;
+    if (!shortcuts?.onClick) {
+      attempts.push({ target: "webpack", method: "shortcut-module", ok: false, err: "itemShortcuts yok" });
+      return { tried: true, started: false, attempts };
+    }
+
+    const stub = buildLocalPlaybackItemStub(item, itemId, startPositionTicks);
+    if (!stub.Id || !stub.ServerId) {
+      attempts.push({
+        target: "webpack",
+        method: "shortcut-prepare",
+        ok: false,
+        err: `eksik item/serverId (${stub.Id ? "id-ok" : "id-yok"}, ${stub.ServerId ? "server-ok" : "server-yok"})`
+      });
+      return { tried: true, started: false, attempts };
+    }
+
+    const host = document.createElement("button");
+    host.type = "button";
+    host.className = "itemAction";
+    host.setAttribute("data-action", stub.UserData?.PlaybackPositionTicks > 0 ? "resume" : "play");
+    host.setAttribute("data-id", stub.Id);
+    host.setAttribute("data-serverid", String(stub.ServerId));
+    if (stub.Type) host.setAttribute("data-type", stub.Type);
+    if (stub.MediaType) host.setAttribute("data-mediatype", stub.MediaType);
+    if (stub.ChannelId) host.setAttribute("data-channelid", String(stub.ChannelId));
+    host.setAttribute("data-isfolder", stub.IsFolder ? "true" : "false");
+    if (stub.CollectionType) host.setAttribute("data-collectiontype", String(stub.CollectionType));
+    if (stub.UserData?.PlaybackPositionTicks > 0) {
+      host.setAttribute("data-positionticks", String(stub.UserData.PlaybackPositionTicks));
+    }
+
+    const child = document.createElement("span");
+    host.appendChild(child);
+    document.body.appendChild(host);
+
+    try {
+      shortcuts.onClick({
+        target: child,
+        preventDefault() {},
+        stopPropagation() {}
+      });
+      const confirmed = await waitForLocalMainVideoStart(450);
+      attempts.push({
+        target: "webpack",
+        method: "itemShortcuts.onClick",
+        ok: true,
+        started: true,
+        confirmed
+      });
+      return { tried: true, started: true, attempts };
+    } finally {
+      host.remove();
+    }
+  } catch (err) {
+    attempts.push({
+      target: "webpack",
+      method: "itemShortcuts.onClick",
+      ok: false,
+      err: String(err?.message || err || "")
+    });
+    return { tried: true, started: false, attempts };
+  }
+}
+
+async function tryWebpackPlaybackManagerStart(itemId, { startPositionTicks = 0, item = null } = {}) {
+  const attempts = [];
+  const req = getWebpackRequireForPlayNow();
+  if (!req) {
+    attempts.push({ target: "webpack", method: "require", ok: false, err: "webpack require yok" });
+    return { tried: true, started: false, attempts };
+  }
+
+  try {
+    let playbackManager = null;
+
+    try {
+      const direct = req(39738);
+      if (direct?.f?.play) playbackManager = direct.f;
+    } catch {}
+
+    if (!playbackManager && req.c) {
+      for (const mod of Object.values(req.c)) {
+        const candidate = mod?.exports?.f;
+        if (candidate?.play && candidate?.canPlay && candidate?.getCurrentPlayer) {
+          playbackManager = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!playbackManager?.play) {
+      attempts.push({ target: "webpack", method: "playbackManager", ok: false, err: "playback manager yok" });
+      return { tried: true, started: false, attempts };
+    }
+
+    const stub = buildLocalPlaybackItemStub(item, itemId, startPositionTicks);
+    if (!stub.Id || !stub.ServerId) {
+      attempts.push({
+        target: "webpack",
+        method: "playbackManager.play",
+        ok: false,
+        err: `eksik item/serverId (${stub.Id ? "id-ok" : "id-yok"}, ${stub.ServerId ? "server-ok" : "server-yok"})`
+      });
+      return { tried: true, started: false, attempts };
+    }
+
+    if (typeof playbackManager.canPlay === "function" && !playbackManager.canPlay(stub)) {
+      attempts.push({ target: "webpack", method: "playbackManager.canPlay", ok: false, err: "canPlay=false" });
+      return { tried: true, started: false, attempts };
+    }
+
+    const payload = {
+      ids: [stub.Id],
+      serverId: stub.ServerId
+    };
+    if (stub.UserData?.PlaybackPositionTicks > 0) {
+      payload.startPositionTicks = stub.UserData.PlaybackPositionTicks;
+    }
+
+    const maybePromise = playbackManager.play(payload);
+    if (maybePromise && typeof maybePromise.then === "function") {
+      maybePromise.catch(() => null);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    const confirmed = await waitForLocalMainVideoStart(450);
+    attempts.push({
+      target: "webpack",
+      method: "playbackManager.play",
+      ok: true,
+      started: true,
+      confirmed
+    });
+    return { tried: true, started: true, attempts };
+  } catch (err) {
+    attempts.push({
+      target: "webpack",
+      method: "playbackManager.play",
+      ok: false,
+      err: String(err?.message || err || "")
+    });
+    return { tried: true, started: false, attempts };
+  }
+}
+
+async function tryLocalPlaybackStart(itemId, { startPositionTicks = 0, item = null } = {}) {
+  const normalizedId = String(itemId || "").trim();
+  if (!normalizedId) {
+    return { tried: false, started: false, attempts: [] };
+  }
+
+  const managers = collectPlaybackManagersForPlayNow();
+  const players = collectLocalPlayerTargetsForPlayNow(managers);
+  const targets = [...managers, ...players];
+
+  const attempts = [];
+  const cappedStartTicks = Math.max(0, Math.floor(Number(startPositionTicks) || 0));
+  const basePlayPayload = { ids: [normalizedId] };
+  if (cappedStartTicks > 0) basePlayPayload.startPositionTicks = cappedStartTicks;
+  const playItemsPayload = item ? { items: [item] } : null;
+  if (playItemsPayload && cappedStartTicks > 0) {
+    playItemsPayload.startPositionTicks = cappedStartTicks;
+  }
+
+  const webpackPlaybackKick = await tryWebpackPlaybackManagerStart(normalizedId, {
+    startPositionTicks: cappedStartTicks,
+    item
+  }).catch(() => ({ tried: false, started: false, attempts: [] }));
+  if (Array.isArray(webpackPlaybackKick?.attempts)) {
+    attempts.push(...webpackPlaybackKick.attempts);
+  }
+  if (webpackPlaybackKick?.started) {
+    return {
+      tried: true,
+      started: true,
+      attempts
+    };
+  }
+
+  const webpackShortcutKick = await tryWebpackShortcutPlaybackStart(normalizedId, {
+    startPositionTicks: cappedStartTicks,
+    item
+  }).catch(() => ({ tried: false, started: false, attempts: [] }));
+  if (Array.isArray(webpackShortcutKick?.attempts)) {
+    attempts.push(...webpackShortcutKick.attempts);
+  }
+  if (webpackShortcutKick?.started) {
+    return {
+      tried: true,
+      started: true,
+      attempts
+    };
+  }
+
+  const deadline = Date.now() + 4200;
+  const maxMethodCalls = 10;
+  let methodCalls = 0;
+
+  const methodSpecs = [
+    { name: "play", args: () => [basePlayPayload] },
+    { name: "play", args: () => (playItemsPayload ? [playItemsPayload] : null) },
+    { name: "playById", args: () => [normalizedId] },
+    { name: "playItem", args: () => [normalizedId] },
+    { name: "openItem", args: () => [normalizedId] },
+    { name: "displayContent", args: () => [{ ItemId: normalizedId }] }
+  ];
+
+  for (const target of targets) {
+    if (Date.now() >= deadline || methodCalls >= maxMethodCalls) break;
+    const targetLabel = String(target?.id || target?.name || target?.constructor?.name || "unknown");
+
+    for (const spec of methodSpecs) {
+      if (Date.now() >= deadline || methodCalls >= maxMethodCalls) break;
+      if (typeof target?.[spec.name] !== "function") continue;
+      const args = spec.args();
+      if (!args) continue;
+
+      methodCalls += 1;
+      try {
+        const maybePromise = target[spec.name](...args);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          await Promise.race([
+            maybePromise.catch(() => null),
+            new Promise((resolve) => setTimeout(resolve, 900))
+          ]);
+        }
+        const started = await waitForLocalMainVideoStart(1200);
+        attempts.push({ target: targetLabel, method: spec.name, ok: true, started });
+        if (started) {
+          return { tried: true, started: true, attempts };
+        }
+      } catch (err) {
+        attempts.push({
+          target: targetLabel,
+          method: spec.name,
+          ok: false,
+          err: String(err?.message || err || "")
+        });
+      }
+    }
+  }
+
+  return {
+    tried:
+      attempts.length > 0 ||
+      !!webpackShortcutKick?.tried ||
+      !!webpackPlaybackKick?.tried,
+    started: false,
+    attempts
+  };
 }
 
 function sortEpisodes(episodes = []) {
@@ -1102,7 +1591,43 @@ async function getBestEpisodeIdForSeason(seasonId, seriesId, userId) {
 export async function playNow(itemId) {
   try {
     const self = getSessionInfo();
-    const storedUserId = getStoredUserId() || self.userId;
+    const userAgent = String((typeof navigator !== "undefined" && navigator.userAgent) || "");
+    const isAndroid = /android/i.test(userAgent);
+    const isLikelyWebView =
+      /; wv\)/i.test(userAgent) ||
+      /\bVersion\/\d+(\.\d+)?\b/i.test(userAgent) ||
+      !!window.ReactNativeWebView;
+    const isAndroidWebView = isAndroid && isLikelyWebView;
+    const persistDebug = (payload) => {
+      try {
+        window.__jmsLastPlayNowTargetDebug = payload;
+      } catch {}
+      try {
+        localStorage.setItem("jms:lastPlayNowDebug", JSON.stringify(payload));
+      } catch {}
+      try {
+        const serialized = JSON.stringify(payload);
+        console.warn("[JMS_PLAYNOW_DEBUG]", serialized);
+      } catch {
+        try { console.warn("[JMS_PLAYNOW_DEBUG]", payload); } catch {}
+      }
+    };
+
+    persistDebug({
+      at: Date.now(),
+      stage: "start",
+      itemId: String(itemId || ""),
+      isAndroidWebView
+    });
+
+    const requesterUserId = pickFirstString(
+      self?.userId,
+      getStoredUserId(),
+      safeGet("persist_user_id")
+    );
+    if (!requesterUserId) {
+      throw new Error("Aktif kullanıcı kimliği bulunamadı. Sayfayı yenileyip tekrar deneyin.");
+    }
 
     let item = await fetchItemDetails(itemId);
     if (!item) throw new Error("Öğe bulunamadı");
@@ -1151,86 +1676,93 @@ export async function playNow(itemId) {
       return false;
     }
     if (item.Type === "Series") {
-      const best = await getBestEpisodeIdForSeries(item.Id, self.userId);
+      const best = await getBestEpisodeIdForSeries(item.Id, requesterUserId);
       if (!best) throw new Error("Bölüm bulunamadı");
       itemId = best;
       item = await fetchItemDetails(itemId);
     }
     if (item.Type === "Season") {
-      const best = await getBestEpisodeIdForSeason(item.Id, item.SeriesId, self.userId);
+      const best = await getBestEpisodeIdForSeason(item.Id, item.SeriesId, requesterUserId);
       if (!best) throw new Error("Bu sezonda hiç bölüm yok!");
       itemId = best;
       item = await fetchItemDetails(itemId);
     }
-    const sessions = await makeApiRequest(`/Sessions`);
-    const allClients = Array.isArray(sessions) ? sessions : [];
-    const videoClients = allClients.filter(s =>
-      s?.Capabilities?.PlayableMediaTypes?.includes("Video")
-    );
+    const normalizedItemId = String(itemId);
+    const resumeTicks = Math.max(0, Math.floor(Number(item?.UserData?.PlaybackPositionTicks) || 0));
 
-    if (!videoClients.length) {
-      throw new Error("Video oynatıcı bulunamadı. Lütfen bir TV/telefon uygulaması açın.");
-    }
-    const storedApiDevId = getStoredDeviceId();
-    let target = null;
-    if (storedApiDevId && storedUserId) {
-      target = videoClients.find(s =>
-        s?.DeviceId === storedApiDevId && s?.UserId === storedUserId
-      ) || null;
-    }
-    if (!target && storedApiDevId) {
-      target = videoClients.find(s => s?.DeviceId === storedApiDevId) || null;
-    }
-    if (!target) {
-      target = videoClients.find(s =>
-        s?.UserId === storedUserId && self?.deviceId && s?.DeviceId === self.deviceId
-      ) || null;
-    }
-    if (!target) {
-      target = videoClients.find(s => s?.UserId === storedUserId) || null;
-    }
-    if (!target && self?.sessionId) {
-      target = videoClients.find(s => s?.Id === self.sessionId) || null;
-    }
-    if (!target) {
-      target = videoClients
-        .filter(s => s?.LastActivityDate)
-        .sort((a, b) => new Date(b.LastActivityDate) - new Date(a.LastActivityDate))[0] || null;
+    const localKick = await tryLocalPlaybackStart(normalizedItemId, {
+      startPositionTicks: resumeTicks,
+      item
+    }).catch(() => ({ tried: false, started: false, attempts: [] }));
+
+    if (localKick?.started) {
+      window.currentPlayingItemId = itemId;
+      persistDebug({
+        at: Date.now(),
+        stage: "success",
+        itemId,
+        requesterUserId,
+        method: "local-direct"
+      });
+      return true;
     }
 
-    if (!target) {
-      throw new Error("Uygun oynatıcı cihaz bulunamadı");
-    }
+    persistDebug({
+      at: Date.now(),
+      stage: "local-failed",
+      itemId,
+      requesterUserId,
+      localTried: !!localKick?.tried,
+      localAttempts: Array.isArray(localKick?.attempts)
+        ? localKick.attempts.slice(0, 8)
+        : []
+    });
 
-    if (target.UserId && target.UserId !== storedUserId) {
-      console.warn("Hedef cihaz farklı kullanıcıya ait, yine de denenecek");
+    if (localKick?.tried) {
+      throw new Error("Yerel oynatıcı başlatılamadı. Sayfayı yenileyip tekrar deneyin.");
     }
-    const userItemData = await makeApiRequest(`/Users/${self.userId}/Items/${itemId}`);
-    const resumeTicks = userItemData?.UserData?.PlaybackPositionTicks || 0;
-    const playCommand = resumeTicks > 0 ? "PlayNow" : "PlayNow";
-    let playUrl = `/Sessions/${target.Id}/Playing?playCommand=${playCommand}&itemIds=${itemId}`;
-
-    if (resumeTicks > 0) {
-      playUrl += `&StartPositionTicks=${resumeTicks}`;
-    }
-    const res = await fetch(withServer(playUrl), {
-  method: "POST",
-  headers: buildEmbyHeaders({ 'Content-Type': 'application/json' }),
-  credentials: 'same-origin'
-});
-
-    if (!res.ok) {
-      const errorText = await res.text().catch(() => '');
-      throw new Error(`Oynatma komutu başarısız: ${res.status} ${errorText}`);
-    }
-
-    window.currentPlayingItemId = itemId;
-    if (target.DeviceName) {
-      console.log(`Oynatma komutu gönderildi: ${target.DeviceName}`);
-    }
-    return true;
+    throw new Error("Yerel oynatıcı bulunamadı. Sayfayı yenileyip tekrar deneyin.");
   } catch (err) {
     console.error("Oynatma hatası:", err);
+    let next = null;
+    try {
+      const prev = window.__jmsLastPlayNowTargetDebug || {};
+      next = {
+        ...prev,
+        at: Date.now(),
+        stage: "error",
+        error: String(err?.message || err || "")
+      };
+      window.__jmsLastPlayNowTargetDebug = next;
+      localStorage.setItem("jms:lastPlayNowDebug", JSON.stringify(next));
+    } catch {}
+
+    const userAgent = String((typeof navigator !== "undefined" && navigator.userAgent) || "");
+    const isAndroid = /android/i.test(userAgent);
+    const isLikelyWebView =
+      /; wv\)/i.test(userAgent) ||
+      /\bVersion\/\d+(\.\d+)?\b/i.test(userAgent) ||
+      !!window.ReactNativeWebView;
+    const isAndroidWebView = isAndroid && isLikelyWebView;
+    const hasSentAttempt =
+      Array.isArray(next?.attempts) &&
+      next.attempts.some((attempt) => attempt?.sent === true);
+    const isSoftSuccess = isAndroidWebView && next?.stage === "error" && hasSentAttempt;
+
+    if (isSoftSuccess) {
+      try {
+        const soft = {
+          ...next,
+          at: Date.now(),
+          stage: "soft-success",
+          suppressedErrorBadge: true
+        };
+        window.__jmsLastPlayNowTargetDebug = soft;
+        localStorage.setItem("jms:lastPlayNowDebug", JSON.stringify(soft));
+      } catch {}
+      return true;
+    }
+
     const errorMsg = err.message || "Oynatma sırasında bir hata oluştu";
     if (typeof window.showMessage === 'function') {
       window.showMessage(errorMsg, 'error');

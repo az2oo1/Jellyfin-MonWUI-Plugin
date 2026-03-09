@@ -4,6 +4,7 @@ import { updateSlidePosition } from '../positionUtils.js';
 import { createCheckbox, createImageTypeSelect, bindCheckboxKontrol, bindTersCheckboxKontrol, updateConfig } from "../settings.js";
 import { updateHeaderUserAvatar, updateAvatarStyles, clearAvatarCache } from "../userAvatar.js";
 import { showNotification } from "../player/ui/notification.js";
+import { initOsdHeaderRatings } from "../osdHeaderRatings.js";
 
 const _intOr = (v, def) => {
   const n = parseInt(v, 10);
@@ -154,7 +155,6 @@ const USER_ONLY_KEYS = [
             showProgressAsSeconds: formData.get('showProgressAsSeconds') === 'on',
             enableTrailerPlayback: formData.get('enableTrailerPlayback') === 'on',
             enableVideoPlayback: formData.get('enableVideoPlayback') === 'on',
-            gradientOverlayImageType: formData.get('gradientOverlayImageType'),
             manualBackdropSelection: formData.get('manualBackdropSelection') === 'on',
             indexZeroSelection: formData.get('indexZeroSelection') === 'on',
             backdropImageType: formData.get('backdropImageType'),
@@ -217,8 +217,9 @@ const USER_ONLY_KEYS = [
             enableCounterSystem: formData.get('enableCounterSystem') === 'on',
 
             enableDirectorRows: formData.get('enableDirectorRows') === 'on',
-            directorRowsCount: parseInt(localStorage.getItem("directorRowsCount"), 10) || 4,
-            directorRowsMinItemsPerDirector: parseInt(localStorage.getItem("directorRowsMinItemsPerDirector"), 10) || 8,
+            showDirectorRowsHeroCards: formData.get('showDirectorRowsHeroCards') === 'on',
+            directorRowsCount: _intOr(formData.get('directorRowsCount'), config.directorRowsCount ?? 4),
+            directorRowsMinItemsPerDirector: _intOr(formData.get('directorRowsMinItemsPerDirector'), config.directorRowsMinItemsPerDirector ?? 8),
             directorRowCardCount: parseInt(formData.get('directorRowCardCount'), 10),
             placeDirectorRowsAtBottom: formData.get('placeDirectorRowsAtBottom') === 'on',
             directorRowsUseTopGenres: formData.get('directorRowsUseTopGenres') === 'on',
@@ -229,9 +230,14 @@ const USER_ONLY_KEYS = [
 
             enableProfileChooser: formData.get('enableProfileChooser') === 'on',
             profileChooserAutoOpen: formData.get('profileChooserAutoOpen') === 'on',
+            profileChooserAutoOpenRequireQuickLogin: boolFromFd(
+              'profileChooserAutoOpenRequireQuickLogin',
+              config.profileChooserAutoOpenRequireQuickLogin !== false
+            ),
             profileChooserRememberTokens: formData.get('profileChooserRememberTokens') === 'on',
 
             enableRecentRows: formData.get('enableRecentRows') === 'on',
+            showRecentRowsHeroCards: formData.get('showRecentRowsHeroCards') === 'on',
             enableRecentMoviesRow: (() => {
               const master = formData.get('enableRecentRows') === 'on';
               if (!master) return false;
@@ -331,6 +337,7 @@ const USER_ONLY_KEYS = [
 
             enableStudioHubs: formData.get('enableStudioHubs') === 'on',
             enablePersonalRecommendations: formData.get('enablePersonalRecommendations') === 'on',
+            showPersonalRecsHeroCards: formData.get('showPersonalRecsHeroCards') === 'on',
             personalRecsCacheTtlMs: parseInt(formData.get('personalRecsCacheTtlMs'), 10) || 360,
             studioHubsHoverVideo: formData.get('studioHubsHoverVideo') === 'on',
             placePersonalRecsUnderStudioHubs: formData.get('placePersonalRecsUnderStudioHubs') === 'on',
@@ -627,6 +634,10 @@ const USER_ONLY_KEYS = [
               showLogo: formData.get('pauseOverlayShowLogo') === 'on',
               closeOnMouseMove: formData.get('pauseOverlayCloseOnMouseMove') === 'on',
               showBackdrop: formData.get('pauseOverlayShowBackdrop') === 'on',
+              showOsdHeaderRatings: formData.get('pauseOverlayShowOsdHeaderRatings') === 'on',
+              showOsdHeaderCommunityRating: formData.get('pauseOverlayShowOsdHeaderCommunityRating') === 'on',
+              showOsdHeaderCriticRating: formData.get('pauseOverlayShowOsdHeaderCriticRating') === 'on',
+              showOsdHeaderOfficialRating: formData.get('pauseOverlayShowOsdHeaderOfficialRating') === 'on',
               minVideoMinutes: pauseOverlayMinDurMin,
               showAgeBadge: formData.get('pauseOverlayShowAgeBadge') === 'on',
               ageBadgeDurationMs: Math.max(1000, (parseInt(formData.get('ageBadgeDurationSec'), 10) || 6) * 1000),
@@ -654,6 +665,9 @@ const USER_ONLY_KEYS = [
             : updatedConfig;
 
         updateConfig(toSave);
+        try { window.__jmsOsdHeaderRatings?.destroy?.(); } catch {}
+        try { initOsdHeaderRatings(); } catch {}
+        localStorage.removeItem('gradientOverlayImageType');
 
         if (!(cfgGuard?.forceGlobalUserSettings && !isAdmin)) {
           publishAdminSnapshotIfForced();
@@ -710,6 +724,10 @@ export function applyRawConfig(config) {
   Object.entries(config).forEach(([key, value]) => {
     try {
       if (key === 'settings.allowedTabs.v1') return;
+      if (key === 'gradientOverlayImageType') {
+        localStorage.removeItem(key);
+        return;
+      }
       if (typeof value === 'object') {
         localStorage.setItem(key, JSON.stringify(value));
       } else {
@@ -719,6 +737,8 @@ export function applyRawConfig(config) {
       console.warn(`'${key}' değeri ayarlanamadı:`, e);
     }
   });
+
+  localStorage.removeItem('gradientOverlayImageType');
 
   updateSlidePosition();
 

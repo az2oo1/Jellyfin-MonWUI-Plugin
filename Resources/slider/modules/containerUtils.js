@@ -2,7 +2,6 @@ import { getConfig } from "./config.js";
 import { applyContainerStyles } from "./positionUtils.js";
 import { fetchItemDetails } from "./api.js";
 import { calculateMatchPercentage } from "./hoverTrailerModal.js";
-import { withServer } from "./jfUrl.js";
 
 const config = getConfig();
 
@@ -15,24 +14,6 @@ export function createSlidesContainer(indexPage) {
     indexPage.insertBefore(slidesContainer, indexPage.firstChild);
   }
   return slidesContainer;
-}
-
-export function createGradientOverlay(imageUrl = "") {
-  const overlay = document.createElement("div");
-  overlay.className = "gradient-overlay";
-  if (!imageUrl) {
-    overlay.style.backgroundImage = "none";
-  } else {
-    const url = (typeof imageUrl === "string" && imageUrl.startsWith("/"))
-      ? withServer(imageUrl)
-      : imageUrl;
-    overlay.style.backgroundImage = `url(${url})`;
-    overlay.style.backgroundRepeat = "no-repeat";
-    overlay.style.backgroundPosition = "50%";
-    overlay.style.backgroundSize = "cover";
-    overlay.style.aspectRatio = "1 / 1";
-  }
-  return overlay;
 }
 
 export function createHorizontalGradientOverlay() {
@@ -57,11 +38,11 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
     const typeSpan = document.createElement("span");
     typeSpan.className = "type";
     const typeTranslations = {
-      Series: { text: config.languageLabels.dizi, icon: '<i class="fas fa-tv fa-lg"></i>' },
-      Season: { text: config.languageLabels.season, icon: '<i class="fas fa-tv fa-lg"></i>' },
-      Episode: { text: config.languageLabels.episode, icon: '<i class="fas fa-tv fa-lg"></i>' },
-      BoxSet: { text: config.languageLabels.boxset, icon: '<i class="fas fa-film fa-lg"></i>' },
-      Movie: { text: config.languageLabels.film, icon: '<i class="fas fa-film fa-lg"></i>' }
+      Series: { text: config.languageLabels.dizi, icon: '<i class="fas fa-tv "></i>' },
+      Season: { text: config.languageLabels.season, icon: '<i class="fas fa-tv "></i>' },
+      Episode: { text: config.languageLabels.episode, icon: '<i class="fas fa-tv "></i>' },
+      BoxSet: { text: config.languageLabels.boxset, icon: '<i class="fas fa-film "></i>' },
+      Movie: { text: config.languageLabels.film, icon: '<i class="fas fa-film "></i>' }
     };
     const typeInfo = typeTranslations[itemType] || { text: itemType, icon: "" };
     typeSpan.innerHTML = `${typeInfo.icon} ${typeInfo.text}`;
@@ -78,8 +59,8 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
     const watchedSpan = document.createElement("span");
     watchedSpan.className = "watched-status";
     let watchedText = UserData.Played
-      ? `<i class="fa-light fa-circle-check fa-lg"></i> ${config.languageLabels.izlendi}`
-      : `<i class="fa-light fa-circle-xmark fa-lg"></i> ${config.languageLabels.izlenmedi}`;
+      ? `<i class="fa-light fa-circle-check "></i> ${config.languageLabels.izlendi}`
+      : `<i class="fa-light fa-circle-xmark "></i> ${config.languageLabels.izlenmedi}`;
     if (UserData.Played && UserData.PlayCount > 0) {
       watchedText += ` (${UserData.PlayCount})`;
     }
@@ -87,9 +68,10 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
     statusContainer.appendChild(watchedSpan);
   }
 
-  if (RunTimeTicks && config.showRuntimeInfo) {
+    if (RunTimeTicks && config.showRuntimeInfo) {
     const runtimeSpan = document.createElement("span");
     runtimeSpan.className = "sure";
+
     const calcRuntime = (ticks) => {
       const totalMinutes = Math.floor(ticks / 600000000);
       const hours = Math.floor(totalMinutes / 60);
@@ -98,11 +80,45 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
         ? `${hours}${config.languageLabels.sa} ${minutes}${config.languageLabels.dk}`
         : `${minutes}${config.languageLabels.dk}`;
     };
-    runtimeSpan.innerHTML = `<i class="fa-regular fa-hourglass-end fa-lg"></i> ${
-      Array.isArray(RunTimeTicks)
-        ? RunTimeTicks.map(val => calcRuntime(val)).join(", ")
-        : calcRuntime(RunTimeTicks)
-    }`;
+
+    const formatEndTimeLocalized = (ticks) => {
+      const totalMinutes = Math.floor(ticks / 600000000);
+      const end = new Date(Date.now() + totalMinutes * 60 * 1000);
+      const locale = String(config?.languageLabels?.timeLocale || "tr-TR").trim() || "tr-TR";
+
+      try {
+        return new Intl.DateTimeFormat(locale, {
+          hour: "numeric",
+          minute: "2-digit"
+        }).format(end);
+      } catch {
+        const hh = String(end.getHours()).padStart(2, "0");
+        const mm = String(end.getMinutes()).padStart(2, "0");
+        return `${hh}:${mm}`;
+      }
+    };
+
+    if (Array.isArray(RunTimeTicks)) {
+      runtimeSpan.innerHTML = `<i class="fa-regular fa-hourglass-end "></i> ${
+        RunTimeTicks.map(val => calcRuntime(val)).join(", ")
+      }`;
+    } else {
+      const remainingTicks =
+        typeof UserData?.PlaybackPositionTicks === "number" &&
+        UserData.PlaybackPositionTicks > 0 &&
+        UserData.PlaybackPositionTicks < RunTimeTicks
+          ? Math.max(RunTimeTicks - UserData.PlaybackPositionTicks, 0)
+          : RunTimeTicks;
+      const endHHMM = formatEndTimeLocalized(remainingTicks);
+      const endTimeLabel = String(config?.languageLabels?.endTimeLabel || "").trim();
+      runtimeSpan.innerHTML = `
+        <i class="fa-regular fa-hourglass-end "></i> ${calcRuntime(RunTimeTicks)}
+        <span class="end-time">
+          <i class="fa-regular fa-clock"></i> ${endTimeLabel ? `${endTimeLabel} ` : ""}${endHHMM}
+        </span>
+      `.trim();
+    }
+
     statusContainer.appendChild(runtimeSpan);
   }
 
@@ -160,7 +176,11 @@ export async function createActorSlider(People, config, item) {
 
   let actualPeople = People;
 
-  if ((item.Type === "Episode" || item.Type === "Season") && item.SeriesId) {
+  if (
+    (item.Type === "Episode" || item.Type === "Season") &&
+    item.SeriesId &&
+    (!Array.isArray(actualPeople) || actualPeople.length === 0)
+  ) {
     try {
       const parent = await fetchItemDetails(item.SeriesId);
       if (parent && Array.isArray(parent.People)) {
@@ -250,48 +270,36 @@ export async function createActorSlider(People, config, item) {
 export function createInfoContainer({ config, Genres, ProductionYear, ProductionLocations }) {
   const container = document.createElement("div");
   container.className = "info-container";
-  applyContainerStyles(container, 'info');
+  applyContainerStyles(container, "info");
 
-  const normalizeKey = str =>
-    str?.toString().toLowerCase().replace(/\s+/g, "");
+  const normalizeKey = (str) => str?.toString().toLowerCase().replace(/\s+/g, "");
 
-  if (Genres && Genres.length && config.showGenresInfo) {
-    const genresSpan = document.createElement("span");
-    genresSpan.className = "genres";
-    genresSpan.innerHTML = `<i class="fa-regular fa-masks-theater"></i> ${Genres.map(
-      genre => {
-        const key = normalizeKey(genre);
-        const matchedEntry = Object.entries(config.languageLabels.turler || {}).find(
-          ([labelKey]) => normalizeKey(labelKey) === key
-        );
-        return matchedEntry ? matchedEntry[1] : genre;
-      }
-    ).join(", ")} <i class="fa-solid fa-sparkle fa-2xs" style="color: #ffffff;"></i>`;
-    container.appendChild(genresSpan);
+  const parts = [];
+
+  if (Array.isArray(Genres) && Genres.length && config.showGenresInfo) {
+    const translated = Genres.map((genre) => {
+      const key = normalizeKey(genre);
+      const matchedEntry = Object.entries(config.languageLabels.turler || {}).find(
+        ([labelKey]) => normalizeKey(labelKey) === key
+      );
+      return matchedEntry ? matchedEntry[1] : genre;
+    }).join(", ");
+
+    parts.push(`<span class="genres"><i class="fa-regular fa-masks-theater"></i> ${translated}</span>`);
   }
 
   if (ProductionYear && config.showYearInfo) {
-    const yearSpan = document.createElement("span");
-    yearSpan.className = "yil";
-    yearSpan.innerHTML = `<i class="fa-regular fa-calendar"></i> ${
-      Array.isArray(ProductionYear)
-        ? ProductionYear.join(
-            '<i class="fa-solid fa-sparkle fa-2xs" style="color: #ffffff;"></i>'
-          )
-        : ProductionYear
-    } <i class="fa-solid fa-sparkle fa-2xs" style="color: #ffffff;"></i>`;
-    container.appendChild(yearSpan);
+    const yearText = Array.isArray(ProductionYear) ? ProductionYear.join(", ") : ProductionYear;
+    parts.push(`<span class="yil"><i class="fa-regular fa-calendar"></i> ${yearText}</span>`);
   }
 
   if (ProductionLocations && config.showCountryInfo) {
-    const countrySpan = document.createElement("span");
-    countrySpan.className = "ulke";
     const getFlagEmoji = (code) =>
       code
         ? code
             .toUpperCase()
             .split("")
-            .map(char => String.fromCodePoint(127397 + char.charCodeAt()))
+            .map((char) => String.fromCodePoint(127397 + char.charCodeAt()))
             .join("")
         : "";
 
@@ -305,23 +313,25 @@ export function createInfoContainer({ config, Genres, ProductionYear, Production
         : { code: countryRaw.slice(0, 2).toUpperCase(), name: countryRaw };
     };
 
-    countrySpan.innerHTML = `<i class="fa-regular fa-location-dot"></i> ${
-      Array.isArray(ProductionLocations)
-        ? ProductionLocations.map(c => {
-            const info = getCountryInfo(c);
-            return `${getFlagEmoji(info.code)} ${info.name}`;
-          }).join(' <i class="fa-solid fa-sparkle fa-2xs" style="color: #ffffff;"></i> ')
-        : (() => {
-            const info = getCountryInfo(ProductionLocations);
-            return `${getFlagEmoji(info.code)} ${info.name}`;
-          })()
-    }`;
-    container.appendChild(countrySpan);
+    const countryText = Array.isArray(ProductionLocations)
+      ? ProductionLocations.map((c) => {
+          const info = getCountryInfo(c);
+          return `${getFlagEmoji(info.code)} ${info.name}`;
+        }).join(", ")
+      : (() => {
+          const info = getCountryInfo(ProductionLocations);
+          return `${getFlagEmoji(info.code)} ${info.name}`;
+        })();
+
+    parts.push(`<span class="ulke"><i class="fa-regular fa-location-dot"></i> ${countryText}</span>`);
   }
+
+  container.innerHTML = parts.join(` <span class="info-sep">✧</span> `);
+
+  if (!parts.length) container.style.display = "none";
 
   return container;
 }
-
 
 export async function createDirectorContainer({ config, People, item }) {
   const container = document.createElement("div");
@@ -330,7 +340,11 @@ export async function createDirectorContainer({ config, People, item }) {
 
   let actualPeople = People;
 
-  if ((item.Type === "Episode" || item.Type === "Season") && item.SeriesId) {
+  if (
+    (item.Type === "Episode" || item.Type === "Season") &&
+    item.SeriesId &&
+    (!Array.isArray(actualPeople) || actualPeople.length === 0)
+  ) {
     try {
       const parent = await fetchItemDetails(item.SeriesId);
       if (parent && Array.isArray(parent.People)) {
@@ -395,9 +409,9 @@ export async function createRatingContainer({
       matchSpan.className = "match-percentage";
       matchSpan.innerHTML = `
   <span class="match-rating">
-    <i class="fa-regular fa-heart fa-xl"></i>
+    <i class="fa-regular fa-heart fa-lg"></i>
     <span class="heart-filled" style="clip-path: inset(${100 - matchPercentage}% 0 0 0);">
-      <i class="fa-solid fa-heart fa-xl"></i>
+      <i class="fa-solid fa-heart fa-lg"></i>
     </span>
   </span>
   <span class="percentage-text">${matchPercentage}%</span>`;
@@ -434,7 +448,7 @@ export async function createRatingContainer({
     if (config.showCriticRating && CriticRating) {
       const criticSpan = document.createElement("span");
       criticSpan.className = "t-rating";
-      criticSpan.innerHTML = `<i class="fa-duotone fa-solid fa-tomato fa-lg" style="--fa-primary-color: #01902e; --fa-secondary-color: #f93208; --fa-secondary-opacity: 1;"></i> ${
+      criticSpan.innerHTML = `<i class="fa-duotone fa-solid fa-tomato " style="--fa-primary-color: #01902e; --fa-secondary-color: #f93208; --fa-secondary-opacity: 1;"></i> ${
         Array.isArray(CriticRating) ? CriticRating.join(", ") : CriticRating
       } `;
       container.appendChild(criticSpan);
@@ -444,7 +458,7 @@ export async function createRatingContainer({
     if (config.showOfficialRating && OfficialRating) {
       const officialRatingSpan = document.createElement("span");
       officialRatingSpan.className = "officialrating";
-      officialRatingSpan.innerHTML = `<i class="fa-solid fa-family fa-lg"></i> ${
+      officialRatingSpan.innerHTML = `<i class="fa-solid fa-family "></i> ${
         Array.isArray(OfficialRating) ? OfficialRating.join(", ") : OfficialRating
       }`;
       container.appendChild(officialRatingSpan);

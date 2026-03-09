@@ -453,15 +453,6 @@ export function createSliderPanel(config, labels) {
   delayDiv.append(delayLabel, delayInput);
   sliderDiv.appendChild(delayDiv);
 
-  const gradientDiv = document.createElement('div');
-  gradientDiv.className = 'fsetting-item gradient-overlay-container';
-  const gradientLabel = document.createElement('label');
-  gradientLabel.textContent = labels.gradientOverlayImageType || 'Yerleşik Fragman Oynatıldığında Gösterilecek Görsel Türü:';
-  const gradientSelect = createImageTypeSelect('gradientOverlayImageType', config.gradientOverlayImageType || 'backdropUrl', true);
-  gradientLabel.htmlFor = 'gradientInput';
-  gradientDiv.append(gradientLabel, gradientSelect);
-  sliderDiv.appendChild(gradientDiv);
-
   const backgroundOptionsDiv = document.createElement('div');
   backgroundOptionsDiv.className = 'fsetting-item';
 
@@ -804,14 +795,10 @@ function updateTrailerRelatedFields() {
   const isEnabled = !!(t || v || tv);
 
   const trailerDelayContainer = document.querySelector('.trailer-delay-container');
-  const gradientOverlayContainer = document.querySelector('.gradient-overlay-container');
-
-  if (trailerDelayContainer && gradientOverlayContainer) {
+  if (trailerDelayContainer) {
     trailerDelayContainer.style.opacity = isEnabled ? 1 : 0.6;
-    gradientOverlayContainer.style.opacity = isEnabled ? 1 : 0.6;
 
     trailerDelayContainer.querySelectorAll('input, select').forEach(el => el.disabled = !isEnabled);
-    gradientOverlayContainer.querySelectorAll('input, select').forEach(el => el.disabled = !isEnabled);
   }
 }
 document.addEventListener('DOMContentLoaded', updateTrailerRelatedFields);

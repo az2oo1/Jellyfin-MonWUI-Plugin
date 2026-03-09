@@ -2,18 +2,36 @@ import { getYoutubeEmbedUrl, getProviderUrl, isValidUrl, createTrailerIframe, de
 import { updateFavoriteStatus, updatePlayedStatus, fetchItemDetails, goToDetailsPage } from "./api.js";
 import { getConfig } from "./config.js";
 import { getLanguageLabels, getDefaultLanguage } from "../language/index.js";
-import { createSlidesContainer, createGradientOverlay, createHorizontalGradientOverlay, createLogoContainer, createStatusContainer, createActorSlider, createInfoContainer, createDirectorContainer, createRatingContainer, createLanguageContainer, createMetaContainer, createMainContentContainer, createPlotContainer, createTitleContainer } from "./containerUtils.js";
+import { createSlidesContainer, createHorizontalGradientOverlay, createLogoContainer, createStatusContainer, createActorSlider, createInfoContainer, createDirectorContainer, createRatingContainer, createLanguageContainer, createMetaContainer, createMainContentContainer, createPlotContainer, createTitleContainer } from "./containerUtils.js";
 import { createButtons, createProviderContainer } from './buttons.js';
 import { withServer, withServerSrcset } from "./jfUrl.js";
 
 const S = (u) => withServer(u);
 const config = getConfig();
+const LOW_POWER_PEAK = (() => {
+  try {
+    const ua = String((typeof navigator !== 'undefined' && navigator.userAgent) || '');
+    const uaMobile = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+    const coarse = window.matchMedia?.('(pointer: coarse)')?.matches === true || navigator.maxTouchPoints > 0;
+    const shortestSide = Math.min(
+      window.innerWidth || window.screen?.width || 0,
+      window.innerHeight || window.screen?.height || 0
+    );
+    return !!config.peakSlider && coarse && (!!window.ReactNativeWebView || uaMobile || (shortestSide > 0 && shortestSide <= 1280));
+  } catch {
+    return false;
+  }
+})();
 const settingsBackgroundSlides = [];
-const backdropWarmQueue = createImageWarmQueue({ concurrency: 3 });
+const backdropWarmQueue = createImageWarmQueue({ concurrency: LOW_POWER_PEAK ? 1 : 3 });
 window.__backdropWarmQueue = backdropWarmQueue;
 
-const BG_HYDRATION_PER_FRAME = 12;
+const BG_HYDRATION_PER_FRAME = LOW_POWER_PEAK ? 4 : 12;
 const NEIGHBOR_WARM_COUNT = 2;
+const BG_IO_ROOT_MARGIN = LOW_POWER_PEAK ? '240px 0px' : '800px 0px';
+const WARM_OBSERVER_ROOT_MARGIN = LOW_POWER_PEAK ? '160px 0px' : '600px 0px';
+const PRELOAD_IO_ROOT_MARGIN = LOW_POWER_PEAK ? '220px 0px' : '800px 0px';
+const BG_SCROLL_IDLE_MS = LOW_POWER_PEAK ? 160 : 120;
 let __bgHydrationQueue = [];
 let __bgHydrationRAF = 0;
 let __bgScrollActive = false;
@@ -44,11 +62,16 @@ function bgFlushHydrationFrame() {
   const st = document.createElement('style');
   st.id = 'backdrop-perf-css';
   st.textContent = `
-    .backdrop { opacity: 1; transition: opacity .5s ease; will-change: opacity, filter, transform; transform: translateZ(0); }
-    .backdrop.is-lqip { filter: blur(16px); transform: scale(1.03); }
+    .backdrop {
+      opacity: 1;
+      transition: opacity .28s ease, filter .34s ease, transform .34s cubic-bezier(.2,.6,.2,1);
+      will-change: opacity, filter, transform;
+      transform: translateZ(0);
+    }
+    .backdrop.is-lqip { filter: blur(14px); transform: scale(1.02); }
+    .backdrop.is-hi-pending { opacity: .94; }
     #slides-container.is-scrolling *,
     #slides-container.is-scrolling .backdrop,
-    #slides-container.is-scrolling .gradient-overlay,
     #slides-container.is-scrolling .horizontal-gradient-overlay {
       transition: none !important;
       animation: none !important;
@@ -71,26 +94,77 @@ function bgFlushHydrationFrame() {
 const __bgIO = new IntersectionObserver((entries) => {
   for (const ent of entries) {
     const img = ent.target;
-    const data = img.__bgData || {};
-    if (ent.isIntersecting) {
-      if (!img.__hiRequested) {
-        img.__hiRequested = true;
-        img.__phase = 'hi';
-        bgQueueHydration(() => {
-          if (!img.isConnected) return;
-          if (data.hqSrcset) img.srcset = data.hqSrcset;
-          if (data.hqSrc)    img.src    = data.hqSrc;
-        });
-      }
-    }
+    if (!ent.isIntersecting) continue;
+    if (img.__peakManaged && !isPeakBackdropEligible(img)) continue;
+    img.__requestHi?.();
   }
-}, { rootMargin: '800px 0px' });
+}, { rootMargin: BG_IO_ROOT_MARGIN });
+
+function isPeakBackdropEligible(img) {
+  if (!img?.__peakManaged) return true;
+  const slide = img.closest?.('.slide');
+  if (!slide) return false;
+  return slide.classList.contains('active') || slide.classList.contains('peak-neighbor');
+}
 
 function hydrateBackdrop(img, { lqSrc, hqSrc, hqSrcset = '', fallback = '', eager = false, onHiLoaded }) {
   const fb = fallback || lqSrc || '';
   img.__bgData = { lqSrc, hqSrc, hqSrcset, fallback: fb };
   img.__phase = 'lq';
   img.__hiRequested = false;
+  img.__peakHiTimer = 0;
+  img.__fetchPriorityTarget = '';
+
+  img.__clearPeakHiTimer = () => {
+    if (!img.__peakHiTimer) return;
+    clearTimeout(img.__peakHiTimer);
+    img.__peakHiTimer = 0;
+  };
+
+  img.__requestHi = ({ eagerLoad = false, fetchPriority = '' } = {}) => {
+    const data = img.__bgData || {};
+    if (!data.hqSrc || !img.isConnected) return;
+    if (img.__phase === 'hi' && img.__hiRequested && (!data.hqSrcset || img.srcset === data.hqSrcset) && img.src === data.hqSrc) {
+      return;
+    }
+    img.__clearPeakHiTimer?.();
+    img.__hiRequested = true;
+    img.__phase = 'hi';
+    img.__fetchPriorityTarget = fetchPriority || '';
+    img.classList.add('is-hi-pending');
+    bgQueueHydration(() => {
+      if (!img.isConnected) return;
+      try {
+        if (fetchPriority) img.setAttribute('fetchpriority', fetchPriority);
+        else img.removeAttribute('fetchpriority');
+      } catch {}
+      try { img.loading = eagerLoad ? 'eager' : 'auto'; } catch {}
+      try { img.decoding = eagerLoad ? 'auto' : 'async'; } catch {}
+      if (data.hqSrcset) img.srcset = data.hqSrcset;
+      if (data.hqSrc) img.src = data.hqSrc;
+    });
+  };
+
+  img.__requestLq = () => {
+    const data = img.__bgData || {};
+    const target = data.lqSrc || data.fallback;
+    if (!target || !img.isConnected) return;
+    if (img.__phase === 'lq' && img.src === target && !img.srcset) return;
+    img.__clearPeakHiTimer?.();
+    img.__hiRequested = false;
+    img.__phase = 'lq';
+    img.__fetchPriorityTarget = '';
+    bgQueueHydration(() => {
+      if (!img.isConnected) return;
+      try { img.removeAttribute('srcset'); } catch {}
+      try { img.removeAttribute('fetchpriority'); } catch {}
+      try { img.loading = 'lazy'; } catch {}
+      try { img.decoding = 'async'; } catch {}
+      img.classList.add('is-lqip');
+      img.classList.remove('is-hi-pending');
+      if (img.src !== target) img.src = target;
+    });
+  };
 
   try { img.removeAttribute('srcset'); } catch {}
   img.classList.add('is-lqip');
@@ -108,18 +182,24 @@ function hydrateBackdrop(img, { lqSrc, hqSrc, hqSrcset = '', fallback = '', eage
       try { img.removeAttribute('srcset'); } catch {}
       if (lqSrc) img.src = lqSrc; else if (fb) img.src = fb;
       img.classList.add('is-lqip');
+      img.classList.remove('is-hi-pending');
       img.__phase = 'lq';
       img.__hiRequested = false;
+      img.__fetchPriorityTarget = '';
     }
   };
   const onLoad = () => {
     if (img.__phase === 'hi') {
       img.classList.remove('is-lqip');
+      img.classList.remove('is-hi-pending');
       img.style.opacity = '1';
       img.__hydrated = true;
       try { img.loading = 'eager'; } catch {}
       try { img.decoding = 'auto'; } catch {}
-      try { img.setAttribute('fetchpriority','high'); } catch {}
+      try {
+        if (img.__fetchPriorityTarget) img.setAttribute('fetchpriority', img.__fetchPriorityTarget);
+        else img.removeAttribute('fetchpriority');
+      } catch {}
       if (typeof onHiLoaded === 'function') { try { onHiLoaded(); } catch {} }
     } else {
       img.style.opacity = '1';
@@ -133,14 +213,12 @@ function hydrateBackdrop(img, { lqSrc, hqSrc, hqSrcset = '', fallback = '', eage
 
   __bgIO.observe(img);
   if (eager && hqSrc) {
-    img.__phase = 'hi';
-    img.__hiRequested = true;
-    if (hqSrcset) img.srcset = hqSrcset;
-    img.src = hqSrc;
+    img.__requestHi({ eagerLoad: true, fetchPriority: 'high' });
   }
 }
 
 function unobserveBackdrop(img) {
+  try { img.__clearPeakHiTimer?.(); } catch {}
   try { __bgIO.unobserve(img); } catch {}
   try { img.removeEventListener('error', img.__bgOnErr); } catch {}
   try { img.removeEventListener('load',  img.__bgOnLoad); } catch {}
@@ -257,7 +335,7 @@ async function createSlide(item) {
         if (!__bgHydrationRAF && __bgHydrationQueue.length) {
           __bgHydrationRAF = requestAnimationFrame(bgFlushHydrationFrame);
         }
-      }, 120);
+      }, BG_SCROLL_IDLE_MS);
     };
     scroller.addEventListener('scroll', onScrollPerf, { passive: true });
   })();
@@ -309,7 +387,7 @@ async function createSlide(item) {
   if (config.manualBackdropSelection || config.indexZeroSelection) {
     highestQualityBackdropIndex = "0";
   } else {
-    highestQualityBackdropIndex = await getHighestQualityBackdropIndex(parentId);
+    highestQualityBackdropIndex = await getHighestQualityBackdropIndex(parentId, { itemDetails: item });
   }
 
   function storeBackdropUrl(id, url) {
@@ -367,18 +445,6 @@ async function createSlide(item) {
     slide.dataset.runtimeticks = RunTimeTicks;
   }
 
-  const selectedOverlayUrl = {
-    backdropUrl: autoBackdropUrl,
-    landscapeUrl,
-    primaryUrl,
-    logoUrl,
-    bannerUrl,
-    artUrl,
-    discUrl,
-    none: ""
-  }[config.gradientOverlayImageType];
-
-  slide.dataset.background = S(selectedOverlayUrl);
   slide.dataset.backdropUrl = autoBackdropUrl;
   slide.dataset.landscapeUrl = landscapeUrl;
   slide.dataset.primaryUrl = primaryUrl;
@@ -395,11 +461,14 @@ async function createSlide(item) {
   const absPlaceholder = S(placeholderUrl);
   const absSrcset = withServerSrcset(srcset || "");
   const finalBackdropForWarm = absBackdrop;
+  const allowPeakWarm = !config.peakSlider || isFirstSlide;
+  slide.dataset.background = absBackdrop || S(autoBackdropUrl);
 
   const backdropImg = document.createElement('img');
   backdropImg.className = 'backdrop';
   backdropImg.alt = 'Backdrop';
   backdropImg.sizes = '100vw';
+  backdropImg.__peakManaged = !!config.peakSlider;
   if (isFirstSlide) backdropImg.setAttribute('fetchpriority', 'high');
 
   hydrateBackdrop(backdropImg, {
@@ -410,18 +479,20 @@ async function createSlide(item) {
     onHiLoaded: () => {  }
   });
 
-  backdropWarmQueue.enqueue(finalBackdropForWarm, { shortPreload: true });
-  const warmObserver = new IntersectionObserver((entries, obs) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        shortPreload(finalBackdropForWarm, 1500);
-        warmImageOnce(finalBackdropForWarm).catch(() => {});
-        obs.unobserve(entry.target);
-      }
-    });
-  }, { root: null, rootMargin: '600px 0px' });
-  warmObserver.observe(backdropImg);
-  perSlideObservers.push(warmObserver);
+  if ((!LOW_POWER_PEAK || isFirstSlide) && allowPeakWarm) {
+    backdropWarmQueue.enqueue(finalBackdropForWarm, { shortPreload: true });
+    const warmObserver = new IntersectionObserver((entries, obs) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting && (!backdropImg.__peakManaged || isPeakBackdropEligible(backdropImg))) {
+          shortPreload(finalBackdropForWarm, 1500);
+          warmImageOnce(finalBackdropForWarm).catch(() => {});
+          obs.unobserve(entry.target);
+        }
+      });
+    }, { root: null, rootMargin: WARM_OBSERVER_ROOT_MARGIN });
+    warmObserver.observe(backdropImg);
+    perSlideObservers.push(warmObserver);
+  }
 
   const pinActiveIfNeeded = () => {
     const slideEl = backdropImg.closest('.slide');
@@ -433,27 +504,32 @@ async function createSlide(item) {
   backdropImg.addEventListener('load', pinActiveIfNeeded, { once:true, passive:true, signal });
 
   const warmOnHover = () => { warmImageOnce(finalBackdropForWarm).catch(() => {}); };
-  backdropImg.addEventListener('mouseenter',  warmOnHover, { passive: true, signal });
-  backdropImg.addEventListener('pointerover', warmOnHover, { passive: true, signal });
-  const ioPreload = new IntersectionObserver((entries, observer) => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      const finalBackdrop = config.manualBackdropSelection ? manualBackdropUrl : backdropUrl;
-      let preload = document.querySelector(`link[rel="preload"][as="image"][href="${finalBackdrop}"]`);
-      if (!preload) {
-        preload = document.createElement('link');
-        preload.rel = 'preload';
-        preload.as = 'image';
-        preload.href = finalBackdrop;
-        document.head.appendChild(preload);
-      }
-      const tid = setTimeout(() => { try { if (preload && !preload.__pinned) preload.remove(); } catch {} }, 1500);
-      perSlideCleanups.push(() => clearTimeout(tid));
-      observer.unobserve(entry.target);
-    });
-  }, { rootMargin: '800px 0px' });
-  ioPreload.observe(backdropImg);
-  perSlideObservers.push(ioPreload);
+  if (!LOW_POWER_PEAK) {
+    backdropImg.addEventListener('mouseenter',  warmOnHover, { passive: true, signal });
+    backdropImg.addEventListener('pointerover', warmOnHover, { passive: true, signal });
+  }
+  if ((!LOW_POWER_PEAK || isFirstSlide) && allowPeakWarm) {
+    const ioPreload = new IntersectionObserver((entries, observer) => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        if (backdropImg.__peakManaged && !isPeakBackdropEligible(backdropImg)) return;
+        const finalBackdrop = config.manualBackdropSelection ? manualBackdropUrl : backdropUrl;
+        let preload = document.querySelector(`link[rel="preload"][as="image"][href="${finalBackdrop}"]`);
+        if (!preload) {
+          preload = document.createElement('link');
+          preload.rel = 'preload';
+          preload.as = 'image';
+          preload.href = finalBackdrop;
+          document.head.appendChild(preload);
+        }
+        const tid = setTimeout(() => { try { if (preload && !preload.__pinned) preload.remove(); } catch {} }, 1500);
+        perSlideCleanups.push(() => clearTimeout(tid));
+        observer.unobserve(entry.target);
+      });
+    }, { rootMargin: PRELOAD_IO_ROOT_MARGIN });
+    ioPreload.observe(backdropImg);
+    perSlideObservers.push(ioPreload);
+  }
 
   backdropImg.addEventListener('click', (ev) => {
   const slideEl = ev.currentTarget.closest('.slide');
@@ -478,10 +554,10 @@ async function createSlide(item) {
   };
 
   slide.__cleanupSlide = teardown;
+  slide.__backdropImg = backdropImg;
 
-  const gradientOverlay = createGradientOverlay(selectedOverlayUrl);
   const horizontalGradientOverlay = createHorizontalGradientOverlay();
-  slide.append(backdropImg, gradientOverlay, horizontalGradientOverlay);
+  slide.append(backdropImg, horizontalGradientOverlay);
 
   if (!slide.__trailerInit) {
    slide.__trailerInit = true;
@@ -586,7 +662,7 @@ async function createSlide(item) {
   UserData,
   item
 });
-  const providerContainer = createProviderContainer({ config, ProviderIds, RemoteTrailers, itemId, slide });
+  const providerContainer = createProviderContainer({ config, ProviderIds, RemoteTrailers, itemId, slide, item });
   const languageContainer = createLanguageContainer({ config, MediaStreams, itemType });
 
   const metaContainer = createMetaContainer();

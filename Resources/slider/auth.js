@@ -190,12 +190,17 @@ export function getWebClientHints() {
   try {
     const ac = window.ApiClient || window.apiClient || null;
     if (ac) {
+      hints.userId =
+        (typeof ac.getCurrentUserId === "function" ? ac.getCurrentUserId() : ac._currentUserId) || null;
       hints.sessionId =
         ac._sessionId || ac.sessionId || ac?.connectionManager?._session?.Id || null;
       hints.deviceId =
         ac._deviceId || (typeof ac.deviceId === "function" ? ac.deviceId() : ac.deviceId) || null;
       hints.accessToken =
-        ac._authToken || ac.accessToken || ac?._serverInfo?.AccessToken || null;
+        ac._authToken ||
+        (typeof ac.accessToken === "function" ? ac.accessToken() : ac.accessToken) ||
+        ac?._serverInfo?.AccessToken ||
+        null;
       hints.clientName = ac._appName || ac.name || "Jellyfin Web";
       hints.clientVersion = ac._appVersion || ac.appVersion || "1.0.0";
       hints.serverId =

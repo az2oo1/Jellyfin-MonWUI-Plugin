@@ -1,6 +1,9 @@
 import { makeApiRequest, getSessionInfo, getCachedUserTopGenres } from "./api.js";
 import { getConfig } from "./config.js";
 import { withServer } from "./jfUrl.js";
+import { openDetailsModal } from "./detailsModal.js";
+
+const IS_MOBILE = (navigator.maxTouchPoints > 0) || (window.innerWidth <= 820);
 
 const COMMON_FIELDS = [
   "PrimaryImageAspectRatio",
@@ -41,6 +44,76 @@ function buildPosterSrcSet(item) {
 function getDetailsUrl(itemId, serverId) {
   return `#/details?id=${itemId}&serverId=${encodeURIComponent(serverId)}`;
 }
+
+function getActiveExplorerServerId() {
+  return __serverId || __d_serverId || __p_serverId || getSessionInfo()?.serverId || "";
+}
+
+function getExplorerCardOrigin(cardEl) {
+  return (
+    cardEl?.querySelector?.(".cardImage") ||
+    cardEl?.querySelector?.(".cardImageContainer") ||
+    cardEl
+  );
+}
+
+async function openExplorerCardDetails(cardEl) {
+  const itemId = String(cardEl?.dataset?.itemId || "");
+  if (!itemId) return;
+
+  const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+  try {
+    await openDetailsModal({
+      itemId,
+      serverId: getActiveExplorerServerId(),
+      preferBackdropIndex: backdropIndex,
+      originEl: getExplorerCardOrigin(cardEl),
+    });
+  } catch (err) {
+    console.warn("openDetailsModal failed (explorer card):", err);
+  }
+}
+
+function bindExplorerGridDetails(grid) {
+  if (!grid) return;
+
+  grid.addEventListener('click', async (e) => {
+    const card = e.target.closest('a.ge-card');
+    if (!card) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await openExplorerCardDetails(card);
+  }, { passive: false });
+
+  grid.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const card = e.target.closest('a.ge-card');
+    if (!card) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await openExplorerCardDetails(card);
+  }, { passive: false });
+}
+
+function closeActiveExplorers() {
+  if (__overlay) {
+    try { closeGenreExplorer(true); } catch {}
+  }
+  if (__d_overlay) {
+    try { closeDirectorExplorer(true); } catch {}
+  }
+  if (__p_overlay) {
+    try { closePersonalExplorer(true); } catch {}
+  }
+}
+
+(function bindDetailsModalPlayCloser() {
+  if (window.__jmsGenreExplorerPlayCloseBound) return;
+  window.__jmsGenreExplorerPlayCloseBound = true;
+  window.addEventListener("jms:details-modal-play", () => {
+    closeActiveExplorers();
+  }, { passive: true });
+})();
 
 function buildLogoUrl(item, width = 220, quality = 72) {
   const tag = item.ImageTags?.Logo || item.LogoImageTag;
@@ -146,6 +219,25 @@ const __imgIO = new IntersectionObserver((entries) => {
 
 function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const fb = fallback || PLACEHOLDER_URL;
+  if (IS_MOBILE) {
+    try { __imgIO.unobserve(img); } catch {}
+    try { if (img.__onErr) img.removeEventListener('error', img.__onErr); } catch {}
+    try { if (img.__onLoad) img.removeEventListener('load',  img.__onLoad); } catch {}
+    delete img.__onErr;
+    delete img.__onLoad;
+    try { img.removeAttribute('srcset'); } catch {}
+    if (hqSrcset) {
+      try { img.srcset = hqSrcset; } catch {}
+    }
+    img.src = hqSrc || lqSrc || fb;
+    img.classList.remove('is-lqip');
+    img.classList.add('__hydrated');
+    img.__phase = 'hi';
+    img.__hiRequested = true;
+    img.__hydrated = true;
+    return;
+  }
+
   img.__data = { lqSrc, hqSrc, hqSrcset, fallback: fb };
   img.__phase = 'lq';
   img.__hiRequested = false;
@@ -282,23 +374,7 @@ export function openGenreExplorer(genre) {
   injectGEPerfStyles();
   try { playOpenAnimation(__overlay); } catch {}
   const grid = __overlay.querySelector('.ge-grid');
-  grid.addEventListener('click', (e) => {
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
-  grid.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
+  bindExplorerGridDetails(grid);
 
   window.addEventListener('hashchange', hashCloser, { passive: true });
 
@@ -455,24 +531,7 @@ export function openDirectorExplorer(person) {
   try { d_playOpenAnimation(__d_overlay); } catch {}
 
   const grid = __d_overlay.querySelector('.ge-grid');
-  grid.addEventListener('click', (e) => {
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => d_animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
-
-  grid.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => d_animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
+  bindExplorerGridDetails(grid);
 
   window.addEventListener('hashchange', d_hashCloser, { passive: true });
   __d_overlay.querySelector('.ge-close').addEventListener('click', () => d_animatedCloseThen(), { passive:true });
@@ -697,10 +756,14 @@ function createCardFor(item) {
           ${community}
           <div class="prc-type-badge">
             <span class="prc-type-icon material-icons">${typeIcon}</span>
+            ${escapeHtml(typeLabel)}
           </div>
         </div>
         <div class="prc-gradient"></div>
         <div class="prc-overlay">
+          <div class="prc-titleline">
+            ${escapeHtml(item.Name || "")}
+          </div>
           <div class="prc-meta">
             ${ageChip ? `<span class="prc-age">${ageChip}</span><span class="prc-dot">•</span>` : ""}
             ${year ? `<span class="prc-year">${year}</span><span class="prc-dot">•</span>` : ""}
@@ -756,38 +819,11 @@ let __p_originPoint = null;
 let __p_isClosing = false;
 let __p_seenIds = new Set();
 let __p_seenKeys = new Set();
-
-async function p_fetchTopGenreSample(userId, limit = 30) {
-  let genres = [];
-  try { genres = await getCachedUserTopGenres(3); } catch {}
-  const params = new URLSearchParams();
-  params.set("IncludeItemTypes", "Movie,Series");
-  params.set("Recursive", "true");
-  params.set("Filters", "IsUnplayed");
-  params.set("Fields", COMMON_FIELDS);
-  params.set("SortBy", "Random,CommunityRating,DateCreated");
-  params.set("SortOrder", "Descending");
-  params.set("Limit", "180");
-
-  if (genres && genres.length) {
-    params.set("Genres", genres.join("|"));
-  }
-
-  const url = `/Users/${encodeURIComponent(userId)}/Items?` + params.toString();
-  const data = await makeApiRequest(url);
-  const items = Array.isArray(data?.Items) ? data.Items : [];
-
-  const seen = new Set();
-  const out = [];
-  for (const it of items) {
-    const k = makeItemKey(it);
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(it);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
+let __p_topGenres = [];
+let __p_genreStartIndex = 0;
+let __p_fallbackStartIndex = 0;
+let __p_genreDone = false;
+let __p_fallbackDone = false;
 
 function p_playOpenAnimation(overlayEl) {
   const sheet = overlayEl;
@@ -825,42 +861,84 @@ async function p_loadMore() {
 
   const LIMIT = 40;
   const { userId } = getSessionInfo();
-  let genres = [];
-  try {
-    genres = await getCachedUserTopGenres(3);
-  } catch {}
-
-  const params = new URLSearchParams();
-params.set("IncludeItemTypes", "Movie,Series");
-params.set("Recursive", "true");
-params.set("Filters", "IsUnplayed");
-params.set("Fields", COMMON_FIELDS);
-params.set("SortBy", "CommunityRating,DateCreated");
-params.set("SortOrder", "Descending");
-params.set("Limit", String(LIMIT));
-params.set("StartIndex", String(__p_startIndex));
-
-if (genres && genres.length) {
-  params.set("Genres", genres.join("|"));
-}
-
-const url = `/Users/${encodeURIComponent(userId)}/Items?` + params.toString();
-
-  try {
-    const data = await makeApiRequest(url, { signal: __p_abort.signal });
-    let items = Array.isArray(data?.Items) ? data.Items : [];
-    const unique = [];
-    for (const it of items) {
-      if (!it?.Id) continue;
-      const k = makeItemKey(it);
-      if (__p_seenKeys.has(k)) continue;
-      __p_seenKeys.add(k);
-      __p_seenIds.add(it.Id);
-      unique.push(it);
+  if (!Array.isArray(__p_topGenres) || !__p_topGenres.length) {
+    try {
+      __p_topGenres = await getCachedUserTopGenres(3);
+    } catch {
+      __p_topGenres = [];
     }
-    p_renderIntoGrid(unique);
+    __p_genreDone = !__p_topGenres.length;
+  }
+
+  try {
+    const unique = [];
+    let attempts = 0;
+
+    const fetchSourceBatch = async ({ genres = null, startIndex = 0, limit = 80 } = {}) => {
+      const params = new URLSearchParams();
+      params.set("IncludeItemTypes", "Movie,Series");
+      params.set("Recursive", "true");
+      params.set("Filters", "IsUnplayed");
+      params.set("Fields", COMMON_FIELDS);
+      params.set("SortBy", genres?.length ? "CommunityRating,DateCreated" : "Random,CommunityRating,DateCreated");
+      params.set("SortOrder", "Descending");
+      params.set("Limit", String(limit));
+      params.set("StartIndex", String(startIndex));
+      if (genres?.length) params.set("Genres", genres.join("|"));
+
+      const url = `/Users/${encodeURIComponent(userId)}/Items?` + params.toString();
+      const data = await makeApiRequest(url, { signal: __p_abort.signal });
+      return Array.isArray(data?.Items) ? data.Items : [];
+    };
+
+    const appendUniqueItems = (items) => {
+      for (const it of items) {
+        if (!it?.Id) continue;
+        const k = makeItemKey(it);
+        if (!k || __p_seenKeys.has(k)) continue;
+        __p_seenKeys.add(k);
+        __p_seenIds.add(it.Id);
+        unique.push(it);
+        if (unique.length >= LIMIT) break;
+      }
+    };
+
+    while (unique.length < LIMIT && attempts < 6 && (!__p_genreDone || !__p_fallbackDone)) {
+      attempts++;
+      let roundProgress = false;
+
+      if (!__p_genreDone && unique.length < LIMIT) {
+        const genreBatch = await fetchSourceBatch({
+          genres: __p_topGenres,
+          startIndex: __p_genreStartIndex,
+          limit: Math.max(LIMIT * 2, 80),
+        });
+        if (genreBatch.length) roundProgress = true;
+        __p_genreStartIndex += genreBatch.length;
+        if (genreBatch.length < Math.max(LIMIT * 2, 80)) __p_genreDone = true;
+        appendUniqueItems(genreBatch);
+      }
+
+      if (!__p_fallbackDone && unique.length < LIMIT) {
+        const fallbackBatch = await fetchSourceBatch({
+          startIndex: __p_fallbackStartIndex,
+          limit: Math.max(LIMIT * 2, 80),
+        });
+        if (fallbackBatch.length) roundProgress = true;
+        __p_fallbackStartIndex += fallbackBatch.length;
+        if (fallbackBatch.length < Math.max(LIMIT * 2, 80)) __p_fallbackDone = true;
+        appendUniqueItems(fallbackBatch);
+      }
+
+      if (!roundProgress) break;
+    }
+
+    const items = unique.slice(0, LIMIT);
+    p_renderIntoGrid(items);
     __p_startIndex += items.length;
-    if (items.length < LIMIT) { try { __p_io?.disconnect(); } catch {} }
+    if ((!items.length && __p_genreDone && __p_fallbackDone) || ((__p_genreDone && __p_fallbackDone) && items.length < LIMIT)) {
+      try { __p_io?.disconnect(); } catch {}
+    }
   } catch (e) {
     if (e?.name !== 'AbortError') console.error("Personal explorer fetch error:", e);
   } finally {
@@ -887,8 +965,16 @@ function p_renderIntoGrid(items){
 export function openPersonalExplorer() {
   if (__p_overlay) { try { closePersonalExplorer(true); } catch {} }
 
-  const { serverId, userId } = getSessionInfo();
+  const { serverId } = getSessionInfo();
   __p_serverId = serverId;
+  __p_startIndex = 0;
+  __p_seenIds.clear?.();
+  __p_seenKeys.clear?.();
+  __p_topGenres = [];
+  __p_genreStartIndex = 0;
+  __p_fallbackStartIndex = 0;
+  __p_genreDone = false;
+  __p_fallbackDone = false;
   __p_overlay = document.createElement('div');
   __p_overlay.className = 'genre-explorer-overlay';
   __p_overlay.innerHTML = `
@@ -906,6 +992,7 @@ export function openPersonalExplorer() {
         <div class="ge-empty" style="display:none">
           ${(getConfig()?.languageLabels?.noResults) || "İçerik bulunamadı"}
         </div>
+        <div class="ge-sentinel"></div>
       </div>
     </div>
   `;
@@ -914,45 +1001,34 @@ export function openPersonalExplorer() {
   try { p_playOpenAnimation(__p_overlay); } catch {}
 
   const grid = __p_overlay.querySelector('.ge-grid');
-  grid.addEventListener('click', (e) => {
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => p_animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
-  grid.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    const a = e.target.closest('a.ge-card');
-    if (!a) return;
-    requestAnimationFrame(() => p_animatedCloseThen(() => {
-      try { window.location.hash = a.getAttribute('href').slice(1); } catch {}
-    }));
-    e.preventDefault();
-  }, { passive: false });
+  bindExplorerGridDetails(grid);
 
   window.addEventListener('hashchange', p_hashCloser, { passive: true });
   __p_overlay.querySelector('.ge-close').addEventListener('click', () => p_animatedCloseThen(), { passive:true });
   __p_overlay.addEventListener('click', (e) => { if (e.target === __p_overlay) p_animatedCloseThen(); }, { passive:true });
   document.addEventListener('keydown', p_escCloser, { passive:true });
-
-  (async () => {
-    try {
-      const items = await p_fetchTopGenreSample(userId, 30);
-      if (!items.length) {
-        __p_overlay.querySelector('.ge-empty').style.display = '';
-        return;
+  const scroller = __p_overlay.querySelector('.ge-content');
+  const onScrollPerf = () => {
+    __scrollActive = true;
+    if (__scrollIdleTimer) clearTimeout(__scrollIdleTimer);
+    __scrollIdleTimer = setTimeout(() => {
+      __scrollActive = false;
+      if (!__hydrationRAF && __hydrationQueue.length) {
+        __hydrationRAF = requestAnimationFrame(flushHydrationFrame);
       }
-      const frag = document.createDocumentFragment();
-      for (const it of items) frag.appendChild(createCardFor(it));
-      grid.appendChild(frag);
-      pruneGridIfNeeded();
-    } catch (e) {
-      console.error("Personal explorer sample yüklenemedi:", e);
-      __p_overlay.querySelector('.ge-empty').style.display = '';
+    }, 120);
+  };
+  scroller.addEventListener('scroll', onScrollPerf, { passive: true });
+  __p_overlay.__onScrollPerf = onScrollPerf;
+
+  p_loadMore();
+  const sentinel = __p_overlay.querySelector('.ge-sentinel');
+  __p_io = new IntersectionObserver((ents)=>{
+    for (const ent of ents) {
+      if (ent.isIntersecting) p_loadMore();
     }
-  })();
+  }, { root: scroller, rootMargin: '800px 0px' });
+  __p_io.observe(sentinel);
 }
 
 export function closePersonalExplorer(skipAnimation = false) {
@@ -963,12 +1039,23 @@ export function closePersonalExplorer(skipAnimation = false) {
   __p_io = null;
   if (__p_abort) { try { __p_abort.abort(); } catch {} __p_abort = null; }
   const cleanup = () => {
+    try {
+      const scroller = __p_overlay.querySelector('.ge-content');
+      scroller?.removeEventListener('scroll', __p_overlay.__onScrollPerf);
+      __p_overlay.__onScrollPerf = null;
+    } catch {}
     __p_overlay?.remove();
     __p_overlay = null;
     __p_busy = false;
     __p_startIndex = 0;
     __p_isClosing = false;
     __p_seenIds.clear?.();
+    __p_seenKeys.clear?.();
+    __p_topGenres = [];
+    __p_genreStartIndex = 0;
+    __p_fallbackStartIndex = 0;
+    __p_genreDone = false;
+    __p_fallbackDone = false;
   };
   if (skipAnimation) { cleanup(); return; }
   p_animatedCloseThen(cleanup);

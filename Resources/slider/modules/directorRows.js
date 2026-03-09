@@ -1,10 +1,10 @@
-import { getSessionInfo, makeApiRequest, getCachedUserTopGenres, playNow } from "./api.js";
+import { getSessionInfo, makeApiRequest, getCachedUserTopGenres } from "./api.js";
 import { getConfig } from "./config.js";
 import { getLanguageLabels } from "../language/index.js";
 import { attachMiniPosterHover } from "./studioHubsUtils.js";
 import { openDirectorExplorer } from "./genreExplorer.js";
 import { REOPEN_COOLDOWN_MS, OPEN_HOVER_DELAY_MS } from "./hoverTrailerModal.js";
-import { createTrailerIframe, ensureJmsDetailsOverlay } from "./utils.js";
+import { createTrailerIframe } from "./utils.js";
 import { openDetailsModal } from "./detailsModal.js";
 import { withServer } from "./jfUrl.js";
 import { setupScroller } from "./personalRecommendations.js";
@@ -28,6 +28,7 @@ const PLACEHOLDER_URL = (config.placeholderImage) || './slider/src/images/placeh
 const ROW_CARD_COUNT = Number.isFinite(config.directorRowCardCount) ? Math.max(1, config.directorRowCardCount|0) : 10;
 const EFFECTIVE_ROW_CARD_COUNT = ROW_CARD_COUNT;
 const MIN_RATING = 0;
+const SHOW_DIRECTOR_ROWS_HERO_CARDS = (config.showDirectorRowsHeroCards !== false);
 const HOVER_MODE = (config.directorRowsHoverPreviewMode === 'studioMini' || config.directorRowsHoverPreviewMode === 'modal')
   ? config.directorRowsHoverPreviewMode
   : 'inherit';
@@ -35,10 +36,6 @@ const HOVER_MODE = (config.directorRowsHoverPreviewMode === 'studioMini' || conf
 const DIR_ROWS_COUNT_NUM = Number(config.directorRowsCount);
 const ROWS_COUNT = Number.isFinite(DIR_ROWS_COUNT_NUM) ? Math.max(1, DIR_ROWS_COUNT_NUM | 0) : 5;
 const MAX_RENDER_COUNT = ROWS_COUNT;
-
-const MIN_CONTENTS = Number.isFinite(config.directorRowsMinItemsPerDirector)
-  ? Math.max(1, config.directorRowsMinItemsPerDirector|0)
-  : 10;
 
 const STATE = {
   directors: [],
@@ -56,6 +53,7 @@ const STATE = {
   autoPumpScheduled: false,
   _db: null,
   _scope: null,
+  _bgStarted: false,
   _backfillRunning: false,
 };
 
@@ -65,6 +63,71 @@ let __dirArrowObserver = null;
 let __dirSyncInterval = null;
 let __dirBackfillInterval = null;
 let __dirBackfillIdleHandle = null;
+let __dirAutoPumpHandle = null;
+let __dirMountRetryTimer = null;
+let __dirInitSeq = 0;
+let __dirWarmPromise = null;
+let __dirWarmScope = "";
+let __dirWarmCache = { scope: "", directors: [], fromCache: false, warmedAt: 0, minContents: 0 };
+let __dirPrimePromise = null;
+let __dirPrimeScope = "";
+let __dirKickBackfillPromise = null;
+let __dirKickBackfillScope = "";
+let __dirEligibilityRefreshRunning = false;
+let __dirEligibilityRefreshScope = "";
+
+function isDirectorRowsWorkerActive() {
+  return !!(STATE.started || STATE._bgStarted);
+}
+
+function getDirectorMinContents() {
+  const liveConfig = getConfig?.() || config || {};
+  const raw = Number(liveConfig.directorRowsMinItemsPerDirector);
+  return Number.isFinite(raw) ? Math.max(1, raw | 0) : 10;
+}
+
+function getDirectorWarmCache(scope) {
+  if (!scope || __dirWarmCache.scope !== scope) return null;
+  if (__dirWarmCache.minContents !== getDirectorMinContents()) return null;
+  const directors = Array.isArray(__dirWarmCache.directors) ? __dirWarmCache.directors : [];
+  if (!directors.length) return null;
+  return {
+    directors: directors.slice(),
+    fromCache: !!__dirWarmCache.fromCache,
+  };
+}
+
+function getDirectorPrimeMinItems() {
+  return EFFECTIVE_ROW_CARD_COUNT + 1;
+}
+
+function setDirectorWarmCache(scope, result) {
+  if (!scope) return;
+  __dirWarmCache = {
+    scope,
+    directors: Array.isArray(result?.directors) ? result.directors.filter(Boolean).slice() : [],
+    fromCache: !!result?.fromCache,
+    warmedAt: Date.now(),
+    minContents: getDirectorMinContents(),
+  };
+}
+
+async function ensureDirectorRowsSession({ userId, serverId }) {
+  if (!userId) return { db: null, scope: null };
+  const scope = makeScope({ serverId, userId });
+
+  STATE.userId = userId;
+  STATE.serverId = serverId;
+
+  if (STATE._db && STATE._scope === scope) {
+    return { db: STATE._db, scope };
+  }
+
+  const db = await openDirRowsDB();
+  STATE._db = db;
+  STATE._scope = scope;
+  return { db, scope };
+}
 
 function setDirectorArrowLoading(isLoading) {
   const arrow = STATE._loadMoreArrow;
@@ -167,33 +230,38 @@ function detachDirectorScrollIdleLoader() {
   }
 }
 
+function scheduleDirectorAutoPump(timeout = 120) {
+  if (STATE.autoPumpScheduled) return;
+  if (!STATE.started || !STATE.wrapEl?.isConnected) return;
+  if (STATE.loading) return;
+  if (STATE.nextIndex >= STATE.directors.length || STATE.renderedCount >= STATE.maxRenderCount) return;
+
+  STATE.autoPumpScheduled = true;
+
+  if (__dirAutoPumpHandle) {
+    try { __cancelIdle(__dirAutoPumpHandle); } catch {}
+    __dirAutoPumpHandle = null;
+  }
+
+  __dirAutoPumpHandle = __idle(async () => {
+    __dirAutoPumpHandle = null;
+    STATE.autoPumpScheduled = false;
+
+    if (!STATE.started || !STATE.wrapEl?.isConnected) return;
+    if (STATE.loading) return;
+    if (STATE.nextIndex >= STATE.directors.length || STATE.renderedCount >= STATE.maxRenderCount) return;
+
+    try {
+      await renderNextDirectorBatch();
+    } catch (e) {
+      console.warn("directorRows: auto pump failed:", e);
+    }
+  }, Math.max(40, timeout | 0));
+}
+
 (function ensurePerfCssOnce(){
   if (document.getElementById('dir-rows-perf-css')) return;
   const st = document.createElement('style');
-  st.id = 'dir-rows-perf-css';
-  st.textContent = `
-    #director-rows .dir-row-section {
-      contain-intrinsic-size: 260px 600px;
-      margin-bottom: 8px;
-    }
-    #director-rows .personal-recs-row {
-      contain-intrinsic-size: 260px 400px;
-      contain: layout style paint;
-    }
-    #director-rows .personal-recs-card {
-      contain: layout style paint;
-      will-change: transform;
-    }
-    #director-rows img.is-lqip {
-      filter: blur(8px);
-      transform: translateZ(0);
-      transition: filter 0.3s ease;
-    }
-    #director-rows img.__hydrated {
-      filter: none;
-    }
-  `;
-  document.head.appendChild(st);
 })();
 
 const COMMON_FIELDS = [
@@ -207,10 +275,25 @@ const COMMON_FIELDS = [
   "ProductionYear",
   "CumulativeRunTimeTicks",
   "RunTimeTicks",
+  "UserData",
   "People",
   "Overview",
   "RemoteTrailers"
 ].join(",");
+
+function getDirectorRowCardTypeBadge(itemType) {
+  const ll = config.languageLabels || {};
+  if (itemType === "Series") {
+    return { label: ll.dizi || labels.dizi || "Dizi", icon: "live_tv" };
+  }
+  if (itemType === "BoxSet") {
+    return {
+      label: ll.collectionTitle || ll.boxset || labels.collectionTitle || labels.boxset || "Collection",
+      icon: "collections"
+    };
+  }
+  return { label: ll.film || labels.film || "Film", icon: "movie" };
+}
 
 function pickBestItemByRating(items) {
   if (!items || !items.length) return null;
@@ -228,14 +311,65 @@ function pickBestItemByRating(items) {
   return best || items[0] || null;
 }
 
-function buildPosterUrl(item, height = 540, quality = 72) {
+function buildPosterUrl(item, height = 540, quality = 72, { omitTag = false } = {}) {
+  if (!item?.Id) return null;
   const tag = item?.ImageTags?.Primary || item?.PrimaryImageTag;
-  if (!tag) return null;
-  return withServer(`/Items/${item.Id}/Images/Primary?tag=${encodeURIComponent(tag)}&maxHeight=${height}&quality=${quality}&EnableImageEnhancers=false`);
+  if (!tag && !omitTag) return null;
+
+  const qs = [];
+  if (tag && !omitTag) qs.push(`tag=${encodeURIComponent(tag)}`);
+  qs.push(`maxHeight=${height}`);
+  qs.push(`quality=${quality}`);
+  qs.push(`EnableImageEnhancers=false`);
+
+  return withServer(`/Items/${item.Id}/Images/Primary?${qs.join("&")}`);
 }
 function buildPosterUrlHQ(item){ return buildPosterUrl(item, 540, 72); }
 
 function buildPosterUrlLQ(item){ return buildPosterUrl(item, 80, 20); }
+
+function toNoTagUrl(url) {
+  if (!url) return "";
+  const s = String(url);
+  try {
+    const u = new URL(s, window.location?.origin || "http://localhost");
+    u.searchParams.delete("tag");
+    return u.toString();
+  } catch {
+    const [base, q = ""] = s.split("?");
+    if (!q) return s;
+    const rest = q.split("&").filter(Boolean).filter(p => !/^tag=/i.test(p));
+    return rest.length ? `${base}?${rest.join("&")}` : base;
+  }
+}
+
+function toNoTagSrcset(srcset) {
+  if (!srcset || typeof srcset !== "string") return "";
+  return srcset
+    .split(",")
+    .map(part => {
+      const p = part.trim();
+      if (!p) return "";
+      const m = p.match(/^(\S+)(\s+.+)?$/);
+      if (!m) return p;
+      return `${toNoTagUrl(m[1])}${m[2] || ""}`;
+    })
+    .filter(Boolean)
+    .join(", ");
+}
+
+function markImageSettled(img, src) {
+  if (!img) return;
+  try { img.removeAttribute("srcset"); } catch {}
+  if (src) {
+    try { img.src = src; } catch {}
+  }
+  img.__phase = "settled";
+  img.__hiRequested = false;
+  img.classList.add("__hydrated");
+  img.classList.remove("is-lqip");
+  img.__hydrated = true;
+}
 
 function buildLogoUrl(item, width = 220, quality = 80) {
   if (!item) return null;
@@ -293,12 +427,12 @@ function withCacheBust(url) {
 }
 
 function scheduleImgRetry(img, phase, delayMs) {
-  if (!img) return;
+  if (!img) return false;
   const st = (img.__retryState ||= { lq: { tries: 0 }, hi: { tries: 0 } });
   const slot = st[phase] || (st[phase] = { tries: 0 });
 
   const maxTries = (phase === "hi") ? 8 : 6;
-  if (slot.tries >= maxTries) return;
+  if (slot.tries >= maxTries) return false;
 
   slot.tries++;
   clearTimeout(slot.tid);
@@ -325,6 +459,7 @@ function scheduleImgRetry(img, phase, delayMs) {
     img.__hiRequested = false;
     img.src = withCacheBust(data.lqSrc || fb);
   }, Math.max(250, delayMs|0));
+  return true;
 }
 
 let __imgIO = window.__JMS_DIR_IMGIO;
@@ -358,13 +493,46 @@ if (!__imgIO) {
 
 function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const fb = fallback || PLACEHOLDER_URL;
+  if (IS_MOBILE) {
+    try { __imgIO.unobserve(img); } catch {}
+    try { if (img.__onErr) img.removeEventListener('error', img.__onErr); } catch {}
+    try { if (img.__onLoad) img.removeEventListener('load',  img.__onLoad); } catch {}
+    delete img.__onErr;
+    delete img.__onLoad;
+    try {
+      if (img.__retryState) {
+        clearTimeout(img.__retryState.lq?.tid);
+        clearTimeout(img.__retryState.hi?.tid);
+      }
+    } catch {}
+    delete img.__retryState;
+    delete img.__fallbackState;
+    try { img.removeAttribute('srcset'); } catch {}
+    const staticSrc = hqSrc || lqSrc || fb;
+    if (img.__mobileStaticSrc === staticSrc && img.src === staticSrc) return;
+    try { img.loading = "lazy"; } catch {}
+    if (img.src !== staticSrc) img.src = staticSrc;
+    img.__mobileStaticSrc = staticSrc;
+    img.classList.remove('is-lqip');
+    img.classList.remove('__hydrated');
+    img.__phase = 'static';
+    img.__hiRequested = true;
+    img.__disableHi = true;
+    img.__hydrated = true;
+    return;
+  }
+
+  const lqSrcNoTag = toNoTagUrl(lqSrc);
+  const hqSrcNoTag = toNoTagUrl(hqSrc);
+  const hqSrcsetNoTag = toNoTagSrcset(hqSrcset);
 
   try { if (img.__onErr) img.removeEventListener('error', img.__onErr); } catch {}
   try { if (img.__onLoad) img.removeEventListener('load',  img.__onLoad); } catch {}
 
-  img.__data = { lqSrc, hqSrc, hqSrcset, fallback: fb };
+  img.__data = { lqSrc, hqSrc, hqSrcset, lqSrcNoTag, hqSrcNoTag, hqSrcsetNoTag, fallback: fb };
   img.__phase = 'lq';
   img.__hiRequested = false;
+  img.__fallbackState = { lqNoTagTried: false, hiNoTagTried: false };
 
   try {
     img.removeAttribute('srcset');
@@ -379,20 +547,52 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const onError = () => {
   const data = img.__data || {};
   const fb = data.fallback || PLACEHOLDER_URL;
+  const st = (img.__fallbackState ||= { lqNoTagTried: false, hiNoTagTried: false });
 
   try { img.removeAttribute("srcset"); } catch {}
 
   img.__hiRequested = false;
 
   if (img.__phase === "hi") {
+    if (!st.hiNoTagTried && data.hqSrcNoTag && data.hqSrcNoTag !== data.hqSrc) {
+      st.hiNoTagTried = true;
+      img.__phase = "hi";
+      img.__hiRequested = true;
+      img.src = withCacheBust(data.hqSrcNoTag);
+
+      const _rIC = window.requestIdleCallback || ((fn)=>setTimeout(fn, 0));
+      _rIC(() => {
+        if (img.__hiRequested && data.hqSrcsetNoTag) img.srcset = data.hqSrcsetNoTag;
+      });
+      return;
+    }
+
+    img.classList.add("__hydrated");
+    img.classList.remove("is-lqip");
+    img.__hydrated = true;
+
     const delay = 800 * Math.min(6, (img.__retryState?.hi?.tries || 0) + 1);
-    scheduleImgRetry(img, "hi", delay);
+    const queued = scheduleImgRetry(img, "hi", delay);
+    if (!queued) {
+      const settleSrc = img.currentSrc || img.src || data.lqSrc || fb;
+      markImageSettled(img, settleSrc);
+    }
   } else {
+    if (!st.lqNoTagTried && data.lqSrcNoTag && data.lqSrcNoTag !== data.lqSrc) {
+      st.lqNoTagTried = true;
+      img.__phase = "lq";
+      img.src = withCacheBust(data.lqSrcNoTag);
+      return;
+    }
+
     if (!img.currentSrc && !img.src) {
       try { img.src = fb; } catch {}
     }
     const delay = 600 * Math.min(5, (img.__retryState?.lq?.tries || 0) + 1);
-    scheduleImgRetry(img, "lq", delay);
+    const queued = scheduleImgRetry(img, "lq", delay);
+    if (!queued) {
+      markImageSettled(img, fb);
+    }
   }
 };
 
@@ -404,7 +604,7 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
     img.__retryState.hi && (img.__retryState.hi.tries = 0);
   }
 
-  if (img.__phase === "hi") {
+  if (img.__phase === "hi" || img.__phase === "settled") {
     img.classList.add("__hydrated");
     img.classList.remove("is-lqip");
     img.__hydrated = true;
@@ -432,6 +632,7 @@ function unobserveImage(img) {
     }
   } catch {}
   delete img.__retryState;
+  delete img.__fallbackState;
 }
 
 if (!window.__dirRowsPageShowBound) {
@@ -477,6 +678,27 @@ function getDetailsUrl(itemId, serverId) {
   return `#/details?id=${itemId}&serverId=${encodeURIComponent(serverId)}`;
 }
 
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+function getPlaybackPercent(item) {
+  const ud = item?.UserData || item?.UserDataDto || null;
+  if (!ud) return 0;
+
+  const p = Number(ud.PlayedPercentage);
+  if (Number.isFinite(p) && p > 0) return clamp01(p / 100);
+
+  const pos = Number(ud.PlaybackPositionTicks);
+  if (!Number.isFinite(pos) || pos <= 0) return 0;
+
+  const durTicks =
+    (item?.Type === "Series" ? Number(item?.CumulativeRunTimeTicks) : Number(item?.RunTimeTicks)) ||
+    Number(item?.RunTimeTicks) ||
+    0;
+
+  if (!Number.isFinite(durTicks) || durTicks <= 0) return 0;
+  return clamp01(pos / durTicks);
+}
+
 function createRecommendationCard(item, serverId, aboveFold = false) {
   const card = document.createElement("div");
   card.className = "card personal-recs-card";
@@ -490,13 +712,15 @@ function createRecommendationCard(item, serverId, aboveFold = false) {
   const runtimeTicks = item.Type === "Series" ? item.CumulativeRunTimeTicks : item.RunTimeTicks;
   const runtime = formatRuntime(runtimeTicks);
   const genres = Array.isArray(item.Genres) ? item.Genres.slice(0, 2).join(", ") : "";
-  const isSeries = item.Type === "Series";
-  const typeLabel = isSeries
-    ? ((config.languageLabels && config.languageLabels.dizi) || "Dizi")
-    : ((config.languageLabels && config.languageLabels.film) || "Film");
-  const typeIcon = isSeries ? 'live_tv' : 'movie';
+  const { label: typeLabel, icon: typeIcon } = getDirectorRowCardTypeBadge(item.Type);
   const community = Number.isFinite(item.CommunityRating)
     ? `<div class="community-rating" title="Community Rating">⭐ ${item.CommunityRating.toFixed(1)}</div>`
+    : "";
+  const progress = getPlaybackPercent(item);
+  const progressHtml = (progress > 0.02 && progress < 0.999)
+    ? `<div class="rr-progress-wrap" aria-label="${escapeHtml(config.languageLabels?.progress || "İlerleme")}">
+         <div class="rr-progress-bar" style="width:${Math.round(progress * 100)}%"></div>
+       </div>`
     : "";
 
   card.innerHTML = `
@@ -527,6 +751,7 @@ function createRecommendationCard(item, serverId, aboveFold = false) {
             </div>
             ${genres ? `<div class="prc-genres">${genres}</div>` : ""}
           </div>
+          ${progressHtml}
         </div>
       </a>
     </div>
@@ -563,30 +788,25 @@ function createRecommendationCard(item, serverId, aboveFold = false) {
     card.querySelector('.cardImageContainer')?.prepend(noImg);
   }
 
-  try {
-    const hostEl = card.querySelector(".cardImageContainer");
-    if (hostEl) {
-      ensureJmsDetailsOverlay({
-        hostEl,
-        itemId: item.Id,
-        serverId,
-        onDetails: async () => {
-          const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
-          await openDetailsModal({
-            itemId: item.Id,
-            serverId,
-            preferBackdropIndex: backdropIndex,
-            originEl: hostEl?.querySelector?.('img.cardImage') || hostEl,
-          });
-        },
-        onPlay: async () => {
-          await playNow(item.Id);
-        },
-        showPlay: false,
-      });
-    }
-  } catch (e) {
-    console.warn("ensureJmsDetailsOverlay failed (directorRows):", e);
+  const cardLink = card.querySelector(".cardLink");
+  if (cardLink) {
+    cardLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const hostEl = card.querySelector(".cardImageContainer");
+      const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+      try {
+        await openDetailsModal({
+          itemId: item.Id,
+          serverId,
+          preferBackdropIndex: backdropIndex,
+          originEl: hostEl?.querySelector?.("img.cardImage") || hostEl || card,
+          originEvent: e,
+        });
+      } catch (err) {
+        console.warn("openDetailsModal failed (director card):", err);
+      }
+    }, { passive: false });
   }
 
   const mode = (HOVER_MODE === 'inherit')
@@ -610,6 +830,15 @@ function isHomeRoute() {
   return h.startsWith('#/home') || h.startsWith('#/index') || h === '' || h === '#';
 }
 
+function scheduleDirectorRowsRetry(ms = 500) {
+  if (!isHomeRoute()) return;
+  if (__dirMountRetryTimer) clearTimeout(__dirMountRetryTimer);
+  __dirMountRetryTimer = setTimeout(() => {
+    __dirMountRetryTimer = null;
+    try { mountDirectorRowsLazy(); } catch {}
+  }, Math.max(120, ms | 0));
+}
+
 function createDirectorHeroCard(item, serverId, directorName) {
   const hero = document.createElement('div');
   hero.className = 'dir-row-hero';
@@ -618,15 +847,31 @@ function createDirectorHeroCard(item, serverId, directorName) {
   const bg   = buildBackdropUrlHQ(item) || buildPosterUrlHQ(item) || PLACEHOLDER_URL;
   const logo = buildLogoUrl(item);
   const year = item.ProductionYear || '';
-  const plot = clampText(item.Overview, 240);
+  const plot = clampText(item.Overview, 1200);
   const ageChip = normalizeAgeChip(item.OfficialRating || '');
   const genres = Array.isArray(item.Genres) ? item.Genres.slice(0, 3).join(", ") : "";
 
-  const metaParts = [];
-  if (ageChip) metaParts.push(ageChip);
-  if (year) metaParts.push(year);
-  if (genres) metaParts.push(genres);
-  const meta = metaParts.join(" • ");
+  const heroMetaItems = [];
+  if (ageChip) heroMetaItems.push({ text: ageChip, variant: "age" });
+  if (year) heroMetaItems.push({ text: year, variant: "year" });
+  if (genres) heroMetaItems.push({ text: genres, variant: "genres" });
+  const metaHtml = heroMetaItems.length
+    ? heroMetaItems
+        .map(({ text, variant }) =>
+          `<span class="dir-row-hero-meta dir-row-hero-meta--${variant}">${escapeHtml(text)}</span>`
+        )
+        .join("")
+    : "";
+  const heroProgress = getPlaybackPercent(item);
+  const heroProgressPct = Math.round(heroProgress * 100);
+  const heroProgressHtml = (heroProgress > 0.02 && heroProgress < 0.999)
+    ? `
+      <div class="dir-hero-progress-wrap" aria-label="${escapeHtml(config.languageLabels?.progress || "İlerleme")}">
+        <div class="dir-hero-progress-bar" style="width:${heroProgressPct}%"></div>
+      </div>
+      <div class="dir-hero-progress-pct">${heroProgressPct}%</div>
+    `
+    : "";
 
   hero.innerHTML = `
     <div class="dir-row-hero-bg-wrap">
@@ -635,8 +880,7 @@ function createDirectorHeroCard(item, serverId, directorName) {
 
     <div class="dir-row-hero-inner">
       <div class="dir-row-hero-meta-container">
-
-      <div class="dir-row-hero-label">
+        <div class="dir-row-hero-label">
           ${(config.languageLabels?.yonetmen || "yönetmen")} ${escapeHtml(directorName || "")}
         </div>
 
@@ -648,38 +892,36 @@ function createDirectorHeroCard(item, serverId, directorName) {
 
         <div class="dir-row-hero-title">${escapeHtml(item.Name)}</div>
 
-        ${meta ? `<div class="dir-row-hero-meta">${escapeHtml(meta)}</div>` : ""}
+        ${metaHtml ? `<div class="dir-row-hero-submeta">${metaHtml}</div>` : ""}
 
         ${plot ? `<div class="dir-row-hero-plot">${escapeHtml(plot)}</div>` : ""}
 
-        <div class="dir-row-hero-actions">
-        <button type="button" class="dir-row-hero-details">
-          ${(config.languageLabels?.details || "Ayrıntılar")}
-        </button>
       </div>
     </div>
+    ${heroProgressHtml}
   `;
 
-  const goDetails = () => {
+  const openDetails = async (e) => {
+    try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch {}
+    const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+    const originEl = hero.querySelector(".dir-row-hero-bg") || hero;
     try {
-      window.location.hash = getDetailsUrl(item.Id, serverId);
-    } catch {
-      window.location.href = getDetailsUrl(item.Id, serverId);
+      await openDetailsModal({
+        itemId: item.Id,
+        serverId,
+        preferBackdropIndex: backdropIndex,
+        originEl,
+      });
+    } catch (err) {
+      console.warn("openDetailsModal failed (director hero):", err);
     }
   };
 
-  hero.addEventListener('click', () => {
-    goDetails();
+  hero.addEventListener('click', openDetails);
+  hero.tabIndex = 0;
+  hero.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") openDetails(e);
   });
-
-  const detailsBtn = hero.querySelector('.dir-row-hero-details');
-
-  if (detailsBtn) {
-    detailsBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      goDetails();
-    });
-  }
 
   hero.classList.add('active');
 
@@ -718,6 +960,7 @@ function createDirectorHeroCard(item, serverId, directorName) {
       serverId,
       detailsUrl: getDetailsUrl(item.Id, serverId),
       detailsText: (config.languageLabels?.details || labels.details || "Ayrıntılar"),
+      showDetailsOverlay: false,
     });
   } catch (err) {
     console.error("Director hero için createTrailerIframe hata:", err);
@@ -967,18 +1210,17 @@ function filterAndTrimByRating(items, minRating, maxCount) {
   return out;
 }
 
-async function hasAtLeastNByDirector(userId, directorId, n=MIN_CONTENTS) {
+async function getDirectorContentCount(userId, directorId) {
   const url =
     `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true&` +
     `PersonIds=${encodeURIComponent(directorId)}&` +
     `Limit=1&SortBy=DateCreated&SortOrder=Descending`;
   try {
     const data = await makeApiRequest(url);
-    const total = Number(data?.TotalRecordCount) || 0;
-    return total >= n;
+    return Number(data?.TotalRecordCount) || 0;
   } catch (e) {
     console.warn('directorRows: count check failed for', directorId, e);
-    return false;
+    return null;
   }
 }
 
@@ -995,10 +1237,112 @@ async function pMapLimited(list, limit, mapper) {
   return ret;
 }
 
+function runDirectorBackgroundTask(task, label = "directorRows: background task failed:", timeout = 800) {
+  const runner = () => {
+    Promise.resolve()
+      .then(task)
+      .catch((e) => {
+        console.warn(label, e);
+      });
+  };
+
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(runner, { timeout: Math.max(200, timeout | 0) });
+  } else {
+    setTimeout(runner, Math.min(Math.max(0, timeout | 0), 250));
+  }
+}
+
+function refreshCachedDirectorEligibility(userId, cachedRows, { db, scope, limit = 0 } = {}) {
+  if (!userId || !db || !scope || !Array.isArray(cachedRows) || !cachedRows.length) return;
+  if (__dirEligibilityRefreshRunning && __dirEligibilityRefreshScope === scope) return;
+  const minContents = getDirectorMinContents();
+
+  const head = cachedRows
+    .filter((d) => d?.directorId)
+    .slice(0, Math.max(1, limit | 0))
+    .map((d) => ({
+      Id: d.directorId,
+      Name: d.name,
+      Count: d.countHint || 0,
+    }));
+
+  if (!head.length) return;
+
+  __dirEligibilityRefreshRunning = true;
+  __dirEligibilityRefreshScope = scope;
+
+  runDirectorBackgroundTask(async () => {
+    try {
+      const checks = await pMapLimited(head, 3, async (d) => {
+        const total = await getDirectorContentCount(userId, d.Id);
+        return {
+          d,
+          total,
+          ok: Number.isFinite(total) && total >= minContents,
+        };
+      });
+
+      for (const x of checks) {
+        if (!Number.isFinite(x.total)) continue;
+        await upsertDirector(db, scope, {
+          Id: x.d.Id,
+          Name: x.d.Name,
+          Count: x.d.Count || 0,
+          eligible: x.ok,
+          countActual: x.total,
+          qualifiedMinItems: minContents,
+        });
+      }
+    } finally {
+      if (__dirEligibilityRefreshScope === scope) {
+        __dirEligibilityRefreshRunning = false;
+      }
+    }
+  }, "directorRows: cached eligibility refresh failed:", 1600);
+}
+
+function persistItemsToDbLater(items) {
+  if (!STATE._db || !STATE._scope || !Array.isArray(items) || !items.length) return;
+  const db = STATE._db;
+  const scope = STATE._scope;
+  const uniqItems = uniqById(items);
+  if (!uniqItems.length) return;
+
+  runDirectorBackgroundTask(async () => {
+    for (const it of uniqItems) {
+      await upsertItem(db, scope, it);
+    }
+  }, "directorRows: cached item hydration persist failed:", 600);
+}
+
+function persistDirectorItemsToDbLater(dir, items) {
+  if (!STATE._db || !STATE._scope || !dir?.Id || !Array.isArray(items) || !items.length) return;
+  const db = STATE._db;
+  const scope = STATE._scope;
+  const uniqItems = uniqById(items);
+  if (!uniqItems.length) return;
+
+  runDirectorBackgroundTask(async () => {
+    for (const it of uniqItems) {
+      await upsertItem(db, scope, it);
+      await linkDirectorItem(db, scope, dir.Id, it.Id);
+    }
+
+    await upsertDirector(db, scope, {
+      Id: dir.Id,
+      Name: dir.Name,
+      Count: dir.Count || 0,
+      eligible: true,
+    });
+  }, "directorRows: DB write-through failed:", 600);
+}
+
 async function pickRandomDirectorsFromTopGenres(userId, targetCount = ROWS_COUNT) {
   const requestedPrimary = 300;
   const requestedFallback = 600;
   const fields = COMMON_FIELDS;
+  const minContents = getDirectorMinContents();
   const topGenres = (config.directorRowsUseTopGenres !== false)
     ? (await getCachedUserTopGenres(2).catch(()=>[]))
     : [];
@@ -1027,11 +1371,11 @@ async function pickRandomDirectorsFromTopGenres(userId, targetCount = ROWS_COUNT
 
   if (topGenres?.length) {
     const g = encodeURIComponent(topGenres.join("|"));
-    const url = `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&SortBy=Random,CommunityRating,DateCreated&SortOrder=Descending&Limit=${requestedPrimary}&Genres=${g}`;
+    const url = `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&EnableUserData=true&SortBy=Random,CommunityRating,DateCreated&SortOrder=Descending&Limit=${requestedPrimary}&Genres=${g}`;
     await scanItems(url, targetCount * 8);
   }
   if (peopleMap.size < targetCount * 2) {
-    const url = `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&SortBy=Random,CommunityRating,DateCreated&SortOrder=Descending&Limit=${requestedFallback}`;
+    const url = `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&EnableUserData=true&SortBy=Random,CommunityRating,DateCreated&SortOrder=Descending&Limit=${requestedFallback}`;
     await scanItems(url, targetCount * 12);
   }
 
@@ -1039,8 +1383,17 @@ async function pickRandomDirectorsFromTopGenres(userId, targetCount = ROWS_COUNT
   if (!directors.length) return [];
   directors.sort((a,b)=>b.Count-a.Count);
   const head = directors.slice(0, Math.min(60, directors.length));
-  const checks = await pMapLimited(head, 3, async (d) => ({ d, ok: await hasAtLeastNByDirector(userId, d.Id, MIN_CONTENTS) }));
-  const eligible = checks.filter(x=>x.ok).map(x=>x.d);
+  const checks = await pMapLimited(head, 3, async (d) => {
+    const total = await getDirectorContentCount(userId, d.Id);
+    return {
+      d,
+      total,
+      ok: Number.isFinite(total) && total >= minContents,
+    };
+  });
+  const eligible = checks
+    .filter(x => x.ok)
+    .map(x => ({ ...x.d, countActual: x.total, qualifiedMinItems: minContents }));
 
   if (!eligible.length) return [];
 
@@ -1061,7 +1414,7 @@ async function fetchItemsByDirector(userId, directorId, limit = EFFECTIVE_ROW_CA
 
   const url =
     `/Users/${userId}/Items?` +
-    `IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&` +
+    `IncludeItemTypes=Movie,Series&Recursive=true&Fields=${fields}&EnableUserData=true&` +
     `PersonIds=${encodeURIComponent(directorId)}&` +
     `SortBy=Random,CommunityRating,DateCreated&SortOrder=Descending&` +
     `Limit=${Math.max(ROWS_COUNT, limit)}`;
@@ -1081,38 +1434,75 @@ async function loadDirectorsFromDbOrApi(userId) {
   const WANT = Math.max(ROWS_COUNT * 3, (STATE.maxRenderCount || MAX_RENDER_COUNT || 1000));
   const db = STATE._db;
   const scope = STATE._scope;
+  const minContents = getDirectorMinContents();
 
   if (db && scope) {
     try {
       const cached = await listDirectors(db, scope, { limit: Math.max(WANT * 4, ROWS_COUNT * 20) });
 
       if (cached?.length) {
-        const pool = cached
-          .filter(d => d && d.eligible !== false)
-          .map(d => ({ Id: d.directorId, Name: d.name, Count: d.countHint || 0 }));
+        const cachedPool = cached
+          .filter(d => d?.directorId)
+          .map(d => ({
+            Id: d.directorId,
+            Name: d.name,
+            Count: d.countHint || 0,
+            countActual: Number.isFinite(Number(d.countActual)) ? Number(d.countActual) : null,
+            qualifiedMinItems: Number.isFinite(Number(d.qualifiedMinItems)) ? Number(d.qualifiedMinItems) : null,
+          }));
 
-        shuffle(pool);
+        const knownEligible = cachedPool.filter((d) =>
+          Number.isFinite(d.countActual) && d.countActual >= minContents
+        );
+        const unknownPool = cachedPool.filter((d) => !Number.isFinite(d.countActual));
+        const validated = [];
+        const seen = new Set();
 
-        const head = pool.slice(0, Math.min(pool.length, WANT * 2));
-        const checks = await pMapLimited(head, 3, async (d) => ({
-          d,
-          ok: await hasAtLeastNByDirector(userId, d.Id, MIN_CONTENTS)
-        }));
+        shuffle(knownEligible);
+        for (const d of knownEligible) {
+          if (seen.has(d.Id)) continue;
+          seen.add(d.Id);
+          validated.push(d);
+          if (validated.length >= WANT) break;
+        }
 
-        const eligible = checks.filter(x => x.ok).map(x => x.d);
-        try {
+        if (validated.length < WANT && unknownPool.length) {
+          shuffle(unknownPool);
+          const toCheck = unknownPool.slice(0, Math.min(unknownPool.length, Math.max(WANT * 3, ROWS_COUNT * 8)));
+          const checks = await pMapLimited(toCheck, 3, async (d) => {
+            const total = await getDirectorContentCount(userId, d.Id);
+            return {
+              d,
+              total,
+              ok: Number.isFinite(total) && total >= minContents,
+            };
+          });
+
           for (const x of checks) {
-            await upsertDirector(db, scope, {
-              Id: x.d.Id,
-              Name: x.d.Name,
-              Count: x.d.Count || 0,
-              eligible: x.ok
-            });
+            if (Number.isFinite(x.total)) {
+              await upsertDirector(db, scope, {
+                Id: x.d.Id,
+                Name: x.d.Name,
+                Count: x.d.Count || 0,
+                eligible: x.ok,
+                countActual: x.total,
+                qualifiedMinItems: minContents,
+              });
+            }
+            if (!x.ok || seen.has(x.d.Id)) continue;
+            seen.add(x.d.Id);
+            validated.push({ ...x.d, countActual: x.total, qualifiedMinItems: minContents });
+            if (validated.length >= WANT) break;
           }
-        } catch {}
+        }
 
-        if (eligible.length) {
-          return { directors: eligible.slice(0, WANT), fromCache: true };
+        if (validated.length) {
+          refreshCachedDirectorEligibility(userId, cached, {
+            db,
+            scope,
+            limit: Math.min(cached.length, Math.max(WANT * 2, ROWS_COUNT * 6)),
+          });
+          return { directors: validated.slice(0, WANT), fromCache: true };
         }
       }
     } catch (e) {
@@ -1138,12 +1528,159 @@ async function loadDirectorsFromDbOrApi(userId) {
   if (db && scope) {
     try {
       for (const d of directors) {
-        await upsertDirector(db, scope, { Id: d.Id, Name: d.Name, Count: d.Count || 0, eligible: true });
+        await upsertDirector(db, scope, {
+          Id: d.Id,
+          Name: d.Name,
+          Count: d.Count || 0,
+          eligible: true,
+          countActual: d.countActual,
+          qualifiedMinItems: minContents,
+        });
       }
     } catch {}
   }
 
   return { directors: directors.slice(0, WANT), fromCache: false };
+}
+
+export async function warmDirectorRowsDb({ force = false } = {}) {
+  const cfg = getConfig?.() || config || {};
+  if (!cfg.enableDirectorRows) {
+    return { directors: [], fromCache: false, skipped: true };
+  }
+
+  const { userId, serverId } = getSessionInfo?.() || {};
+  if (!userId) {
+    return { directors: [], fromCache: false, skipped: true };
+  }
+
+  const scope = makeScope({ serverId, userId });
+  if (!force && __dirWarmPromise && __dirWarmScope === scope) {
+    return __dirWarmPromise;
+  }
+
+  __dirWarmScope = scope;
+  __dirWarmPromise = (async () => {
+    STATE._bgStarted = true;
+
+    try {
+      await ensureDirectorRowsSession({ userId, serverId });
+    } catch (e) {
+      console.warn("directorRows: background DB init failed:", e);
+      STATE._db = null;
+      STATE._scope = null;
+      return { directors: [], fromCache: false, skipped: true };
+    }
+
+    let result = force ? null : getDirectorWarmCache(STATE._scope);
+    if (!result) {
+      result = await loadDirectorsFromDbOrApi(userId);
+      setDirectorWarmCache(STATE._scope, result);
+    }
+
+    startDirectorItemsPrime(result?.directors || [], { force });
+    runDirectorBackgroundTask(() => checkAndSyncNewItems({ force: true }), "directorRows: startup sync failed:", 1200);
+    kickDirectorBackfillNow({ force });
+    startDirectorBackfillLoop();
+    return result;
+  })().finally(() => {
+    if (__dirWarmScope === scope) {
+      __dirWarmPromise = null;
+    }
+  });
+
+  return __dirWarmPromise;
+}
+
+async function ensureDirectorItemsCachedForWarmup(dir, minItems = getDirectorPrimeMinItems()) {
+  const db = STATE._db;
+  const scope = STATE._scope;
+  const userId = STATE.userId;
+  if (!db || !scope || !userId || !dir?.Id) return;
+
+  try {
+    const existing = await getItemsForDirector(db, scope, dir.Id, minItems);
+    if ((existing?.length || 0) >= minItems) return;
+  } catch {}
+
+  const apiItems = await fetchItemsByDirector(
+    userId,
+    dir.Id,
+    Math.max(minItems * 3, EFFECTIVE_ROW_CARD_COUNT * 2)
+  );
+
+  const items = uniqById(apiItems || []);
+  if (!items.length) return;
+
+  for (const it of items) {
+    await upsertItem(db, scope, it);
+    await linkDirectorItem(db, scope, dir.Id, it.Id);
+  }
+
+  await upsertDirector(db, scope, {
+    Id: dir.Id,
+    Name: dir.Name,
+    Count: dir.Count || 0,
+    eligible: true
+  });
+}
+
+function startDirectorItemsPrime(directors, { force = false } = {}) {
+  const db = STATE._db;
+  const scope = STATE._scope;
+  const userId = STATE.userId;
+  const list = Array.isArray(directors) ? directors.filter(d => d?.Id) : [];
+  if (!db || !scope || !userId || !list.length) return null;
+
+  if (!force && __dirPrimePromise && __dirPrimeScope === scope) {
+    return __dirPrimePromise;
+  }
+
+  const primeList = list.slice(0, Math.max(ROWS_COUNT * 3, ROWS_COUNT));
+  __dirPrimeScope = scope;
+  __dirPrimePromise = (async () => {
+    try {
+      await pMapLimited(primeList, 2, async (dir) => {
+        await ensureDirectorItemsCachedForWarmup(dir);
+      });
+    } catch (e) {
+      console.warn("directorRows: startup prime failed:", e);
+    }
+  })().finally(() => {
+    if (__dirPrimeScope === scope) {
+      __dirPrimePromise = null;
+    }
+  });
+
+  return __dirPrimePromise;
+}
+
+function kickDirectorBackfillNow({ force = false } = {}) {
+  const scope = STATE._scope;
+  if (!scope || !STATE._db || !STATE.userId) return null;
+
+  if (!force && __dirKickBackfillPromise && __dirKickBackfillScope === scope) {
+    return __dirKickBackfillPromise;
+  }
+
+  const cfg = getConfig?.() || config || {};
+  const pagesPerRun = Number.isFinite(cfg.directorRowsBackfillPagesPerRun)
+    ? Math.max(1, Math.min(6, cfg.directorRowsBackfillPagesPerRun | 0))
+    : 1;
+  const perPage = Number.isFinite(cfg.directorRowsBackfillLimit)
+    ? Math.max(50, Math.min(400, cfg.directorRowsBackfillLimit | 0))
+    : 200;
+
+  __dirKickBackfillScope = scope;
+  __dirKickBackfillPromise = runDirectorBackfillOnce({ pagesPerRun, limit: perPage }).catch((e) => {
+    console.warn("directorRows: immediate backfill failed:", e);
+  }).finally(() => {
+    if (__dirKickBackfillScope === scope) {
+      __dirKickBackfillPromise = null;
+    }
+  });
+
+  return __dirKickBackfillPromise;
 }
 
 function getDateCreatedTicks(it) {
@@ -1166,10 +1703,11 @@ async function fetchItemsByIds(userId, ids, fields = COMMON_FIELDS) {
 
   for (let i = 0; i < clean.length; i += chunkSize) {
     const chunk = clean.slice(i, i + chunkSize);
-    const url =
-      `/Users/${userId}/Items?` +
-      `Ids=${encodeURIComponent(chunk.join(","))}` +
-      `&Fields=${encodeURIComponent(fields)}`;
+      const url =
+        `/Users/${userId}/Items?` +
+        `Ids=${encodeURIComponent(chunk.join(","))}` +
+        `&Fields=${encodeURIComponent(fields)}` +
+        `&EnableUserData=true`;
 
     try {
       const data = await makeApiRequest(url);
@@ -1273,8 +1811,8 @@ async function checkAndSyncNewItems({ force = false } = {}) {
   const db = STATE._db;
   const scope = STATE._scope;
   if (!db || !scope || !STATE.userId) return;
-  if (!STATE.started) return;
-  if (document.hidden) return;
+  if (!isDirectorRowsWorkerActive()) return;
+  if (document.hidden && !force) return;
   if (STATE._backfillRunning) return;
 
   const headKey = `dirRows:lastHeadTick:${scope}`;
@@ -1321,11 +1859,12 @@ async function runDirectorBackfillOnce({ pagesPerRun = 1, limit = 200 } = {}) {
     const pages   = Math.max(1, Math.min(6, pagesPerRun | 0));
 
     for (let p = 0; p < pages; p++) {
-      if (!STATE.started || !STATE._db || !STATE._scope) break;
+      if (!isDirectorRowsWorkerActive() || !STATE._db || !STATE._scope) break;
 
       const url =
         `/Users/${userId}/Items?IncludeItemTypes=Movie,Series&Recursive=true` +
         `&Fields=${fields}` +
+        `&EnableUserData=true` +
         `&SortBy=DateCreated&SortOrder=Descending` +
         `&StartIndex=${startIndex}` +
         `&Limit=${perPage}`;
@@ -1389,7 +1928,7 @@ function startDirectorBackfillLoop() {
     : 200;
 
   const schedule = async () => {
-    if (!STATE.started) return;
+    if (!isDirectorRowsWorkerActive()) return;
     if (!STATE._db || !STATE._scope || !STATE.userId) return;
     if (document.hidden) return;
     try {
@@ -1468,29 +2007,45 @@ export function mountDirectorRowsLazy() {
 
   if (!window.__dirRowsRouteGuard) {
     window.__dirRowsRouteGuard = true;
-    window.addEventListener('hashchange', () => {
+    const onRoute = () => {
       if (!isHomeRoute()) {
         try { cleanupDirectorRows(); } catch {}
         const el = document.getElementById('director-rows');
         if (el) { try { el.remove(); } catch {} }
       } else {
-        try { mountDirectorRowsLazy(); } catch {}
+        scheduleDirectorRowsRetry(80);
       }
+    };
+    window.addEventListener('hashchange', onRoute, { passive: true });
+    window.addEventListener('popstate', onRoute, { passive: true });
+    window.addEventListener('pageshow', onRoute, { passive: true });
+    document.addEventListener('viewshow', onRoute, { passive: true });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) onRoute();
     }, { passive: true });
   }
 
-  const parent = getHomeSectionsContainer() || document.body;
-  (parent || document.body).appendChild(wrap);
+  const parent = getHomeSectionsContainer();
+  if (!parent) {
+    scheduleDirectorRowsRetry(400);
+    return;
+  }
+  parent.appendChild(wrap);
   try { ensureIntoHomeSections(wrap, null, { placeAfterId: cfg.enableGenreHubs ? "genre-hubs" : null }); } catch {}
-  if (!cfg.enableGenreHubs) { try { pinDirectorRowsToBottom(wrap); } catch {} }
+  if (!IS_MOBILE && !cfg.enableGenreHubs) { try { pinDirectorRowsToBottom(wrap); } catch {} }
 
   const start = async () => {
     try {
       if (!isHomeRoute()) return;
-      initAndRenderFirstBatch(wrap);
+      if (!wrap.isConnected) {
+        scheduleDirectorRowsRetry(260);
+        return;
+      }
+      await initAndRenderFirstBatch(wrap);
     } catch (e) {
       console.error(e);
-      try { initAndRenderFirstBatch(wrap); } catch {}
+      try { cleanupDirectorRows(); } catch {}
+      scheduleDirectorRowsRetry(650);
     }
   };
 
@@ -1518,7 +2073,9 @@ function ensureIntoHomeSections(el, indexPage, { placeAfterId } = {}) {
       ref.insertAdjacentElement('afterend', el);
     } else if (el.parentElement !== container) {
       container.appendChild(el);
-      try { pinDirectorRowsToBottom(el); } catch {}
+      if (!IS_MOBILE) {
+        try { pinDirectorRowsToBottom(el); } catch {}
+      }
     }
     return true;
   };
@@ -1547,6 +2104,7 @@ function getHomeSectionsContainer(indexPage) {
 }
 
 function pinDirectorRowsToBottom(wrap) {
+  if (IS_MOBILE) return;
   if (!wrap) return;
 
   const moveToBottom = () => {
@@ -1576,25 +2134,55 @@ function pinDirectorRowsToBottom(wrap) {
 }
 
 async function initAndRenderFirstBatch(wrap) {
-  if (STATE.started) return;
+  if (STATE.started) {
+    const stale =
+      !STATE.wrapEl ||
+      !STATE.wrapEl.isConnected ||
+      (wrap && STATE.wrapEl !== wrap);
+    if (!stale) return;
+    try { cleanupDirectorRows(); } catch {}
+  }
+  if (!wrap || !wrap.isConnected) {
+    scheduleDirectorRowsRetry(380);
+    return;
+  }
+
+  const initSeq = ++__dirInitSeq;
   const { userId, serverId } = getSessionInfo();
   if (!userId) return;
 
   STATE.started = true;
+  STATE._bgStarted = true;
   STATE.wrapEl = wrap;
   STATE.userId = userId;
   STATE.serverId = serverId;
 
+  let warmResult = null;
   try {
-    STATE._db = await openDirRowsDB();
-    STATE._scope = makeScope({ serverId, userId });
+    warmResult = await warmDirectorRowsDb();
   } catch (e) {
-    console.warn("directorRows: IndexedDB init failed:", e);
-    STATE._db = null;
-    STATE._scope = null;
+    console.warn("directorRows: warmup failed during init:", e);
   }
 
-  const { directors, fromCache } = await loadDirectorsFromDbOrApi(userId);
+  if (!STATE._db || !STATE._scope) {
+    try {
+      await ensureDirectorRowsSession({ userId, serverId });
+    } catch (e) {
+      console.warn("directorRows: IndexedDB init failed:", e);
+      STATE._db = null;
+      STATE._scope = null;
+    }
+  }
+  if (initSeq !== __dirInitSeq || !STATE.started || STATE.wrapEl !== wrap || !wrap.isConnected) return;
+
+  let directorSource = warmResult || getDirectorWarmCache(STATE._scope);
+  if (!directorSource) {
+    directorSource = await loadDirectorsFromDbOrApi(userId);
+    setDirectorWarmCache(STATE._scope, directorSource);
+  }
+
+  const { directors, fromCache } = directorSource;
+  if (initSeq !== __dirInitSeq || !STATE.started || STATE.wrapEl !== wrap || !wrap.isConnected) return;
   STATE.directors = directors || [];
 
   if (STATE.directors.length < ROWS_COUNT) {
@@ -1608,14 +2196,16 @@ async function initAndRenderFirstBatch(wrap) {
 
   const originalBatchSize = STATE.batchSize;
   STATE.batchSize = 1;
-  await renderNextDirectorBatch(true);
+  await renderNextDirectorBatch();
+  if (initSeq !== __dirInitSeq || !STATE.started || STATE.wrapEl !== wrap || !wrap.isConnected) return;
   STATE.batchSize = originalBatchSize;
 
   attachDirectorScrollIdleLoader();
   if (!__dirSyncInterval) {
-    await checkAndSyncNewItems({ force: true });
+    runDirectorBackgroundTask(() => checkAndSyncNewItems({ force: true }), "directorRows: startup sync failed:", 1200);
+    if (initSeq !== __dirInitSeq || !STATE.started || STATE.wrapEl !== wrap || !wrap.isConnected) return;
     __dirSyncInterval = setInterval(() => {
-     if (!STATE.started) return;
+     if (!isDirectorRowsWorkerActive()) return;
       checkAndSyncNewItems().catch(()=>{});
     }, Number.isFinite(config.directorRowsNewCheckIntervalMs)
         ? Math.max(30_000, config.directorRowsNewCheckIntervalMs|0)
@@ -1624,7 +2214,7 @@ async function initAndRenderFirstBatch(wrap) {
   startDirectorBackfillLoop();
 }
 
-async function renderNextDirectorBatch(immediateLoadForThisBatch = false) {
+async function renderNextDirectorBatch() {
   if (STATE.loading || STATE.renderedCount >= STATE.maxRenderCount) {
     return;
   }
@@ -1650,7 +2240,7 @@ async function renderNextDirectorBatch(immediateLoadForThisBatch = false) {
     if (STATE.renderedCount >= STATE.maxRenderCount) break;
 
     const dir = slice[idx];
-    await renderDirectorSection(dir, immediateLoadForThisBatch);
+    await renderDirectorSection(dir);
     STATE.renderedCount++;
   }
 
@@ -1672,6 +2262,8 @@ async function renderNextDirectorBatch(immediateLoadForThisBatch = false) {
       STATE.batchObserver = null;
     }
     detachDirectorScrollIdleLoader();
+  } else {
+    scheduleDirectorAutoPump(prevCount === 0 ? 60 : 120);
   }
 
   console.log(`Render tamamlandı. Toplam: ${STATE.renderedCount}/${STATE.directors.length} yönetmen`);
@@ -1690,7 +2282,7 @@ function buildDirectorTitle(name) {
   return `${escapeHtml(lbl)} ${safeName}`;
 }
 
-function renderDirectorSection(dir, immediateLoad = false) {
+async function renderDirectorSection(dir) {
   const section = document.createElement('section');
   section.className = 'dir-row-section';
 
@@ -1748,6 +2340,7 @@ function renderDirectorSection(dir, immediateLoad = false) {
 
   const heroHost = document.createElement('div');
   heroHost.className = 'dir-row-hero-host';
+  heroHost.style.display = SHOW_DIRECTOR_ROWS_HERO_CARDS ? '' : 'none';
 
   const btnL = document.createElement('button');
   btnL.className = 'hub-scroll-btn hub-scroll-left';
@@ -1779,7 +2372,7 @@ function renderDirectorSection(dir, immediateLoad = false) {
     STATE.wrapEl.appendChild(section);
   }
   row.innerHTML = `<div class="dir-row-loading">${(config.languageLabels?.loadingText) || 'Yükleniyor…'}</div>`;
-  fillRowWhenReady(row, dir, heroHost);
+  await fillRowWhenReady(row, dir, heroHost);
 }
 
 function uniqById(list) {
@@ -1794,90 +2387,104 @@ function uniqById(list) {
   return out;
 }
 
-function fillRowWhenReady(row, dir, heroHost){
-  (async () => {
-    try {
-      const NEED = EFFECTIVE_ROW_CARD_COUNT + 1;
+async function fillRowWhenReady(row, dir, heroHost){
+  try {
+    const NEED = EFFECTIVE_ROW_CARD_COUNT + 1;
 
-      let items = [];
+    let items = [];
 
-      if (STATE._db && STATE._scope) {
-        try {
-          items = await getItemsForDirector(
-            STATE._db,
-            STATE._scope,
-            dir.Id,
-            NEED
-          );
-        } catch (e) {
-          console.warn("directorRows: getItemsForDirector failed:", e);
-        }
-      }
-
-      if ((items?.length || 0) < NEED) {
-        const apiItems = await fetchItemsByDirector(
-          STATE.userId,
+    if (STATE._db && STATE._scope) {
+      try {
+        items = await getItemsForDirector(
+          STATE._db,
+          STATE._scope,
           dir.Id,
-          Math.max(NEED * 3, EFFECTIVE_ROW_CARD_COUNT * 2)
+          NEED
         );
+      } catch (e) {
+        console.warn("directorRows: getItemsForDirector failed:", e);
+      }
+    }
 
-        items = uniqById([...(items || []), ...(apiItems || [])]);
-
-        if (items?.length && STATE._db && STATE._scope) {
-          try {
-            for (const it of items) {
-              await upsertItem(STATE._db, STATE._scope, it);
-              await linkDirectorItem(STATE._db, STATE._scope, dir.Id, it.Id);
-            }
-            await upsertDirector(STATE._db, STATE._scope, {
-              Id: dir.Id,
-              Name: dir.Name,
-              Count: dir.Count || 0,
-              eligible: true
-            });
-          } catch (e) {
-            console.warn("directorRows: DB write-through failed:", e);
-          }
+    if ((items?.length || 0) > 0 && STATE.userId && !(items || []).some(it => it?.UserData || it?.UserDataDto)) {
+      try {
+        const hydrateIds = (items || []).map(it => it?.Id).filter(Boolean).slice(0, NEED);
+        const hydrated = await fetchItemsByIds(STATE.userId, hydrateIds, COMMON_FIELDS);
+        if (hydrated?.length) {
+          items = uniqById([...(hydrated || []), ...(items || [])]);
+          persistItemsToDbLater(hydrated);
         }
+      } catch (e) {
+        console.warn("directorRows: cached items hydration failed:", e);
       }
+    }
 
-      if (!items?.length) {
-        row.innerHTML = `<div class="no-recommendations">${(config.languageLabels?.noRecommendations) || (labels.noRecommendations || "Uygun içerik yok")}</div>`;
-        if (heroHost) heroHost.innerHTML = "";
-        setupScroller(row);
-        return;
+    if ((items?.length || 0) < NEED) {
+      const apiItems = await fetchItemsByDirector(
+        STATE.userId,
+        dir.Id,
+        Math.max(NEED * 3, EFFECTIVE_ROW_CARD_COUNT * 2)
+      );
+
+      items = uniqById([...(items || []), ...(apiItems || [])]);
+
+      if (items?.length && STATE._db && STATE._scope) {
+        persistDirectorItemsToDbLater(dir, items);
       }
+    }
 
-      const pool = items.slice();
-      const best = pickBestItemByRating(pool) || pool[0] || null;
-      const remaining = best ? pool.filter(x => x?.Id !== best.Id) : pool;
+    if (!items?.length) {
+      row.innerHTML = `<div class="no-recommendations">${(config.languageLabels?.noRecommendations) || (labels.noRecommendations || "Uygun içerik yok")}</div>`;
+      if (heroHost) heroHost.innerHTML = "";
+      setupScroller(row);
+      return;
+    }
 
-      if (heroHost && best) {
-        heroHost.innerHTML = "";
+    const pool = items.slice();
+    const best = pickBestItemByRating(pool) || pool[0] || null;
+    const remaining = best ? pool.filter(x => x?.Id !== best.Id) : pool;
+
+    if (heroHost) {
+      heroHost.innerHTML = "";
+      if (SHOW_DIRECTOR_ROWS_HERO_CARDS && best) {
         heroHost.appendChild(createDirectorHeroCard(best, STATE.serverId, dir.Name));
       }
+    }
 
-      row.innerHTML = "";
+    row.innerHTML = "";
 
-      if (!remaining?.length) {
-        row.innerHTML = `<div class="no-recommendations">${(config.languageLabels?.noRecommendations) || (labels.noRecommendations || "Uygun içerik yok")}</div>`;
-        setupScroller(row);
-        return;
-      }
+    if (!remaining?.length) {
+      row.innerHTML = `<div class="no-recommendations">${(config.languageLabels?.noRecommendations) || (labels.noRecommendations || "Uygun içerik yok")}</div>`;
+      setupScroller(row);
+      return;
+    }
 
-      const initialCount = IS_MOBILE ? 3 : 4;
-      const fragment = document.createDocumentFragment();
+    const initialCount = IS_MOBILE ? 3 : 4;
+    const fragment = document.createDocumentFragment();
 
-      for (let i = 0; i < Math.min(initialCount, remaining.length); i++) {
-        fragment.appendChild(createRecommendationCard(remaining[i], STATE.serverId, i < 2));
-      }
-      row.appendChild(fragment);
+    for (let i = 0; i < Math.min(initialCount, remaining.length); i++) {
+      fragment.appendChild(createRecommendationCard(remaining[i], STATE.serverId, i < 2));
+    }
+    row.appendChild(fragment);
 
-      let currentIndex = initialCount;
+    let currentIndex = initialCount;
+
+    await new Promise((resolve) => {
+      const finalize = () => {
+        if (row.isConnected) {
+          setupScroller(row);
+        }
+        resolve();
+      };
 
       const pumpMore = () => {
+        if (!row.isConnected) {
+          resolve();
+          return;
+        }
+
         if (currentIndex >= remaining.length || row.childElementCount >= EFFECTIVE_ROW_CARD_COUNT) {
-          setupScroller(row);
+          finalize();
           return;
         }
 
@@ -1896,17 +2503,22 @@ function fillRowWhenReady(row, dir, heroHost){
       };
 
       setTimeout(pumpMore, 200);
+    });
 
-    } catch (error) {
-      console.error('Yönetmen içerik yükleme hatası:', error);
-      row.innerHTML = `<div class="no-recommendations">Yüklenemedi</div>`;
-      setupScroller(row);
-    }
-  })();
+  } catch (error) {
+    console.error('Yönetmen içerik yükleme hatası:', error);
+    row.innerHTML = `<div class="no-recommendations">Yüklenemedi</div>`;
+    setupScroller(row);
+  }
 }
 
 export function cleanupDirectorRows() {
   try {
+    __dirInitSeq++;
+    if (__dirMountRetryTimer) {
+      clearTimeout(__dirMountRetryTimer);
+      __dirMountRetryTimer = null;
+    }
     detachDirectorScrollIdleLoader();
     STATE.batchObserver?.disconnect();
     STATE.sectionIOs.forEach(io => io.disconnect());
@@ -1924,6 +2536,10 @@ export function cleanupDirectorRows() {
     if (__dirBackfillIdleHandle) {
       try { __cancelIdle(__dirBackfillIdleHandle); } catch {}
       __dirBackfillIdleHandle = null;
+    }
+    if (__dirAutoPumpHandle) {
+      try { __cancelIdle(__dirAutoPumpHandle); } catch {}
+      __dirAutoPumpHandle = null;
     }
 
     if (STATE.wrapEl) {

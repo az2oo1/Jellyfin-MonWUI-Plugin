@@ -75,10 +75,21 @@ export function createSettingsModal() {
       select.id = "jmsProfileTarget";
 
       const autoProfile = getDeviceProfileAuto();
+      const profileNameMap = {
+        desktop: labels?.profileDesktop || "Masaüstü Profil",
+        mobile: labels?.profileMobile || "Mobil Profil"
+      };
+
+      const autoProfileLabel =
+        profileNameMap[autoProfile] || (labels?.profileAutoUnknown || autoProfile);
+
       const opts = [
-        { v: "auto", t: `${labels?.profileAuto || "Bu cihaz (auto)"} (${autoProfile})` },
-        { v: "desktop", t: labels?.profileDesktop || "Desktop profili" },
-        { v: "mobile", t: labels?.profileMobile || "Mobile profili" }
+        {
+          v: "auto",
+          t: `${labels?.profileAuto || "Otomatik Seç"} (${autoProfileLabel})`
+        },
+        { v: "desktop", t: labels?.profileDesktop || "Masaüstü Profil" },
+        { v: "mobile", t: labels?.profileMobile || "Mobil Profil" }
       ];
 
       opts.forEach(o => {

@@ -43,11 +43,4 @@ export function attachMouseEvents() {
       pauseProgressBar();
     }
   }
-
-  indexPage.addEventListener('mouseover', (e) => {
-    if (e.target?.closest?.('.slide')) { pauseSlideTimer(); pauseProgressBar(); }
-  }, { passive: true });
-  indexPage.addEventListener('mouseout', (e) => {
-    if (e.target?.closest?.('.slide')) { resumeSlideTimer(); resumeProgressBar(); }
-  }, { passive: true });
 }

@@ -3,7 +3,7 @@ import { getConfig } from "./config.js";
 import { getLanguageLabels } from "../language/index.js";
 import { attachMiniPosterHover } from "./studioHubsUtils.js";
 import { REOPEN_COOLDOWN_MS, OPEN_HOVER_DELAY_MS } from "./hoverTrailerModal.js";
-import { createTrailerIframe, ensureJmsDetailsOverlay } from "./utils.js";
+import { createTrailerIframe } from "./utils.js";
 import { setupScroller } from "./personalRecommendations.js";
 import { openDetailsModal } from "./detailsModal.js";
 import { openDirRowsDB, makeScope, upsertItemsBatchIdle, getMeta, setMeta, getItemsByIds, } from "./recentRowsDb.js";
@@ -14,6 +14,7 @@ const labels = getLanguageLabels?.() || {};
 const IS_MOBILE = (navigator.maxTouchPoints > 0) || (window.innerWidth <= 820);
 const PLACEHOLDER_URL = (config.placeholderImage) || "./slider/src/images/placeholder.png";
 const ENABLE_RECENT_MASTER = (config.enableRecentRows !== false);
+const SHOW_RECENT_ROWS_HERO_CARDS = (config.showRecentRowsHeroCards !== false);
 const ENABLE_RECENT_MOVIES   = ENABLE_RECENT_MASTER && (config.enableRecentMoviesRow !== false);
 const ENABLE_RECENT_SERIES   = ENABLE_RECENT_MASTER && (config.enableRecentSeriesRow !== false);
 const ENABLE_RECENT_EPISODES = ENABLE_RECENT_MASTER && (config.enableRecentEpisodesRow !== false);
@@ -78,12 +79,22 @@ const STATE = {
 };
 
 let __wrapInserted = false;
+let __recentMountRetryTimer = null;
 
 const TTL_RECENT_MS   = Number.isFinite(config.recentRowsCacheTTLms) ? Math.max(5_000, config.recentRowsCacheTTLms|0) : 90_000;
 const TTL_CONTINUE_MS = Number.isFinite(config.continueRowsCacheTTLms) ? Math.max(5_000, config.continueRowsCacheTTLms|0) : 45_000;
 
 function metaKey(kind, type){ return `rr:${kind}:${type}`; }
 function tvLibMetaSuffix(tvLibId){ return tvLibId ? `@tv:${tvLibId}` : ""; }
+
+function scheduleRecentRowsRetry(ms = 450) {
+  if (__recentMountRetryTimer) clearTimeout(__recentMountRetryTimer);
+  __recentMountRetryTimer = setTimeout(() => {
+    __recentMountRetryTimer = null;
+    if (!getActiveHomePage()) return;
+    try { mountRecentRowsLazy(); } catch {}
+  }, Math.max(120, ms | 0));
+}
 
 async function ensureRecentDb() {
   if (STATE.db && STATE.scope) return;
@@ -130,38 +141,6 @@ function sameIdList(a, b) {
 (function ensurePerfCssOnce(){
   if (document.getElementById("recent-rows-perf-css")) return;
   const st = document.createElement("style");
-  st.id = "recent-rows-perf-css";
-  st.textContent = `
-    #recent-rows .recent-row-section {
-      contain-intrinsic-size: 260px 600px;
-      margin-bottom: 8px;
-    }
-    #recent-rows .personal-recs-row {
-      contain-intrinsic-size: 260px 400px;
-      contain: layout style paint;
-    }
-    #recent-rows .personal-recs-card {
-      contain: layout style paint;
-      will-change: transform;
-    }
-    .skeleton-line {
-      background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
-      background-size: 200% 100%;
-      animation: skeleton-pulse 1.5s ease-in-out infinite;
-      border-radius: 4px;
-    }
-    @keyframes skeleton-pulse {
-      0% { background-position: -200% 0; }
-      100% { background-position: 200% 0; }
-    }
-    img.is-lqip {
-      filter: blur(8px);
-      transform: translateZ(0);
-      transition: filter 0.3s ease;
-    }
-    img.is-lqip.__hydrated { filter: none; }
-  `;
-  document.head.appendChild(st);
 })();
 
 const COMMON_FIELDS = [
@@ -185,15 +164,49 @@ const COMMON_FIELDS = [
   "ParentIndexNumber"
 ].join(",");
 
- function buildPosterUrl(item, height = 540, quality = 72) {
+function getRecentRowsCardTypeBadge(itemType) {
+  const ll = config.languageLabels || {};
+  switch (itemType) {
+    case "Photo":
+      return { label: ll.photo || labels.photo || "Fotoğraf", icon: "photo" };
+    case "PhotoAlbum":
+      return { label: ll.photoAlbum || labels.photoAlbum || "Albüm", icon: "photo" };
+    case "Video":
+      return { label: ll.video || labels.video || "Video", icon: "videocam" };
+    case "Folder":
+      return { label: ll.folder || labels.folder || "Klasör", icon: "folder" };
+    case "Episode":
+      return { label: ll.episode || labels.episode || "Bölüm", icon: "tv" };
+    case "Season":
+      return { label: ll.season || labels.season || "Sezon", icon: "collections" };
+    case "Series":
+      return { label: ll.dizi || labels.dizi || "Dizi", icon: "live_tv" };
+    case "MusicAlbum":
+      return { label: ll.album || labels.album || "Albüm", icon: "library_music" };
+    case "Audio":
+      return { label: ll.track || labels.track || "Parça", icon: "library_music" };
+    case "BoxSet":
+      return {
+        label: ll.collectionTitle || ll.boxset || labels.collectionTitle || labels.boxset || "Collection",
+        icon: "collections"
+      };
+    default:
+      return { label: ll.film || labels.film || "Film", icon: "movie" };
+  }
+}
+
+ function buildPosterUrl(item, height = 540, quality = 72, { omitTag = false } = {}) {
   if (!item?.Id) return null;
   const tag = item?.ImageTags?.Primary || item?.PrimaryImageTag || null;
-  if (!tag) return null;
+  if (!tag && !omitTag) return null;
 
   const base = `/Items/${item.Id}/Images/Primary`;
-  const qs =
-    (tag ? `?tag=${encodeURIComponent(tag)}` : `?`) +
-    `&maxHeight=${height}&quality=${quality}&EnableImageEnhancers=false`;
+  const parts = [];
+  if (tag && !omitTag) parts.push(`tag=${encodeURIComponent(tag)}`);
+  parts.push(`maxHeight=${height}`);
+  parts.push(`quality=${quality}`);
+  parts.push(`EnableImageEnhancers=false`);
+  const qs = `?${parts.join("&")}`;
   const path = base + qs;
 
    return withServer(path);
@@ -202,6 +215,49 @@ const COMMON_FIELDS = [
 function buildPosterUrlHQ(item){ return buildPosterUrl(item, 540, 72); }
 
 function buildPosterUrlLQ(item){ return buildPosterUrl(item, 80, 20); }
+
+function toNoTagUrl(url) {
+  if (!url) return "";
+  const s = String(url);
+  try {
+    const u = new URL(s, window.location?.origin || "http://localhost");
+    u.searchParams.delete("tag");
+    return u.toString();
+  } catch {
+    const [base, q = ""] = s.split("?");
+    if (!q) return s;
+    const rest = q.split("&").filter(Boolean).filter(p => !/^tag=/i.test(p));
+    return rest.length ? `${base}?${rest.join("&")}` : base;
+  }
+}
+
+function toNoTagSrcset(srcset) {
+  if (!srcset || typeof srcset !== "string") return "";
+  return srcset
+    .split(",")
+    .map(part => {
+      const p = part.trim();
+      if (!p) return "";
+      const m = p.match(/^(\S+)(\s+.+)?$/);
+      if (!m) return p;
+      return `${toNoTagUrl(m[1])}${m[2] || ""}`;
+    })
+    .filter(Boolean)
+    .join(", ");
+}
+
+function markImageSettled(img, src) {
+  if (!img) return;
+  try { img.removeAttribute("srcset"); } catch {}
+  if (src) {
+    try { img.src = src; } catch {}
+  }
+  img.__phase = "settled";
+  img.__hiRequested = false;
+  img.classList.add("__hydrated");
+  img.classList.remove("is-lqip");
+  img.__hydrated = true;
+}
 
 function buildLogoUrl(item, width = 220, quality = 80) {
   if (!item) return null;
@@ -251,11 +307,11 @@ function withCacheBust(url) {
 }
 
 function scheduleImgRetry(img, phase, delayMs) {
-  if (!img) return;
+  if (!img) return false;
   const st = (img.__retryState ||= { lq: { tries: 0 }, hi: { tries: 0 } });
   const slot = st[phase] || (st[phase] = { tries: 0 });
   const maxTries = (phase === "hi") ? 8 : 6;
-  if (slot.tries >= maxTries) return;
+  if (slot.tries >= maxTries) return false;
 
   slot.tries++;
   clearTimeout(slot.tid);
@@ -281,6 +337,7 @@ function scheduleImgRetry(img, phase, delayMs) {
     img.__hiRequested = false;
     img.src = withCacheBust(data.lqSrc || fb);
   }, Math.max(250, delayMs|0));
+  return true;
 }
 
 function buildPosterSrcSet(item) {
@@ -331,10 +388,43 @@ if (!__imgIO) {
 
 function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const fb = fallback || PLACEHOLDER_URL;
+  if (IS_MOBILE) {
+    try { __imgIO.unobserve(img); } catch {}
+    try { if (img.__onErr) img.removeEventListener("error", img.__onErr); } catch {}
+    try { if (img.__onLoad) img.removeEventListener("load",  img.__onLoad); } catch {}
+    delete img.__onErr;
+    delete img.__onLoad;
+    try {
+      if (img.__retryState) {
+        clearTimeout(img.__retryState.lq?.tid);
+        clearTimeout(img.__retryState.hi?.tid);
+      }
+    } catch {}
+    delete img.__retryState;
+    delete img.__fallbackState;
+    try { img.removeAttribute("srcset"); } catch {}
+    const staticSrc = hqSrc || lqSrc || fb;
+    if (img.__mobileStaticSrc === staticSrc && img.src === staticSrc) return;
+    try { img.loading = "lazy"; } catch {}
+    if (img.src !== staticSrc) img.src = staticSrc;
+    img.__mobileStaticSrc = staticSrc;
+    img.classList.remove("is-lqip");
+    img.classList.remove("__hydrated");
+    img.__phase = "static";
+    img.__hiRequested = true;
+    img.__disableHi = true;
+    img.__hydrated = true;
+    return;
+  }
 
-  img.__data = { lqSrc, hqSrc, hqSrcset, fallback: fb };
+  const lqSrcNoTag = toNoTagUrl(lqSrc);
+  const hqSrcNoTag = toNoTagUrl(hqSrc);
+  const hqSrcsetNoTag = toNoTagSrcset(hqSrcset);
+
+  img.__data = { lqSrc, hqSrc, hqSrcset, lqSrcNoTag, hqSrcNoTag, hqSrcsetNoTag, fallback: fb };
   img.__phase = "lq";
   img.__hiRequested = false;
+  img.__fallbackState = { lqNoTagTried: false, hiNoTagTried: false };
 
   try {
     img.removeAttribute("srcset");
@@ -348,17 +438,47 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const onError = () => {
   const data = img.__data || {};
   const fb = data.fallback || PLACEHOLDER_URL;
+  const st = (img.__fallbackState ||= { lqNoTagTried: false, hiNoTagTried: false });
 
   try { img.removeAttribute("srcset"); } catch {}
-  try { img.src = fb; } catch {}
 
   img.__hiRequested = false;
   if (img.__phase === "hi") {
+    if (!st.hiNoTagTried && data.hqSrcNoTag && data.hqSrcNoTag !== data.hqSrc) {
+      st.hiNoTagTried = true;
+      img.__phase = "hi";
+      img.__hiRequested = true;
+      img.src = withCacheBust(data.hqSrcNoTag);
+      requestIdleCallback(() => {
+        if (img.__hiRequested && data.hqSrcsetNoTag) img.srcset = data.hqSrcsetNoTag;
+      });
+      return;
+    }
+
+    img.classList.add("__hydrated");
+    img.classList.remove("is-lqip");
+    img.__hydrated = true;
+
     const delay = 800 * Math.min(6, (img.__retryState?.hi?.tries || 0) + 1);
-    scheduleImgRetry(img, "hi", delay);
+    const queued = scheduleImgRetry(img, "hi", delay);
+    if (!queued) {
+      const settleSrc = img.currentSrc || img.src || data.lqSrc || fb;
+      markImageSettled(img, settleSrc);
+    }
   } else {
+    if (!st.lqNoTagTried && data.lqSrcNoTag && data.lqSrcNoTag !== data.lqSrc) {
+      st.lqNoTagTried = true;
+      img.__phase = "lq";
+      img.src = withCacheBust(data.lqSrcNoTag);
+      return;
+    }
+
+    try { img.src = fb; } catch {}
     const delay = 600 * Math.min(5, (img.__retryState?.lq?.tries || 0) + 1);
-    scheduleImgRetry(img, "lq", delay);
+    const queued = scheduleImgRetry(img, "lq", delay);
+    if (!queued) {
+      markImageSettled(img, fb);
+    }
   }
 };
 
@@ -370,7 +490,7 @@ const onLoad = () => {
     img.__retryState.hi && (img.__retryState.hi.tries = 0);
   }
 
-  if (img.__phase === "hi") {
+  if (img.__phase === "hi" || img.__phase === "settled") {
     img.classList.add("__hydrated");
     img.classList.remove("is-lqip");
     img.__hydrated = true;
@@ -397,6 +517,7 @@ function unobserveImage(img) {
     }
   } catch {}
   delete img.__retryState;
+  delete img.__fallbackState;
 }
 
 function formatRuntime(ticks) {
@@ -468,6 +589,19 @@ function getPlaybackPercent(item) {
 
   if (!Number.isFinite(durTicks) || durTicks <= 0) return 0;
   return clamp01(pos / durTicks);
+}
+
+function samePlaybackProgressByOrder(a, b, limit) {
+  const left = Array.isArray(a) ? a : [];
+  const right = Array.isArray(b) ? b : [];
+  const cap = Number.isFinite(limit) ? Math.max(0, limit | 0) : Math.max(left.length, right.length);
+  const n = Math.min(cap, left.length, right.length);
+  for (let i = 0; i < n; i++) {
+    const pa = Math.round(getPlaybackPercent(left[i]) * 1000);
+    const pb = Math.round(getPlaybackPercent(right[i]) * 1000);
+    if (pa !== pb) return false;
+  }
+  return true;
 }
 
 const __hoverIntent = new WeakMap();
@@ -849,37 +983,9 @@ function createRecommendationCard(item, serverId, { aboveFold=false, showProgres
   const runtime = formatRuntime(runtimeTicks);
 
   const genres = Array.isArray(posterSource.Genres) ? posterSource.Genres.slice(0, 2).join(", ") : "";
-  const isSeries = item.Type === "Series";
   const isEpisode = item.Type === "Episode";
   const isSeason  = item.Type === "Season";
-  const isMusicAlbum = item.Type === "MusicAlbum";
-  const isAudio = item.Type === "Audio";
-  const isPhoto = item.Type === "Photo";
-  const isPhotoAlbum = item.Type === "PhotoAlbum";
-  const isVideo = item.Type === "Video";
-  const isFolder = item.Type === "Folder";
-
-  const typeLabel =
-    isPhoto ? (config.languageLabels.photo || "Fotoğraf") :
-    isPhotoAlbum ? (config.languageLabels.photoAlbum || "Albüm") :
-    isVideo ? (config.languageLabels.video || "Video") :
-    isFolder ? (config.languageLabels.folder || "Klasör") :
-    isEpisode ? (config.languageLabels.episode || "Bölüm") :
-    isSeason  ? (config.languageLabels.season  || "Sezon") :
-    isSeries ? (config.languageLabels.dizi || "Dizi") :
-    isMusicAlbum ? (config.languageLabels.album || "Albüm") :
-    isAudio ? (config.languageLabels.track || "Parça") :
-    (config.languageLabels.film || "Film");
-
-  const typeIcon =
-    (isPhoto || isPhotoAlbum) ? "photo" :
-    isVideo ? "videocam" :
-    isFolder ? "folder" :
-    (isMusicAlbum || isAudio) ? "library_music" :
-    isEpisode ? "tv" :
-    isSeason  ? "collections" :
-    isSeries ? "live_tv" :
-    "movie";
+  const { label: typeLabel, icon: typeIcon } = getRecentRowsCardTypeBadge(item.Type);
 
   const community = Number.isFinite(posterSource.CommunityRating)
     ? `<div class="community-rating" title="Community Rating">⭐ ${posterSource.CommunityRating.toFixed(1)}</div>`
@@ -948,28 +1054,26 @@ function createRecommendationCard(item, serverId, { aboveFold=false, showProgres
     img.setAttribute("sizes", IS_MOBILE ? sizesMobile : sizesDesk);
   } catch {}
 
-    try {
+  const cardLink = card.querySelector(".cardLink");
+  if (cardLink) {
+    cardLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
       const hostEl = card.querySelector(".cardImageContainer");
-      if (hostEl) {
-      ensureJmsDetailsOverlay({
-        hostEl,
-        itemId: item.Id,
-        serverId,
-        onDetails: async (e) => {
-        const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+      const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+      try {
         await openDetailsModal({
           itemId: item.Id,
           serverId,
           preferBackdropIndex: backdropIndex,
-          originEl: hostEl?.querySelector?.('img.cardImage') || hostEl,
-          originEvent: e
+          originEl: hostEl?.querySelector?.("img.cardImage") || hostEl || card,
+          originEvent: e,
         });
-      },
-      onPlay: async () => playNow(item.Id),
-      showPlay: false,
-    });
+      } catch (err) {
+        console.warn("openDetailsModal failed (recent card):", err);
+      }
+    }, { passive: false });
   }
-} catch {}
 
   if (posterUrlHQ) {
     hydrateBlurUp(img, { lqSrc: posterUrlLQ, hqSrc: posterUrlHQ, hqSrcset: posterSetHQ, fallback: PLACEHOLDER_URL });
@@ -1062,7 +1166,7 @@ function getSeriesIdFromItem(it) {
   return null;
 }
 
-function createRowHeroCard(item, serverId, labelText) {
+function createRowHeroCard(item, serverId, labelText, { showProgress = false } = {}) {
   const hero = document.createElement("div");
   hero.className = "dir-row-hero";
   hero.dataset.itemId = item.Id;
@@ -1071,7 +1175,7 @@ function createRowHeroCard(item, serverId, labelText) {
   const bg   = buildBackdropUrlHQ(posterSource) || buildPosterUrlHQ(posterSource) || PLACEHOLDER_URL;
   const logo = buildLogoUrl(posterSource);
   const year = posterSource.ProductionYear || "";
-  const plot = clampText(posterSource.Overview, 240);
+  const plot = clampText(posterSource.Overview, 1200);
   const ageChip = normalizeAgeChip(posterSource.OfficialRating || "");
   const isSeries = posterSource.Type === "Series";
   const isEpisode = item.Type === "Episode";
@@ -1087,9 +1191,9 @@ function createRowHeroCard(item, serverId, labelText) {
     (item.RunTimeTicks || posterSource.RunTimeTicks);
 
   const runtime = formatRuntime(runtimeTicks);
-  const heroProgress = getPlaybackPercent(item);
+  const heroProgress = showProgress ? getPlaybackPercent(item) : 0;
   const heroProgressPct = Math.round(heroProgress * 100);
-  const heroProgressHtml = (heroProgress > 0.02 && heroProgress < 0.999)
+  const heroProgressHtml = (showProgress && heroProgress > 0.02 && heroProgress < 0.999)
     ? `
       <div class="dir-hero-progress-wrap" aria-label="${escapeHtml(config.languageLabels.progress || "İlerleme")}">
         <div class="dir-hero-progress-bar" style="width:${heroProgressPct}%"></div>
@@ -1107,20 +1211,29 @@ function createRowHeroCard(item, serverId, labelText) {
     isSeries ? (config.languageLabels.dizi || "Dizi") :
     (config.languageLabels.film || "Film");
 
+  const heroSub = isEpisode ? formatEpisodeLabel(item) : (isSeason ? formatSeasonLabel(item) : "");
   const genres = Array.isArray(posterSource.Genres) ? posterSource.Genres.slice(0, 3).join(", ") : "";
-  const metaParts = [];
-  if (ageChip) metaParts.push(ageChip);
-  if (year) metaParts.push(year);
-  if (runtime) metaParts.push(getRuntimeWithIcons(runtime));
-  if (genres) metaParts.push(genres);
-
-  const meta = metaParts.join(" • ");
+  const runtimeWithIcons = runtime ? getRuntimeWithIcons(runtime) : "";
+  const heroMetaItems = [];
+  if (heroSub) {
+    heroMetaItems.push({ text: heroSub, variant: "subline" });
+  } else {
+    if (ageChip) heroMetaItems.push({ text: ageChip, variant: "age" });
+    if (year) heroMetaItems.push({ text: year, variant: "year" });
+    if (runtimeWithIcons) heroMetaItems.push({ text: runtimeWithIcons, variant: "runtime" });
+    if (genres) heroMetaItems.push({ text: genres, variant: "genres" });
+  }
+  const metaHtml = heroMetaItems.length
+    ? heroMetaItems
+        .map(({ text, variant }) =>
+          `<span class="dir-row-hero-meta dir-row-hero-meta--${variant}">${escapeHtml(text)}</span>`
+        )
+        .join("")
+    : "";
   const heroTitle =
     (isEpisode || isSeason)
       ? (item.SeriesName || posterSource.Name || item.Name)
       : (posterSource.Name || item.Name || "");
-
-  const heroSub = isEpisode ? formatEpisodeLabel(item) : (isSeason ? formatSeasonLabel(item) : "");
 
   hero.innerHTML = `
     <div class="dir-row-hero-bg-wrap">
@@ -1139,38 +1252,37 @@ function createRowHeroCard(item, serverId, labelText) {
 
         <div class="dir-row-hero-title">${escapeHtml(heroTitle)}</div>
 
-        ${heroSub
-          ? `<div class="dir-row-hero-meta">${escapeHtml(heroSub)}</div>`
-          : (meta ? `<div class="dir-row-hero-meta">${escapeHtml(meta)}</div>` : "")
-        }
+        ${metaHtml ? `<div class="dir-row-hero-submeta">${metaHtml}</div>` : ""}
 
         ${plot ? `<div class="dir-row-hero-plot">${escapeHtml(plot)}</div>` : ""}
 
-        <div class="dir-row-hero-actions">
-          <button type="button" class="dir-row-hero-details">
-            ${config.languageLabels.details || "Ayrıntılar"}
-          </button>
-        </div>
       </div>
     </div>
     ${heroProgressHtml}
   `;
 
-  const goDetails = () => {
-    try { window.location.hash = getDetailsUrl(item.Id, serverId); }
-    catch { window.location.href = getDetailsUrl(item.Id, serverId); }
+  const openDetails = async (e) => {
+    try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch {}
+    const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+    const originEl = hero.querySelector(".dir-row-hero-bg") || hero;
+    try {
+      await openDetailsModal({
+        itemId: item.Id,
+        serverId,
+        preferBackdropIndex: backdropIndex,
+        originEl,
+      });
+    } catch (err) {
+      console.warn("openDetailsModal failed (recent hero):", err);
+    }
   };
 
-  hero.addEventListener("click", goDetails);
+  hero.addEventListener("click", openDetails);
+  hero.tabIndex = 0;
+  hero.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") openDetails(e);
+  });
   hero.classList.add("active");
-
-  const detailsBtn = hero.querySelector('.dir-row-hero-details');
-  if (detailsBtn) {
-    detailsBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      goDetails();
-    });
-  }
 
   try {
     const backdropImg = hero.querySelector(".dir-row-hero-bg");
@@ -1189,6 +1301,7 @@ function createRowHeroCard(item, serverId, labelText) {
       serverId,
       detailsUrl: getDetailsUrl(item.Id, serverId),
       detailsText: config.languageLabels.details || "Ayrıntılar",
+      showDetailsOverlay: false,
     });
   } catch (err) {
     console.error("RecentRows hero createTrailerIframe hata:", err);
@@ -1367,9 +1480,12 @@ async function fetchItemsByIds(ids) {
     const out = [];
     for (let i = 0; i < missing.length; i += chunkSize) {
       const chunk = missing.slice(i, i + chunkSize);
+      const userScoped = !!STATE.userId;
+      const basePath = userScoped ? `/Users/${STATE.userId}/Items` : `/Items`;
       const url =
-        `/Items?Ids=${encodeURIComponent(chunk.join(","))}` +
+        `${basePath}?Ids=${encodeURIComponent(chunk.join(","))}` +
         `&Fields=${encodeURIComponent(COMMON_FIELDS)}` +
+        (userScoped ? `&EnableUserData=true` : ``) +
         `&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop,Logo`;
       try {
         const data = await makeApiRequest(url);
@@ -1613,6 +1729,7 @@ function buildSectionSkeleton({ titleText, badgeType, onSeeAll }) {
 
   const heroHost = document.createElement("div");
   heroHost.className = "dir-row-hero-host";
+  heroHost.style.display = SHOW_RECENT_ROWS_HERO_CARDS ? "" : "none";
 
   const scrollWrap = document.createElement("div");
   scrollWrap.className = "personal-recs-scroll-wrap";
@@ -1705,7 +1822,9 @@ async function fillSectionWithItems({
         const remaining = best ? pool.filter(x => x?.Id && x.Id !== best.Id) : pool.slice();
 
         heroHost.innerHTML = "";
-        if (best) heroHost.appendChild(createRowHeroCard(best, STATE.serverId, heroLabel));
+        if (SHOW_RECENT_ROWS_HERO_CARDS && best) {
+          heroHost.appendChild(createRowHeroCard(best, STATE.serverId, heroLabel, { showProgress }));
+        }
 
         row.innerHTML = "";
         const fragment = document.createDocumentFragment();
@@ -1749,7 +1868,12 @@ async function fillSectionWithItems({
   if (cachedItems?.length) {
     const a = cachedItems.map(x => x?.Id).filter(Boolean).slice(0, cardCount+1);
     const b = items.map(x => x?.Id).filter(Boolean).slice(0, cardCount+1);
-    if (sameIdList(a, b)) return true;
+    if (sameIdList(a, b)) {
+      const progressUnchanged =
+        !showProgress ||
+        samePlaybackProgressByOrder(cachedItems, items, cardCount + 1);
+      if (progressUnchanged) return true;
+    }
   }
 
   const pool = items.slice();
@@ -1767,7 +1891,9 @@ async function fillSectionWithItems({
   const remaining = best ? pool.filter(x => x?.Id && x.Id !== best.Id) : pool.slice();
 
   heroHost.innerHTML = "";
-  if (best) heroHost.appendChild(createRowHeroCard(best, STATE.serverId, heroLabel));
+  if (SHOW_RECENT_ROWS_HERO_CARDS && best) {
+    heroHost.appendChild(createRowHeroCard(best, STATE.serverId, heroLabel, { showProgress }));
+  }
 
   row.innerHTML = "";
   if (!remaining.length) {
@@ -1897,6 +2023,10 @@ function ensureRecentRowsPlacement(wrap) {
 
 export function mountRecentRowsLazy() {
   if (!getActiveHomePage()) {
+    if (__recentMountRetryTimer) {
+      clearTimeout(__recentMountRetryTimer);
+      __recentMountRetryTimer = null;
+    }
     cleanupRecentRows();
     return;
   }
@@ -1925,7 +2055,10 @@ export function mountRecentRowsLazy() {
 
   const pin = getPinnedHomeContainer();
   const homeParent = findRealHomeSectionsContainer();
-  if (!homeParent) return;
+  if (!homeParent) {
+    scheduleRecentRowsRetry(260);
+    return;
+  }
   const pr = document.getElementById("personal-recommendations");
 
   let parent = (pin && pin.parent) ? pin.parent : homeParent;
@@ -1958,7 +2091,13 @@ export function mountRecentRowsLazy() {
     }
   }
 
-  const start = () => { try { initAndRender(wrap); } catch (e) { console.error(e); } };
+  const start = () => {
+    if (!wrap.isConnected) {
+      scheduleRecentRowsRetry(260);
+      return;
+    }
+    try { initAndRender(wrap); } catch (e) { console.error(e); }
+  };
   if (document.readyState === "complete") setTimeout(start, 0);
   else window.addEventListener("load", () => setTimeout(start, 0), { once: true });
   }
@@ -1979,6 +2118,10 @@ function getPinnedHomeContainer() {
 
 async function initAndRender(wrap) {
   if (!getActiveHomePage()) return;
+  if (!wrap || !wrap.isConnected) {
+    scheduleRecentRowsRetry(280);
+    return;
+  }
   if (STATE.started) {
     const stale =
       !STATE.wrapEl ||
@@ -2420,6 +2563,10 @@ async function initAndRender(wrap) {
 
 export function cleanupRecentRows() {
   try {
+    if (__recentMountRetryTimer) {
+      clearTimeout(__recentMountRetryTimer);
+      __recentMountRetryTimer = null;
+    }
     if (STATE.wrapEl) {
       STATE.wrapEl.querySelectorAll(".personal-recs-card, .dir-row-hero").forEach(el => {
         try { el.dispatchEvent(new CustomEvent("jms:cleanup")); } catch {}
@@ -2469,6 +2616,11 @@ function getHomeSectionsContainer(indexPage) {
 
   window.addEventListener("hashchange", () => setTimeout(tick, 0), { passive: true });
   window.addEventListener("popstate",  () => setTimeout(tick, 0), { passive: true });
+  window.addEventListener("pageshow",  () => setTimeout(tick, 0), { passive: true });
+  document.addEventListener("viewshow", () => setTimeout(tick, 0), { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) setTimeout(tick, 0);
+  }, { passive: true });
 
   setTimeout(tick, 0);
 })();

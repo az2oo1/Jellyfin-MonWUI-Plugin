@@ -1,10 +1,10 @@
-import { getSessionInfo, makeApiRequest, getCachedUserTopGenres, playNow } from "./api.js";
+import { getSessionInfo, makeApiRequest, getCachedUserTopGenres } from "./api.js";
 import { getConfig } from "./config.js";
 import { getLanguageLabels, getDefaultLanguage } from "../language/index.js";
 import { attachMiniPosterHover } from "./studioHubsUtils.js";
 import { openGenreExplorer, openPersonalExplorer } from "./genreExplorer.js";
 import { REOPEN_COOLDOWN_MS, OPEN_HOVER_DELAY_MS } from "./hoverTrailerModal.js";
-import { createTrailerIframe, ensureJmsDetailsOverlay } from "./utils.js";
+import { createTrailerIframe } from "./utils.js";
 import { openDetailsModal } from "./detailsModal.js";
 import { withServer, withServerSrcset } from "./jfUrl.js";
 import {
@@ -59,6 +59,10 @@ const BYW_ROW_COUNT = Number.isFinite(getConfig()?.becauseYouWatchedRowCount)
   ? Math.max(1, getConfig()?.becauseYouWatchedRowCount | 0)
   : 1;
 
+function isPersonalRecsHeroEnabled() {
+  return getConfig()?.showPersonalRecsHeroCards !== false;
+}
+
 const PRC_DB_STATE = {
   db: null,
   scope: null,
@@ -72,6 +76,20 @@ function __appendCb(url, cb) {
   const u = String(url);
   const sep = u.includes('?') ? '&' : '?';
   return `${u}${sep}cb=${encodeURIComponent(String(cb))}`;
+}
+
+function __appendCbToSrcset(srcset, cb) {
+  if (!srcset || typeof srcset !== 'string') return '';
+  return srcset
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(part => {
+      const m = part.match(/^(\S+)(\s+.+)?$/);
+      if (!m) return part;
+      return `${__appendCb(m[1], cb)}${m[2] || ''}`;
+    })
+    .join(', ');
 }
 
 function __preloadOk(src) {
@@ -137,6 +155,26 @@ function __metaKeyBywScoped(scope, seedKey){ return `prc:byw:${seedKey}:${scope}
 function __metaKeyBywLastScoped(scope, seedKey){ return `prc:byw:lastShown:${seedKey}:${scope}`; }
 
 const PRC_PURGE_KEY = (scope) => `prc:purge:last:${scope}`;
+
+function getPrcTypeToken(itemType) {
+  if (itemType === "Series") return "series";
+  if (itemType === "BoxSet") return "boxset";
+  return "movie";
+}
+
+function getPrcCardTypeBadge(itemType) {
+  const ll = config.languageLabels || {};
+  if (itemType === "Series") {
+    return { label: ll.dizi || labels.dizi || "Dizi", icon: "live_tv" };
+  }
+  if (itemType === "BoxSet") {
+    return {
+      label: ll.collectionTitle || ll.boxset || labels.collectionTitle || labels.boxset || "Collection",
+      icon: "collections"
+    };
+  }
+  return { label: ll.film || labels.film || "Film", icon: "movie" };
+}
 
 async function maybePurgePrcDb(st) {
   try {
@@ -640,6 +678,7 @@ const __imgIO = new IntersectionObserver((entries) => {
     const img = ent.target;
     const data = img.__data || {};
     if (ent.isIntersecting) {
+        if (img.__disableHi) continue;
         if (!__shouldRequestHiRes()) continue;
 
         const now = Date.now();
@@ -702,7 +741,7 @@ function makePRCKey(it) {
   const yr = it?.ProductionYear
     ? String(it.ProductionYear)
     : (it?.PremiereDate ? String(new Date(it.PremiereDate).getUTCFullYear() || '') : '');
-   const tp = it?.Type === "Series" ? "series" : "movie";
+   const tp = getPrcTypeToken(it?.Type);
    return `${tp}::${nm}|${yr}`;
  }
 
@@ -714,58 +753,13 @@ function makePRCLooseKey(it) {
     .trim()
     .toLowerCase();
 
-  const tp = it?.Type === "Series" ? "series" : "movie";
+  const tp = getPrcTypeToken(it?.Type);
   return `${tp}::${nm}`;
 }
 
-(function injectPerfCssOnce(){
-  if (document.getElementById('prc-perf-css')) return;
-  const st = document.createElement('style');
-  st.id = 'prc-perf-css';
-  st.textContent = `
-    .personal-recs-row, .genre-row {
-      content-visibility: auto;
-      contain-intrinsic-size: 260px 1200px;
-      contain: layout paint style;
-    }
-    .dir-row-hero-host { min-height: 260px; }
-
-    .dir-row-hero {
-      transition: opacity .18s ease, transform .18s ease;
-      will-change: opacity, transform;
-    }
-    .dir-row-hero.is-entering { opacity: 0; transform: translateY(2px); }
-    .dir-row-hero.is-leaving  { opacity: 0; }
-
-    .personal-recs-card .cardImage {
-      width: 100%;
-      aspect-ratio: 2 / 3;
-      object-fit: cover;
-      display: block;
-    }
-
-    .personal-recs-card .cardImage.is-lqip {
-      filter: blur(10px);
-      transform: translateZ(0);
-      transition: filter .25s ease;
-    }
-    .personal-recs-card .cardImage.__hydrated {
-      filter: none;
-    }
-
-    .personal-recs-card { contain: paint; }
-    @media (max-width: 820px) {
-      .personal-recs-card .cardImage { aspect-ratio: 2/3; }
-    }
-    .personal-recs-card .prc-top-badges,
-    .personal-recs-card .prc-overlay {
-      will-change: transform;
-      transform: translateZ(0);
-      backface-visibility: hidden;
-    }
-  `;
-  document.head.appendChild(st);
-})();
+/* Runtime CSS injection disabled intentionally.
+   Personal recommendations styles are fully maintained in src/personalRecommendations.css
+   to avoid repeated style tag injections and cascade-order conflicts. */
 
 function buildPosterUrlLQ(item) {
   return buildPosterUrl(item, 120, 25);
@@ -1010,16 +1004,43 @@ function placeSection(sectionEl, homeSections, underStudio) {
 
 function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   const fb = fallback || PLACEHOLDER_URL;
+  if (IS_MOBILE) {
+    try { __imgIO.unobserve(img); } catch {}
+    try { if (img.__onErr) img.removeEventListener('error', img.__onErr); } catch {}
+    try { if (img.__onLoad) img.removeEventListener('load',  img.__onLoad); } catch {}
+    delete img.__onErr;
+    delete img.__onLoad;
+    try { img.removeAttribute('srcset'); } catch {}
+    const staticSrc = hqSrc || lqSrc || fb;
+    if (img.__mobileStaticSrc === staticSrc && img.src === staticSrc) return;
+    try { img.loading = "lazy"; } catch {}
+    if (img.src !== staticSrc) img.src = staticSrc;
+    img.__mobileStaticSrc = staticSrc;
+    img.classList.remove('is-lqip');
+    img.classList.remove('__hydrated');
+    img.__phase = 'static';
+    img.__hiRequested = true;
+    img.__disableHi = true;
+    img.__hydrated = true;
+    return;
+  }
+
   const wantsHi = __shouldRequestHiRes() && (hqSrc || hqSrcset);
+  const lqSrcNoTag = toNoTagUrl(lqSrc);
+  const hqSrcNoTag = toNoTagUrl(hqSrc);
+  const hqSrcsetNoTag = toNoTagSrcset(hqSrcset);
 
   try { __imgIO.unobserve(img); } catch {}
   try { if (img.__onErr) img.removeEventListener('error', img.__onErr); } catch {}
   try { if (img.__onLoad) img.removeEventListener('load',  img.__onLoad); } catch {}
 
-  img.__data = { lqSrc, hqSrc, hqSrcset, fallback: fb };
+  img.__data = { lqSrc, hqSrc, hqSrcset, lqSrcNoTag, hqSrcNoTag, hqSrcsetNoTag, fallback: fb };
   img.__phase = 'lq';
   img.__hiRequested = false;
   img.__hiFailed = false;
+  img.__disableHi = false;
+  img.__allowLqHydrate = false;
+  img.__fallbackState = { lqNoTagTried: false, hiNoTagTried: false };
 
   try { img.removeAttribute('srcset'); } catch {}
   try { img.classList.remove('__hydrated'); } catch {}
@@ -1032,33 +1053,64 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   img.__hydrated = false;
 
   const onError = () => {
+    const data = img.__data || {};
+    const st = (img.__fallbackState ||= { lqNoTagTried: false, hiNoTagTried: false });
     if (img.__phase === 'hi') {
+      if (!st.hiNoTagTried && data.hqSrcNoTag && data.hqSrcNoTag !== data.hqSrc) {
+        st.hiNoTagTried = true;
+        img.__phase = 'hi';
+        img.__hiRequested = true;
+        img.__hiFailed = false;
+        try { img.removeAttribute('srcset'); } catch {}
+        const cb = `hq-notag-${Date.now()}`;
+        if (data.hqSrcsetNoTag) {
+          try { img.srcset = __appendCbToSrcset(data.hqSrcsetNoTag, cb); } catch {}
+        }
+        try { img.src = __appendCb(data.hqSrcNoTag, cb); } catch {}
+        return;
+      }
+
       img.__hiFailed = true;
       img.__hiRequested = false;
       img.__retryAfter = Date.now() + 12_000;
+      if (st.hiNoTagTried || !data.hqSrcNoTag || data.hqSrcNoTag === data.hqSrc) {
+        img.__disableHi = true;
+      }
 
       try { img.removeAttribute('srcset'); } catch {}
       try { img.classList.remove('__hydrated'); } catch {}
 
-      if (lqSrc) {
-        const lq = __appendCb(lqSrc, `lq-${Date.now()}`);
+      if (!st.lqNoTagTried && data.lqSrcNoTag && data.lqSrcNoTag !== data.lqSrc) {
+        st.lqNoTagTried = true;
+        const lqNoTag = __appendCb(data.lqSrcNoTag, `lq-notag-${Date.now()}`);
+        if (img.src !== lqNoTag) img.src = lqNoTag;
+      } else if (data.lqSrc) {
+        const lq = __appendCb(data.lqSrc, `lq-${Date.now()}`);
         if (img.src !== lq) img.src = lq;
       } else {
         img.src = fb;
       }
 
+      img.__allowLqHydrate = true;
       img.classList.add('is-lqip');
       img.__phase = 'lq';
 
       try { __imgIO.unobserve(img); } catch {}
       try { __imgIO.observe(img); } catch {}
     } else {
+      if (!st.lqNoTagTried && data.lqSrcNoTag && data.lqSrcNoTag !== data.lqSrc) {
+        st.lqNoTagTried = true;
+        const lqNoTag = __appendCb(data.lqSrcNoTag, `lq-notag-${Date.now()}`);
+        if (img.src !== lqNoTag) img.src = lqNoTag;
+        return;
+      }
+      img.__allowLqHydrate = true;
       try { img.src = fb; } catch {}
     }
   };
 
   const onLoad = () => {
-    if (img.__phase === 'hi' || !wantsHi) {
+    if (img.__phase === 'hi' || !wantsHi || img.__allowLqHydrate) {
       img.classList.add('__hydrated');
       img.classList.remove('is-lqip');
       img.__hydrated = true;
@@ -1088,6 +1140,9 @@ function unobserveImage(img) {
   delete img.__onLoad;
   delete img.__hiFailed;
   delete img.__hiRequested;
+  delete img.__disableHi;
+  delete img.__allowLqHydrate;
+  delete img.__fallbackState;
   if (img) {
     try { img.removeAttribute('srcset'); } catch {}
     try { delete img.__data; } catch {}
@@ -1162,7 +1217,7 @@ function pageReady() {
     const page = document.querySelector("#indexPage:not(.hide)") || document.querySelector("#homePage:not(.hide)");
     if (!page) return false;
     const hasSections = !!(page.querySelector(".homeSectionsContainer") || document.querySelector(".homeSectionsContainer"));
-    return !!page && (hasSections || true);
+    return !!(page && hasSections);
   } catch { return false; }
 }
 
@@ -1190,6 +1245,7 @@ export async function renderPersonalRecommendations() {
 
   if (__personalRecsBusy) return;
   if (!pageReady()) {
+    __personalRecsInitDone = false;
     scheduleRecsRetry(700);
     return;
   }
@@ -1204,7 +1260,20 @@ export async function renderPersonalRecommendations() {
     const indexPage =
       document.querySelector("#indexPage:not(.hide)") ||
       document.querySelector("#homePage:not(.hide)");
-    if (!indexPage) return;
+    if (!indexPage) {
+      __personalRecsInitDone = false;
+      scheduleRecsRetry(700);
+      return;
+    }
+    const hasHomeSections = !!(
+      indexPage.querySelector(".homeSectionsContainer") ||
+      document.querySelector(".homeSectionsContainer")
+    );
+    if (!hasHomeSections) {
+      __personalRecsInitDone = false;
+      scheduleRecsRetry(520);
+      return;
+    }
 
     const tasks = [];
 
@@ -1277,6 +1346,12 @@ function ensureBecauseContainer(indexPage, key = "0") {
     } else {
       placeSection(existing, homeSections, false);
     }
+    const heroHost = existing.querySelector('.dir-row-hero-host');
+    if (heroHost) {
+      const showHero = isPersonalRecsHeroEnabled();
+      heroHost.style.display = showHero ? '' : 'none';
+      if (!showHero) heroHost.innerHTML = '';
+    }
     try { enforceOrder(parent); } catch {}
     return existing;
   }
@@ -1303,6 +1378,7 @@ function ensureBecauseContainer(indexPage, key = "0") {
   const scrollWrap = section.querySelector('.personal-recs-scroll-wrap');
   const heroHost = document.createElement('div');
   heroHost.className = 'dir-row-hero-host';
+  heroHost.style.display = isPersonalRecsHeroEnabled() ? '' : 'none';
   section.insertBefore(heroHost, scrollWrap);
   section.__heroHost = heroHost;
 
@@ -1567,18 +1643,22 @@ async function renderBecauseYouWatchedAuto(indexPage) {
     try {
       const heroHost = section.__heroHost || section.querySelector('.dir-row-hero-host');
       if (heroHost) {
-        const heroItem = seed || items[0];
-        if (heroItem?.Id) {
-          const heroLabel = formatBecauseYouWatchedTitle(seedName);
-          mountHero(heroHost, heroItem, serverId, heroLabel, { aboveFold: i === 0 });
-          try {
-            const heroEl = heroHost.querySelector('.dir-row-hero');
-            const backdropImg = heroEl?.querySelector?.('.dir-row-hero-bg');
-            const RemoteTrailers =
-              heroItem.RemoteTrailers ||
-              heroItem.RemoteTrailerItems ||
-              heroItem.RemoteTrailerUrls ||
-              [];
+        const showHero = isPersonalRecsHeroEnabled();
+        heroHost.style.display = showHero ? '' : 'none';
+        heroHost.innerHTML = '';
+        if (showHero) {
+          const heroItem = seed || items[0];
+          if (heroItem?.Id) {
+            const heroLabel = formatBecauseYouWatchedTitle(seedName);
+            mountHero(heroHost, heroItem, serverId, heroLabel, { aboveFold: i === 0 });
+            try {
+              const heroEl = heroHost.querySelector('.dir-row-hero');
+              const backdropImg = heroEl?.querySelector?.('.dir-row-hero-bg');
+              const RemoteTrailers =
+                heroItem.RemoteTrailers ||
+                heroItem.RemoteTrailerItems ||
+                heroItem.RemoteTrailerUrls ||
+                [];
             createTrailerIframe({
               config,
               RemoteTrailers,
@@ -1588,8 +1668,10 @@ async function renderBecauseYouWatchedAuto(indexPage) {
               serverId,
               detailsUrl: getDetailsUrl(heroItem.Id, serverId),
               detailsText: (config.languageLabels?.details || labels.details || "Ayrıntılar"),
+              showDetailsOverlay: false,
             });
-          } catch {}
+            } catch {}
+          }
         }
       }
     } catch {}
@@ -2015,7 +2097,11 @@ function buildPosterSrcSet(item) {
   const q  = 50;
   const ar = Number(item.PrimaryImageAspectRatio) || 0.6667;
   const raw = hs
-    .map(h => `${buildPosterUrl(item, h, q)} ${Math.round(h * ar)}w`)
+    .map(h => {
+      const u = buildPosterUrl(item, h, q);
+      return u ? `${u} ${Math.round(h * ar)}w` : "";
+    })
+    .filter(Boolean)
     .join(", ");
   return withServerSrcset(raw);
 }
@@ -2061,11 +2147,49 @@ function getDetailsUrl(itemId, serverId) {
   return `#/details?id=${itemId}&serverId=${encodeURIComponent(serverId)}`;
 }
 
-function buildPosterUrl(item, height = 540, quality = 72) {
+function buildPosterUrl(item, height = 540, quality = 72, { omitTag = false } = {}) {
+  if (!item?.Id) return null;
   const tag = item.ImageTags?.Primary || item.PrimaryImageTag;
-  if (!tag) return null;
-  const url = `/Items/${item.Id}/Images/Primary?tag=${encodeURIComponent(tag)}&maxHeight=${height}&quality=${quality}&EnableImageEnhancers=false`;
+  if (!tag && !omitTag) return null;
+
+  const parts = [];
+  if (tag && !omitTag) parts.push(`tag=${encodeURIComponent(tag)}`);
+  parts.push(`maxHeight=${height}`);
+  parts.push(`quality=${quality}`);
+  parts.push(`EnableImageEnhancers=false`);
+
+  const url = `/Items/${item.Id}/Images/Primary?${parts.join("&")}`;
   return withServer(url);
+}
+
+function toNoTagUrl(url) {
+  if (!url) return "";
+  const s = String(url);
+  try {
+    const u = new URL(s, window.location?.origin || "http://localhost");
+    u.searchParams.delete("tag");
+    return u.toString();
+  } catch {
+    const [base, q = ""] = s.split("?");
+    if (!q) return s;
+    const rest = q.split("&").filter(Boolean).filter(p => !/^tag=/i.test(p));
+    return rest.length ? `${base}?${rest.join("&")}` : base;
+  }
+}
+
+function toNoTagSrcset(srcset) {
+  if (!srcset || typeof srcset !== "string") return "";
+  return srcset
+    .split(",")
+    .map(part => {
+      const p = part.trim();
+      if (!p) return "";
+      const m = p.match(/^(\S+)(\s+.+)?$/);
+      if (!m) return p;
+      return `${toNoTagUrl(m[1])}${m[2] || ""}`;
+    })
+    .filter(Boolean)
+    .join(", ");
 }
 
 function createGenreHeroCard(item, serverId, genreName, { aboveFold = false } = {}) {
@@ -2078,15 +2202,21 @@ function createGenreHeroCard(item, serverId, genreName, { aboveFold = false } = 
 
   const logo = buildLogoUrl(item);
   const year = item.ProductionYear || '';
-  const plot = clampText(item.Overview, 240);
+  const plot = clampText(item.Overview, 1200);
   const ageChip = normalizeAgeChip(item.OfficialRating || '');
   const genres = Array.isArray(item.Genres) ? item.Genres.slice(0, 3).join(", ") : "";
 
-  const metaParts = [];
-  if (ageChip) metaParts.push(ageChip);
-  if (year) metaParts.push(year);
-  if (genres) metaParts.push(genres);
-  const meta = metaParts.join(" • ");
+  const heroMetaItems = [];
+  if (ageChip) heroMetaItems.push({ text: ageChip, variant: "age" });
+  if (year) heroMetaItems.push({ text: year, variant: "year" });
+  if (genres) heroMetaItems.push({ text: genres, variant: "genres" });
+  const metaHtml = heroMetaItems.length
+    ? heroMetaItems
+        .map(({ text, variant }) =>
+          `<span class="dir-row-hero-meta dir-row-hero-meta--${variant}">${escapeHtml(text)}</span>`
+        )
+        .join("")
+    : "";
 
   hero.innerHTML = `
     <div class="dir-row-hero-bg-wrap">
@@ -2115,9 +2245,7 @@ function createGenreHeroCard(item, serverId, genreName, { aboveFold = false } = 
 
         <div class="dir-row-hero-title">${escapeHtml(item.Name)}</div>
 
-        <div class="dir-row-hero-submeta">
-          ${meta ? `<span class="dir-row-hero-meta">${escapeHtml(meta)}</span>` : ""}
-        </div>
+        ${metaHtml ? `<div class="dir-row-hero-submeta">${metaHtml}</div>` : ""}
 
         ${plot ? `<div class="dir-row-hero-plot">${escapeHtml(plot)}</div>` : ""}
 
@@ -2141,12 +2269,27 @@ function createGenreHeroCard(item, serverId, genreName, { aboveFold = false } = 
     }
   } catch {}
 
-  const goDetails = () => {
-    try { window.location.hash = getDetailsUrl(item.Id, serverId); }
-    catch { window.location.href = getDetailsUrl(item.Id, serverId); }
+  const openDetails = async (e) => {
+    try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch {}
+    const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+    const originEl = hero.querySelector('.dir-row-hero-bg') || hero;
+    try {
+      await openDetailsModal({
+        itemId: item.Id,
+        serverId,
+        preferBackdropIndex: backdropIndex,
+        originEl,
+      });
+    } catch (err) {
+      console.warn("openDetailsModal failed (personal hero):", err);
+    }
   };
 
-  hero.addEventListener('click', () => { goDetails(); });
+  hero.addEventListener('click', openDetails);
+  hero.tabIndex = 0;
+  hero.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') openDetails(e);
+  });
 
   hero.classList.add('active');
 
@@ -2175,11 +2318,7 @@ function createRecommendationCard(item, serverId, aboveFold = false) {
   const runtimeTicks = item.Type === "Series" ? item.CumulativeRunTimeTicks : item.RunTimeTicks;
   const runtime = formatRuntime(runtimeTicks);
   const genres = Array.isArray(item.Genres) ? item.Genres.slice(0, 3).join(", ") : "";
-  const isSeries = item.Type === "Series";
-  const typeLabel = isSeries
-    ? ((config.languageLabels && config.languageLabels.dizi) || "Dizi")
-    : ((config.languageLabels && config.languageLabels.film) || "Film");
-  const typeIcon = isSeries ? 'live_tv' : 'movie';
+  const { label: typeLabel, icon: typeIcon } = getPrcCardTypeBadge(item.Type);
   const community = Number.isFinite(item.CommunityRating)
     ? `<div class="community-rating" title="Community Rating">⭐ ${item.CommunityRating.toFixed(1)}</div>`
     : "";
@@ -2247,30 +2386,25 @@ if (posterUrlHQ) {
     card.querySelector('.cardImageContainer')?.prepend(noImg);
   }
 
-  try {
-    const hostEl = card.querySelector(".cardImageContainer");
-    if (hostEl) {
-      ensureJmsDetailsOverlay({
-        hostEl,
-        itemId: item.Id,
-        serverId,
-        onDetails: async () => {
-          const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
-          await openDetailsModal({
-            itemId: item.Id,
-            serverId,
-            preferBackdropIndex: backdropIndex,
-            originEl: hostEl?.querySelector?.('img.cardImage') || hostEl,
-          });
-        },
-        onPlay: async () => {
-          await playNow(item.Id);
-        },
-        showPlay: false,
-      });
-    }
-  } catch (e) {
-    console.warn("ensureJmsDetailsOverlay failed:", e);
+  const cardLink = card.querySelector(".cardLink");
+  if (cardLink) {
+    cardLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const hostEl = card.querySelector(".cardImageContainer");
+      const backdropIndex = localStorage.getItem("jms_backdrop_index") || "0";
+      try {
+        await openDetailsModal({
+          itemId: item.Id,
+          serverId,
+          preferBackdropIndex: backdropIndex,
+          originEl: hostEl?.querySelector?.("img.cardImage") || hostEl || card,
+          originEvent: e,
+        });
+      } catch (err) {
+        console.warn("openDetailsModal failed (personal card):", err);
+      }
+    }, { passive: false });
   }
 
   const mode = (getConfig()?.globalPreviewMode === 'studioMini') ? 'studioMini' : 'modal';
@@ -2391,8 +2525,15 @@ export function setupScroller(row) {
 
   const onClickL = (e) => { e.preventDefault(); e.stopPropagation(); doScroll(-1, e); };
   const onClickR = (e) => { e.preventDefault(); e.stopPropagation(); doScroll( 1, e); };
-  if (btnL) btnL.addEventListener("click", onClickL);
-  if (btnR) btnR.addEventListener("click", onClickR);
+  const blurAfterPointerClick = (btn, e) => {
+    if (!btn) return;
+    if ((e?.detail || 0) <= 0) return;
+    requestAnimationFrame(() => { try { btn.blur(); } catch {} });
+  };
+  const onClickL2 = (e) => { onClickL(e); blurAfterPointerClick(btnL, e); };
+  const onClickR2 = (e) => { onClickR(e); blurAfterPointerClick(btnR, e); };
+  if (btnL) btnL.addEventListener("click", onClickL2);
+  if (btnR) btnR.addEventListener("click", onClickR2);
 
   const onWheel = (e) => {
     const horizontalIntent = Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey;
@@ -2416,7 +2557,7 @@ export function setupScroller(row) {
 
   const ro = new ResizeObserver(() => scheduleUpdate());
   ro.observe(row);
-  row.__scroller = { btnL, btnR, onClickL, onClickR, onWheel, onScroll, onTs, onTm, ro, mo, onLoadCapture };
+  row.__scroller = { btnL, btnR, onClickL: onClickL2, onClickR: onClickR2, onWheel, onScroll, onTs, onTm, ro, mo, onLoadCapture };
   row.addEventListener("jms:cleanup", () => {
     try { cleanupScroller(row); } catch {}
   }, { once: true });
@@ -2539,6 +2680,7 @@ function ensureGenreSectionElement(idx) {
   const scrollWrap = section.querySelector('.personal-recs-scroll-wrap');
   const heroHost = document.createElement('div');
   heroHost.className = 'dir-row-hero-host';
+  heroHost.style.display = isPersonalRecsHeroEnabled() ? '' : 'none';
   section.insertBefore(heroHost, scrollWrap);
   const titleBtn  = section.querySelector('.gh-title-text');
   const seeAllBtn = section.querySelector('.gh-see-all');
@@ -2661,8 +2803,10 @@ async function ensureGenreLoaded(idx) {
       const remaining = (bestIndex >= 0) ? pool.filter((_, i) => i !== bestIndex) : pool.slice();
 
       if (heroHost) {
+        const showHero = isPersonalRecsHeroEnabled();
+        heroHost.style.display = showHero ? '' : 'none';
         heroHost.innerHTML = "";
-        if (best) {
+        if (showHero && best) {
           mountHero(heroHost, best, serverId, genre, { aboveFold: idx === 0 });
           try {
             const heroEl = heroHost.querySelector('.dir-row-hero');
@@ -2677,6 +2821,7 @@ async function ensureGenreLoaded(idx) {
               serverId,
               detailsUrl: getDetailsUrl(best.Id, serverId),
               detailsText: (config.languageLabels?.details || labels.details || "Ayrıntılar"),
+              showDetailsOverlay: false,
             });
           } catch {}
         }
@@ -3179,4 +3324,3 @@ window.addEventListener('online', __forceRetryAllBroken);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) __forceRetryAllBroken();
 });
-

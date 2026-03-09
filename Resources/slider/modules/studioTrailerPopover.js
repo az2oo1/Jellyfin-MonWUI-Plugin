@@ -87,6 +87,15 @@ function ensureEl() {
   `;
 
   (document.body || document.documentElement).appendChild(el);
+  el.addEventListener("pointerenter", () => {
+    if (__timer) { clearTimeout(__timer); __timer = null; }
+  }, { passive: true });
+  el.addEventListener("pointerleave", (e) => {
+    const to = e?.relatedTarget || null;
+    const intoMini = !!(to && to.closest?.(".mini-poster-popover"));
+    if (intoMini) return;
+    hideTrailerPopover(140);
+  }, { passive: true });
   __pop = el;
   return el;
 }

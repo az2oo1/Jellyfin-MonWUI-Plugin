@@ -10,7 +10,10 @@ function jfUrl(pathOrUrl) {
   return pathOrUrl ? withServer(pathOrUrl) : "";
 }
 
-const POLL_INTERVAL_MS = 15_000;
+const POLL_INTERVAL_MS = 60_000;
+const POLL_RESUME_DELAY_MS = 1_500;
+const AUTH_RETRY_INTERVAL_MS = 5_000;
+const CAPABILITY_RECHECK_MS = 2 * 60 * 1000;
 const TOAST_DURATION_MS = config.toastDuration;
 const MAX_NOTIFS = config.maxNotifications;
 const TOAST_DEDUP_MS = 5 * 60 * 1000;
@@ -1412,6 +1415,7 @@ export async function initNotifications() {
   schedulePollLatest(POLL_INTERVAL_MS);
 
   setInterval(async () => {
+    if (document.hidden) return;
     const before = !!notifState._systemAllowed;
     const nowAllowed = await canReadActivityLog();
     notifState._systemAllowed = !!nowAllowed;
@@ -1420,7 +1424,7 @@ export async function initNotifications() {
       renderNotifications();
       pollActivities({ seedIfFirstRun: true });
     }
-  }, 20_000);
+  }, CAPABILITY_RECHECK_MS);
 
   window.forceCheckNotifications = () => {
      pollLatest();
@@ -1441,8 +1445,8 @@ export async function initNotifications() {
       clearTimeout(pollCtl.latestTimer); pollCtl.latestTimer = null;
       clearTimeout(pollCtl.actTimer);    pollCtl.actTimer = null;
     } else {
-      schedulePollLatest(500);
-      if (notifState._systemAllowed) schedulePollActivities(800);
+      schedulePollLatest(POLL_RESUME_DELAY_MS);
+      if (notifState._systemAllowed) schedulePollActivities(POLL_RESUME_DELAY_MS);
     }
   };
   document.addEventListener('visibilitychange', onVis);
@@ -1458,7 +1462,7 @@ function schedulePollLatest(delay = POLL_INTERVAL_MS) {
     catch (e) {  }
     finally {
       pollCtl.latestRunning = false;
-      schedulePollLatest(isAuthReady() ? POLL_INTERVAL_MS : 1000);
+      schedulePollLatest(isAuthReady() ? POLL_INTERVAL_MS : AUTH_RETRY_INTERVAL_MS);
     }
   }, Math.max(300, delay));
 }
@@ -1473,7 +1477,7 @@ function schedulePollActivities(delay = POLL_INTERVAL_MS) {
     catch (e) {}
     finally {
       pollCtl.actRunning = false;
-      schedulePollActivities(POLL_INTERVAL_MS);
+      schedulePollActivities(isAuthReady() ? POLL_INTERVAL_MS : AUTH_RETRY_INTERVAL_MS);
     }
   }, Math.max(500, delay));
 }
@@ -1511,8 +1515,8 @@ function clampToNow(ts) {
   return Math.min(Number(ts) || 0, now);
 }
 
-const ADMIN_CAP_TTL_MS = 5 * 60 * 1000;
-const ADMIN_NEG_TTL_MS = 15 * 1000;
+const ADMIN_CAP_TTL_MS = 10 * 60 * 1000;
+const ADMIN_NEG_TTL_MS = 2 * 60 * 1000;
 
 async function canReadActivityLog() {
   if (!isAuthReady()) return false;

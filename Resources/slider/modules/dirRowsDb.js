@@ -1,11 +1,25 @@
 const DB_NAME = 'jms_dirrows_db';
 const DB_VER  = 1;
 
+function normalizeUserData(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const playedPct = Number(raw.PlayedPercentage);
+  const posTicks = Number(raw.PlaybackPositionTicks);
+  const out = {
+    Played: raw.Played === true,
+    PlayedPercentage: Number.isFinite(playedPct) ? playedPct : null,
+    PlaybackPositionTicks: Number.isFinite(posTicks) ? posTicks : null,
+    LastPlayedDate: raw.LastPlayedDate || raw.LastPlayedDateUtc || null,
+  };
+  return out;
+}
+
 function normalizeCachedItem(rec) {
   if (!rec) return null;
 
   const Id   = rec.Id   || rec.itemId || null;
   if (!Id) return null;
+  const userData = normalizeUserData(rec.UserData || rec.UserDataDto || rec.userData || rec.userDataDto || null);
 
   return {
     Id,
@@ -24,6 +38,8 @@ function normalizeCachedItem(rec) {
     RemoteTrailers: rec.RemoteTrailers || rec.remoteTrailers || [],
     DateCreatedTicks: rec.DateCreatedTicks ?? rec.dateCreatedTicks ?? 0,
     People: rec.People || rec.people || [],
+    UserData: userData,
+    UserDataDto: userData,
   };
 }
 
@@ -83,16 +99,34 @@ export function makeScope({ serverId, userId }) {
 
 export async function upsertDirector(db, scope, director) {
   if (!director?.Id) return;
+  const key = `${scope}|${director.Id}`;
+  let prev = null;
+
+  try {
+    const readTx = db.transaction(['directors'], 'readonly');
+    prev = await promisify(readTx.objectStore('directors').get(key));
+    await txDone(readTx);
+  } catch {}
+
+  const countHint = Number(director.Count);
+  const countActual = Number(director.countActual);
+  const qualifiedMinItems = Number(director.qualifiedMinItems);
+
   const tx = db.transaction(['directors'], 'readwrite');
   const store = tx.objectStore('directors');
   const rec = {
-    key: `${scope}|${director.Id}`,
+    ...(prev && typeof prev === 'object' ? prev : {}),
+    key,
     scope,
     directorId: director.Id,
-    name: director.Name || '',
-    name_lc: String(director.Name || '').toLowerCase(),
-    countHint: Number(director.Count) || 0,
-    eligible: director.eligible !== false,
+    name: director.Name || prev?.name || '',
+    name_lc: String(director.Name || prev?.name || '').toLowerCase(),
+    countHint: Number.isFinite(countHint) ? Math.max(0, countHint | 0) : (Number(prev?.countHint) || 0),
+    eligible: director.eligible === undefined ? (prev?.eligible !== false) : (director.eligible !== false),
+    countActual: Number.isFinite(countActual) ? Math.max(0, countActual | 0) : (Number.isFinite(Number(prev?.countActual)) ? Number(prev.countActual) : null),
+    qualifiedMinItems: Number.isFinite(qualifiedMinItems)
+      ? Math.max(0, qualifiedMinItems | 0)
+      : (Number.isFinite(Number(prev?.qualifiedMinItems)) ? Number(prev.qualifiedMinItems) : null),
     updatedAt: Date.now(),
   };
 
@@ -145,6 +179,7 @@ export async function upsertItem(db, scope, item) {
   if (!item?.Id) return;
   const tx = db.transaction(['items'], 'readwrite');
   const store = tx.objectStore('items');
+  const userData = normalizeUserData(item.UserData || item.UserDataDto || null);
 
   const rec = {
     key: `${scope}|${item.Id}`,
@@ -164,6 +199,8 @@ export async function upsertItem(db, scope, item) {
     CumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
     RemoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
     DateCreatedTicks: item.DateCreatedTicks || 0,
+    UserData: userData,
+    UserDataDto: userData,
 
     itemId: item.Id,
     type: item.Type || '',
@@ -180,6 +217,8 @@ export async function upsertItem(db, scope, item) {
     cumulativeRunTimeTicks: item.CumulativeRunTimeTicks || null,
     remoteTrailers: item.RemoteTrailers || item.RemoteTrailerItems || item.RemoteTrailerUrls || [],
     dateCreatedTicks: item.DateCreatedTicks || 0,
+    userData,
+    userDataDto: userData,
     updatedAt: Date.now(),
   };
 

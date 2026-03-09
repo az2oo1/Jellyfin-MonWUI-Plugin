@@ -69,11 +69,7 @@ function handleAutoAdvance() {
   if (ev.defaultPrevented) {
     return;
   }
-  try {
-    changeSlide(1);
-  } finally {
-    startSlideTimer();
-  }
+  changeSlide(1);
 }
 
 export function stopSlideTimer() {

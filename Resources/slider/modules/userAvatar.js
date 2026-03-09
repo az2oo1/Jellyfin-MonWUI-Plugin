@@ -507,7 +507,13 @@ function getRandomColor(userId) {
 }
 
 export function initAvatarSystem() {
-  const style = document.createElement('style');
+  const STYLE_ID = 'jms-avatar-inline-style';
+  let style = document.getElementById(STYLE_ID);
+  if (!style) {
+    style = document.createElement('style');
+    style.id = STYLE_ID;
+    document.head.appendChild(style);
+  }
   style.textContent = `
     .custom-user-avatar {
       opacity: 0;
@@ -522,7 +528,6 @@ export function initAvatarSystem() {
       opacity: 1;
     }
   `;
-  document.head.appendChild(style);
 
   const config = getConfig();
 

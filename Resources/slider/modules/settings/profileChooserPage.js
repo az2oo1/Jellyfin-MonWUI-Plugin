@@ -35,6 +35,23 @@ export function createProfileChooserPanel(config, labels) {
   autoLabel.prepend(autoCb);
   autoRow.appendChild(autoLabel);
 
+  const autoRuleWrap = document.createElement("div");
+  autoRuleWrap.className = "profile-chooser-auto-sub";
+
+  const autoRuleRow = document.createElement("div");
+  autoRuleRow.className = "fsetting-item profile-chooser-container";
+  const autoRuleLabel = document.createElement("label");
+
+  const autoRuleCb = createCheckbox(
+    "profileChooserAutoOpenRequireQuickLogin",
+    labels?.profileChooserAutoOpenRequireQuickLogin || "En az 1 hızlı giriş varsa otomatik göster",
+    config.profileChooserAutoOpenRequireQuickLogin
+  );
+
+  autoRuleLabel.prepend(autoRuleCb);
+  autoRuleRow.appendChild(autoRuleLabel);
+  autoRuleWrap.appendChild(autoRuleRow);
+
   const rememberRow = document.createElement("div");
   rememberRow.className = "fsetting-item profile-chooser-container";
   const rememberLabel = document.createElement("label");
@@ -52,9 +69,9 @@ export function createProfileChooserPanel(config, labels) {
   desc.className = "description-text";
   desc.textContent =
     labels?.profileChooserDesc ||
-    "Bu ayar, Jellyfin arayüzünde Netflix benzeri kullanıcı seçme ekranını açar. Otomatik açma ve token hatırlama opsiyonları burada yönetilir.";
+    "Bu ayar, Jellyfin arayüzünde Netflix benzeri kullanıcı seçme ekranını açar. Otomatik gösterim, hızlı giriş kuralı ve token hatırlama seçenekleri burada yönetilir.";
 
-  subWrap.append(autoRow, rememberRow, desc);
+  subWrap.append(autoRow, autoRuleWrap, rememberRow, desc);
 
   section.append(enableRow, subWrap);
   panel.appendChild(section);
@@ -63,8 +80,27 @@ export function createProfileChooserPanel(config, labels) {
     "#enableProfileChooser",
     ".profile-chooser-sub",
     0.6,
-    [autoCb, rememberCb]
+    [autoCb, autoRuleCb, rememberCb]
   );
+
+  bindCheckboxKontrol(
+    "#profileChooserAutoOpen",
+    ".profile-chooser-auto-sub",
+    0.6,
+    [autoRuleCb]
+  );
+
+  const enableInput = enableCb.querySelector("input");
+  const autoInput = autoCb.querySelector("input");
+
+  const syncAutoRuleVisibility = () => {
+    const visible = !!(enableInput?.checked && autoInput?.checked);
+    autoRuleWrap.style.display = visible ? "" : "none";
+  };
+
+  enableInput?.addEventListener("change", syncAutoRuleVisibility);
+  autoInput?.addEventListener("change", syncAutoRuleVisibility);
+  syncAutoRuleVisibility();
 
   return panel;
 }

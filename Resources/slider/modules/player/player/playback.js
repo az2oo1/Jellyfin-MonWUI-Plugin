@@ -279,10 +279,21 @@ export function playNext() {
     return refreshPlaylist();
   }
 
+  const playableLength = effectivePlaylist.length || playlist.length;
+  if (playableLength === 0) {
+    updatePlaybackUI(false);
+    showNotification(
+      config.languageLabels.playlistEnded || "Oynatma listesi bitti, yenileniyor...",
+      2000,
+      'info'
+    );
+    return refreshPlaylist();
+  }
+
   if (userSettings.removeOnPlay && currentIndex >= 0 && currentIndex < playlist.length) {
-    const currentTrackId = musicPlayerState.currentTrackId;
-    playlist.splice(currentIndex, 1);
-    const effIdx = effectivePlaylist.findIndex(t => t.Id === currentTrackId);
+    const removed = playlist.splice(currentIndex, 1);
+    const removedTrackId = removed[0]?.Id;
+    const effIdx = effectivePlaylist.findIndex(t => t.Id === removedTrackId);
     if (effIdx > -1) effectivePlaylist.splice(effIdx, 1);
     updatePlaylistModal();
 
@@ -309,17 +320,22 @@ export function playNext() {
   if (userSettings.shuffle) {
     let rnd;
     do {
-      rnd = Math.floor(Math.random() * effectivePlaylist.length);
-    } while (rnd === currentIndex && effectivePlaylist.length > 1);
+      rnd = Math.floor(Math.random() * playableLength);
+    } while (rnd === currentIndex && playableLength > 1);
     nextIndex = rnd;
   } else {
     if (userSettings.repeatMode === 'all') {
-      nextIndex = (currentIndex + 1) % effectivePlaylist.length;
+      nextIndex = (currentIndex + 1) % playableLength;
     } else {
       nextIndex = currentIndex + 1;
-      if (nextIndex >= effectivePlaylist.length) {
+      if (nextIndex >= playableLength) {
         updatePlaybackUI(false);
-        return;
+        showNotification(
+          config.languageLabels.playlistEnded || "Oynatma listesi bitti, yenileniyor...",
+          2000,
+          'info'
+        );
+        return refreshPlaylist();
       }
     }
   }

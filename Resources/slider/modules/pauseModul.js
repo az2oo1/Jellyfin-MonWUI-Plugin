@@ -2,6 +2,7 @@ import { getSessionInfo, fetchItemDetails, makeApiRequest, isAuthReadyStrict } f
 import { getConfig } from "./config.js";
 import { getLanguageLabels, getDefaultLanguage } from "../language/index.js";
 import { withServer } from "./jfUrl.js";
+import { GENERATED_BUCKET_APPENDS, GENERATED_NEW_BUCKETS } from "./generatedTagBuckets.js";
 
 function _numFinite(v, fallback) {
   const n = Number(v);
@@ -147,33 +148,60 @@ let _mouseIdleTimer = null;
 let _iconEl = null;
 let _iconTimeout = null;
 let _playEventAt = 0;
-let _sessLast = { itemId: null, isPaused: null, t: 0 };
 let _sessRawLast = null;
 let _sessChangeAt = 0;
-let _sessHealthyAt = 0;
+const SESSION_FETCH_TTL_MS = 500;
+const SESSION_FETCH_EMPTY_TTL_MS = 150;
+let _sessSnapshotCache = {
+  at: 0,
+  value: { itemId: null, isPaused: null },
+  promise: null,
+};
 
-async function fetchNowPlayingFromSessions(){
-  try {
-    const uid = getUserIdSafe();
-    if (!uid) return { itemId:null,isPaused:null };
+function _cacheSessionSnapshot(value) {
+  _sessSnapshotCache.at = Date.now();
+  _sessSnapshotCache.value = value;
+  return value;
+}
 
-    const sessions = await makeApiRequest(withServer(`/Sessions`));
-    const list = Array.isArray(sessions)?sessions:[];
-
-    const mine = list.filter(s=>s?.UserId===uid);
-    const active = mine.find(s=>s?.NowPlayingItem?.Id) || mine[0];
-    if (!active) return { itemId:null,isPaused:null };
-
-    const r = {
-      itemId: active.NowPlayingItem?.Id || null,
-      isPaused: active.PlayState?.IsPaused ?? null
-    };
-
-    if (r.itemId) _sessHealthyAt = Date.now();
-    return r;
-  } catch {
-    return { itemId:null,isPaused:null };
+async function fetchNowPlayingFromSessions({ force = false } = {}){
+  if (!force && _sessSnapshotCache.promise) {
+    return _sessSnapshotCache.promise;
   }
+  const cacheTtl = _sessSnapshotCache.value?.itemId
+    ? SESSION_FETCH_TTL_MS
+    : SESSION_FETCH_EMPTY_TTL_MS;
+  if (!force && (Date.now() - _sessSnapshotCache.at) < cacheTtl) {
+    return _sessSnapshotCache.value;
+  }
+
+  const request = (async () => {
+    try {
+      const uid = getUserIdSafe();
+      if (!uid) return _cacheSessionSnapshot({ itemId:null,isPaused:null });
+
+      const sessions = await makeApiRequest(withServer(`/Sessions?ActiveWithinSeconds=30`));
+      const list = Array.isArray(sessions)?sessions:[];
+
+      const mine = list.filter(s=>s?.UserId===uid);
+      const active = mine.find(s=>s?.NowPlayingItem?.Id) || mine[0];
+      if (!active) return _cacheSessionSnapshot({ itemId:null,isPaused:null });
+
+      const r = {
+        itemId: active.NowPlayingItem?.Id || null,
+        isPaused: active.PlayState?.IsPaused ?? null
+      };
+
+      return _cacheSessionSnapshot(r);
+    } catch {
+      return _cacheSessionSnapshot({ itemId:null,isPaused:null });
+    } finally {
+      _sessSnapshotCache.promise = null;
+    }
+  })();
+
+  _sessSnapshotCache.promise = request;
+  return request;
 }
 
 function getItemIdFromDom() {
@@ -412,6 +440,7 @@ async function fetchFiltersFor(type) {
 function _computeStamp() {
   return [withServer(''), getUserIdSafe() || ''].join('|');
 }
+
 async function loadCatalogTagsWithCache() {
   const stamp = _computeStamp();
   const now = Date.now();
@@ -555,7 +584,7 @@ function countMatches(text, words) {
   return c;
 }
 
-const BUCKETS = [
+const BASE_BUCKETS = [
   {
     key: "superhero",
     needles: [
@@ -1275,6 +1304,36 @@ const BUCKETS = [
   },
 ];
 
+const BUCKETS = (() => {
+  const mergeNeedles = (base, extra) => {
+    const set = new Set();
+    for (const n of base || []) {
+      const v = String(n || "").trim().toLowerCase();
+      if (v) set.add(v);
+    }
+    for (const n of extra || []) {
+      const v = String(n || "").trim().toLowerCase();
+      if (v) set.add(v);
+    }
+    return [...set];
+  };
+
+  const merged = BASE_BUCKETS.map((b) => ({
+    ...b,
+    needles: mergeNeedles(b.needles, GENERATED_BUCKET_APPENDS?.[b.key] || []),
+  }));
+
+  for (const extra of GENERATED_NEW_BUCKETS || []) {
+    const key = String(extra?.key || "").trim();
+    if (!key) continue;
+    merged.push({
+      key,
+      needles: mergeNeedles([], extra?.needles || []),
+    });
+  }
+  return merged;
+})();
+
 const _NEEDLE_INDEX = (() => {
   const idx = new Map();
   const add = (k, bucket) => {
@@ -1296,6 +1355,30 @@ const _NEEDLE_INDEX = (() => {
    return idx;
  })();
 
+const _BUCKET_META = BUCKETS.map((b) => {
+  const fullNeedles = new Set();
+  const tokenNeedles = new Set();
+  const singleNeedles = new Set();
+  const phraseNeedles = [];
+  for (const raw of b.needles || []) {
+    const norm = String(raw || "").toLowerCase().trim();
+    if (!norm) continue;
+    fullNeedles.add(norm);
+    const toks = norm.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    for (const tk of toks) tokenNeedles.add(tk);
+    if (toks.length === 1) singleNeedles.add(toks[0]);
+    if (toks.length > 1 && norm.length >= 5) phraseNeedles.push(norm);
+  }
+  return {
+    key: b.key,
+    fullNeedles,
+    tokenNeedles,
+    singleNeedles,
+    phraseNeedles,
+  };
+});
+const _BUCKET_META_BY_KEY = new Map(_BUCKET_META.map((m) => [m.key, m]));
+
 function _tokenizeTag(s) {
   return String(s || "")
     .toLowerCase()
@@ -1303,19 +1386,90 @@ function _tokenizeTag(s) {
     .filter(Boolean);
 }
 
-function _bucketsForTag(tag) {
+function _bucketScoresForTag(tag) {
   const norm = _normTag(tag);
+  if (!norm) return new Map();
   const tokens = _tokenizeTag(norm);
-  const hits = new Set();
-  const direct = _NEEDLE_INDEX.get(norm);
-  if (direct) for (const k of direct) hits.add(k);
+  if (!tokens.length) return new Map();
 
-   for (const tk of tokens) {
-     const set = _NEEDLE_INDEX.get(tk);
-     if (set) for (const k of set) hits.add(k);
-   }
-   return hits;
- }
+  const scored = new Map();
+  const candidates = new Set();
+  const addScore = (k, v) => {
+    if (!k || !Number.isFinite(v) || v <= 0) return;
+    scored.set(k, (scored.get(k) || 0) + v);
+    candidates.add(k);
+  };
+
+  const direct = _NEEDLE_INDEX.get(norm);
+  if (direct) for (const k of direct) addScore(k, 2.8);
+
+  for (const tk of tokens) {
+    const set = _NEEDLE_INDEX.get(tk);
+    if (!set) continue;
+    for (const k of set) {
+      candidates.add(k);
+      const meta = _BUCKET_META_BY_KEY.get(k);
+      if (meta?.singleNeedles?.has(tk)) addScore(k, 0.95);
+    }
+  }
+
+  for (const key of candidates) {
+    const meta = _BUCKET_META_BY_KEY.get(key);
+    if (!meta) continue;
+    let s = scored.get(meta.key) || 0;
+
+    let singleHits = 0;
+    let phraseHits = 0;
+    for (const tk of tokens) {
+      if (meta.singleNeedles.has(tk)) {
+        singleHits++;
+      } else if (meta.tokenNeedles.has(tk)) {
+        phraseHits++;
+      }
+    }
+    if (singleHits > 0) {
+      const density = singleHits / Math.max(1, tokens.length);
+      s += singleHits * 0.55 + density * 0.9;
+    } else if (phraseHits >= 2) {
+      const density = phraseHits / Math.max(1, tokens.length);
+      s += phraseHits * 0.55 + density * 0.75;
+    }
+
+    if (!meta.fullNeedles.has(norm) && norm.length >= 6) {
+      for (const phrase of meta.phraseNeedles) {
+        if (norm.includes(phrase) || phrase.includes(norm)) {
+          s += 1.2;
+          break;
+        }
+      }
+    }
+
+    const neg = NEGATIVE_WORDS[meta.key] || [];
+    if (neg.length) s -= 0.8 * countMatches(norm, neg);
+
+    if (s > 0) scored.set(meta.key, s);
+  }
+
+  const threshold = tokens.length <= 1 ? 2.45 : 1.6;
+  const filtered = [...scored.entries()]
+    .filter(([, s]) => s >= threshold)
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return _bucketPriorityRank(a[0]) - _bucketPriorityRank(b[0]);
+    });
+
+  if (!filtered.length) return new Map();
+  const top = filtered[0][1];
+  const out = new Map();
+  for (const [k, s] of filtered) {
+    if (s >= Math.max(threshold, top * 0.62)) out.set(k, s);
+  }
+  return out;
+}
+
+function _bucketsForTag(tag) {
+  return new Set(_bucketScoresForTag(tag).keys());
+}
 
 const NEGATIVE_WORDS = {
   fairytale: ['war','battle','soldier','army','frontline','sniper','bomb','grenade','blood','gore','massacre'],
@@ -1335,13 +1489,18 @@ const BUCKET_PRIORITY = [
   'superhero','fairytale'
 ];
 
+function _bucketPriorityRank(code) {
+  const idx = BUCKET_PRIORITY.indexOf(code);
+  return idx === -1 ? 999 : idx;
+}
+
 function buildAutoDescriptorTagMap(catalogTags) {
    const map = {};
    for (const b of BUCKETS) map[b.key] = [];
    for (const t of catalogTags) {
-     const hitKeys = _bucketsForTag(t);
-     if (!hitKeys.size) continue;
-     for (const k of hitKeys) map[k].push(t);
+     const scored = _bucketScoresForTag(t);
+     if (!scored.size) continue;
+     for (const [k] of scored) map[k].push(t);
    }
    return map;
  }
@@ -1370,24 +1529,29 @@ function deriveTagDescriptors(item = {}) {
   if (!raw.length) return [];
   const tags = raw.map(_normTag);
   const map = getDescriptorTagMap();
+  const validCodes = new Set(Object.keys(map));
+  const scoreMap = new Map([...validCodes].map((k) => [k, 0]));
 
-  const scores = [];
-  for (const code of Object.keys(map)) {
-   let s = 0;
-   for (const tg of tags) {
-     const hit = _bucketsForTag(tg);
-     if (hit.has(code)) s += 1;
-     const neg = NEGATIVE_WORDS[code] || [];
-     for (const n of neg) {
-       if (_tokenizeTag(tg).includes(String(n).toLowerCase())) s -= 1.5;
-     }
-   }
-   if (s > 0) scores.push({ code, s });
- }
+  for (const tg of tags) {
+    const scored = _bucketScoresForTag(tg);
+    for (const [code, s] of scored) {
+      if (!validCodes.has(code)) continue;
+      scoreMap.set(code, (scoreMap.get(code) || 0) + s);
+    }
+    for (const code of validCodes) {
+      const neg = NEGATIVE_WORDS[code] || [];
+      if (!neg.length) continue;
+      scoreMap.set(code, (scoreMap.get(code) || 0) - (0.65 * countMatches(tg, neg)));
+    }
+  }
+
+  const scores = [...scoreMap.entries()]
+    .filter(([, s]) => s > 1.2)
+    .map(([code, s]) => ({ code, s }));
   if (!scores.length) return [];
   scores.sort((a, b) => {
     if (b.s !== a.s) return b.s - a.s;
-    return BUCKET_PRIORITY.indexOf(a.code) - BUCKET_PRIORITY.indexOf(b.code);
+    return _bucketPriorityRank(a.code) - _bucketPriorityRank(b.code);
   });
   return scores.slice(0, 2).map((x) => descriptorLabel(x.code));
 }
@@ -1429,36 +1593,14 @@ function deriveKeywordDescriptors(item = {}) {
   if (!scores.length) return [];
   scores.sort((a, b) => {
     if (b.s !== a.s) return b.s - a.s;
-    return BUCKET_PRIORITY.indexOf(a.code) - BUCKET_PRIORITY.indexOf(b.code);
+    return _bucketPriorityRank(a.code) - _bucketPriorityRank(b.code);
   });
   return scores.slice(0, 2).map((x) => descriptorLabel(x.code));
 }
 
 export function setupPauseScreen() {
   console.log("[PO] setupPauseScreen called", { active: window.__jmsPauseOverlay?.active });
-  let _sessPollTimer=null;
   let _badgeCtx = "first";
-
-function startSessionPoll(){
-  if (_sessPollTimer) return;
-  _sessPollTimer = setInterval(async ()=>{
-    const r = await fetchNowPlayingFromSessions();
-    const cur = { itemId:r.itemId, isPaused:r.isPaused };
-
-    if (DEBUG_PO) {
-      if (_sessLast.itemId !== cur.itemId){
-        if (!_sessLast.itemId && cur.itemId) dlog("🎬 START",cur.itemId);
-        else if (_sessLast.itemId && !cur.itemId) dlog("⛔ STOP",_sessLast.itemId);
-        else if (_sessLast.itemId && cur.itemId) dlog("🔁 SWITCH",_sessLast.itemId,"→",cur.itemId);
-      } else if (_sessLast.isPaused !== cur.isPaused && cur.itemId){
-        dlog(cur.isPaused?"⏸ PAUSE":"▶ RESUME",cur.itemId);
-      }
-    }
-    _sessLast = cur;
-  },1200);
-}
-
-  startSessionPoll();
 
   const config = getConfig();
   const overlayConfig = config.pauseOverlay || { enabled: true };
@@ -2026,6 +2168,7 @@ function kickBindRetries(schedule = [50,150,350,800,1500,2500,4000,6000,8000,120
   }
 
   const content = overlayEl.querySelector(".pause-overlay-content");
+  const progressWrap = progressWrapEl;
   if (content) {
     content.style.willChange = "transform, opacity";
     content.style.transform = "translateY(10px)";
@@ -2044,6 +2187,18 @@ function kickBindRetries(schedule = [50,150,350,800,1500,2500,4000,6000,8000,120
       },
       { once: true, signal }
     );
+  }
+
+  if (progressWrap) {
+    progressWrap.style.willChange = "transform, opacity";
+    progressWrap.style.transform = "translateY(10px)";
+    progressWrap.style.opacity = "0";
+    setTimeout(() => {
+      progressWrap.style.transition =
+        "transform 0.4s cubic-bezier(0.2, 0.8, 0.4, 1), opacity 0.4s ease";
+      progressWrap.style.transform = "translateY(0)";
+      progressWrap.style.opacity = "1";
+    }, 10);
   }
 if (_mouseIdleTimer) { clearTimeout(_mouseIdleTimer); _mouseIdleTimer = null; }
   const enableMouseClose = (getConfig()?.pauseOverlay?.closeOnMouseMove !== false);
@@ -2066,9 +2221,11 @@ if (_mouseIdleTimer) { clearTimeout(_mouseIdleTimer); _mouseIdleTimer = null; }
 function hideOverlay(opts = {}) {
   const fromSwipe = !!opts.fromSwipe || !!overlayEl.__jmsSwipeClosing;
   const preserve = fromSwipe || !!opts.preserve;
+  const HIDE_MS = 300;
   stopProgressLoop();
 
   const content = overlayEl.querySelector(".pause-overlay-content");
+  const progressWrap = progressWrapEl;
   if (content) {
     content.style.willChange = "transform, opacity";
     if (!fromSwipe) {
@@ -2079,12 +2236,22 @@ function hideOverlay(opts = {}) {
     }
   }
 
+  if (progressWrap) {
+    progressWrap.style.willChange = "transform, opacity";
+    if (!fromSwipe) {
+      progressWrap.style.transition =
+        "transform 0.3s cubic-bezier(0.4, 0, 0.6, 1), opacity 0.3s ease";
+      progressWrap.style.transform = "translateY(10px)";
+      progressWrap.style.opacity = "0";
+    }
+  }
+
   if (pausedLabel) {
     pausedLabel.style.opacity = "0";
     LC.addTimeout(() => {
       overlayEl?.classList.remove("visible");
       pausedLabel.style.display = "none";
-    }, 300);
+    }, HIDE_MS);
   }
 
   LC.addTimeout(() => {
@@ -2098,17 +2265,26 @@ function hideOverlay(opts = {}) {
       };
       if (fromSwipe) requestAnimationFrame(doReset); else doReset();
     }
+    if (progressWrap) {
+      const doResetProgress = () => {
+        progressWrap.style.transition = "";
+        progressWrap.style.transform = "";
+        progressWrap.style.opacity = "";
+        progressWrap.style.willChange = "";
+      };
+      if (fromSwipe) requestAnimationFrame(doResetProgress); else doResetProgress();
+    }
     if (!preserve) {
       wipeOverlayState();
     }
     overlayEl.__jmsSwipeClosing = false;
-  }, 300);
+  }, HIDE_MS);
 
   if (pauseTimeout && !preserve) {
     clearTimeout(pauseTimeout);
     pauseTimeout = null;
   }
-  LC.addTimeout(() => { _maybeShowBadge(); }, 320);
+  LC.addTimeout(() => { _maybeShowBadge(); }, HIDE_MS + 20);
 }
 
   function _clearRecos() {
@@ -2384,6 +2560,7 @@ function hideOverlay(opts = {}) {
     }
     if (video.closest(".video-preview-modal")) return;
     activeVideo = video;
+    try { window.__jmsActiveVideo = video; } catch {}
     relaxScanDepth();
 
     let cleanupSmart = null;
@@ -2770,6 +2947,9 @@ function hideOverlay(opts = {}) {
       }
       try { unobserveVideo(v); } catch {}
       activeVideo = null;
+      try {
+        if (window.__jmsActiveVideo === v) window.__jmsActiveVideo = null;
+      } catch {}
       clearOverlayUi();
     });
   }
@@ -3364,9 +3544,9 @@ const _onKey = (e) => {
     try { wipeIconBadges(); } catch {}
     try { overlayEl?.classList.remove("visible"); } catch {}
     activeVideo = null;
+    try { window.__jmsActiveVideo = null; } catch {}
     currentMediaId = null;
     if (pauseTimeout) clearTimeout(pauseTimeout);
-    if (_sessPollTimer) clearInterval(_sessPollTimer);
     pauseTimeout = null;
     try {
       stopLoop?.();
@@ -3486,11 +3666,11 @@ function _descCodesFromItem(item){
 const BUCKET_ICON_MAP = {
   sex: "cinsellik",
   nudity: "cinsellik",
-  romance_love: "cinsellik",
+  romance_love: "genel",
   violence: "siddet",
   war: "siddet",
   crime: "siddet",
-  action_adventure: "siddet",
+  action_adventure: "genel",
   superhero: "siddet",
   sports: "siddet",
   mature: "yetiskin",
@@ -3516,62 +3696,192 @@ const BUCKET_ICON_MAP = {
   sci_fi_tech: "genel"
 };
 
-function _bucketKeysFromItem(item){
-  const keys = new Set();
-  for (const t of (item?.Tags || item?.Keywords || [])) {
-    for (const k of _bucketsForTag(t)) keys.add(k);
+const BUCKET_ICON_WEIGHT = {
+  sex: 0.95,
+  nudity: 1.1,
+  romance_love: 0.2,
+  violence: 0.95,
+  war: 0.85,
+  crime: 0.72,
+  action_adventure: 0.45,
+  superhero: 0.3,
+  sports: 0.18,
+  mature: 1.12,
+  horror: 1.0,
+  drugs: 0.95,
+  profanity: 0.55,
+  discrimination: 0.72,
+  political: 0.38,
+  religion_myth: 0.2,
+  thriller_suspense: 0.5,
+  mystery_detective: 0.25,
+  documentary_biopic: 0.2,
+  music_dance: 0.2,
+  animation_kids: 0.26,
+  animals_nature: 0.24,
+  historical: 0.2,
+  fantasy_magic: 0.2,
+  supernatural: 0.2,
+  fairytale: 0.22,
+  travel_road: 0.16,
+  period_era: 0.18,
+  western: 0.18,
+  sci_fi_tech: 0.22,
+};
+
+const ICON_THRESHOLD = {
+  cinsellik: 2.0,
+  siddet: 2.2,
+  yetiskin: 3.1,
+};
+
+function _bucketScoresFromItem(item) {
+  const scores = new Map();
+  const add = (k, v) => {
+    if (!k || !Number.isFinite(v) || v <= 0) return;
+    scores.set(k, (scores.get(k) || 0) + v);
+  };
+
+  const tags = Array.from(new Set([
+    ...(item?.Tags || []),
+    ...(item?.Keywords || []),
+  ].map((t) => String(t || "").trim()).filter(Boolean)));
+
+  for (const t of tags) {
+    const taggedScores = _bucketScoresForTag(t);
+    for (const [k, s] of taggedScores) add(k, s);
   }
-  const K = (s)=>String(s||"").toLowerCase();
-  const hay = K([item?.Overview, (item?.Taglines||[]).join(" "), (item?.Studios||[]).join(" ")].join(" "));
-  if (/horror|slasher|gore|supernatural|paranormal/.test(hay)) keys.add("horror");
-  if (/\bwar|battle|army|military\b/.test(hay)) keys.add("war");
-  if (/\bcrime|mafia|gang|heist|robbery\b/.test(hay)) keys.add("crime");
-  if (/\bviolence|violent|fight|combat|torture\b/.test(hay)) keys.add("violence");
-  if (/\bsex|sexual|erotic|intimate|nudity|nude\b/.test(hay)) { keys.add("sex"); keys.add("nudity"); }
-  if (/\bdrug|narcotic|cocaine|heroin|meth\b/.test(hay)) keys.add("drugs");
-  if (/\bprofanity|explicit language|vulgar|swear\b/.test(hay)) keys.add("profanity");
-  if (/\bthriller|suspense|stalker|espionage|kidnapping\b/.test(hay)) keys.add("thriller_suspense");
-  if (/\bmystery|detective|whodunit|noir\b/.test(hay)) keys.add("mystery_detective");
-  if (/\bromance|romantic|love\b/.test(hay)) keys.add("romance_love");
-  if (/\baddiction|trauma|suicide|abuse|domestic violence\b/.test(hay)) keys.add("mature");
+
+  const asText = (v) => String(v || "").toLowerCase();
+  const hay = asText([
+    item?.Overview,
+    (item?.Taglines || []).join(" "),
+    (item?.Studios || []).map((s) => s?.Name || s).join(" "),
+  ].join(" "));
+
+  const textBoosts = [
+    ["horror", /horror|slasher|gore|supernatural|paranormal/g, 1.25],
+    ["war", /\bwar|battle|army|military\b/g, 0.95],
+    ["crime", /\bcrime|mafia|gang|heist|robbery\b/g, 0.9],
+    ["violence", /\bviolence|violent|fight|combat|torture\b/g, 1.0],
+    ["sex", /\bsex|sexual|erotic|intimate\b/g, 1.0],
+    ["nudity", /\bnudity|nude|topless\b/g, 1.15],
+    ["drugs", /\bdrug|narcotic|cocaine|heroin|meth\b/g, 0.95],
+    ["profanity", /\bprofanity|explicit language|vulgar|swear\b/g, 0.9],
+    ["thriller_suspense", /\bthriller|suspense|stalker|espionage|kidnapping\b/g, 0.7],
+    ["mystery_detective", /\bmystery|detective|whodunit|noir\b/g, 0.65],
+    ["romance_love", /\bromance|romantic|love\b/g, 0.6],
+    ["mature", /\baddiction|trauma|suicide|abuse|domestic violence\b/g, 1.2],
+  ];
+  for (const [bucket, rx, w] of textBoosts) {
+    const count = (hay.match(rx) || []).length;
+    if (count > 0) add(bucket, count * w);
+  }
+
+  return scores;
+}
+
+function _bucketKeysFromItem(item) {
+  const keys = new Set();
+  for (const [k, s] of _bucketScoresFromItem(item)) {
+    if (s >= 1.4) keys.add(k);
+  }
   return keys;
 }
 
-function buildIconListForItem(item){
-  const ALLOWED = new Set(["genel","cinsellik","siddet","yetiskin"]);
-  const list = [];
-  const bucketKeys = _bucketKeysFromItem(item);
-  for (const k of bucketKeys) {
-    const icon = BUCKET_ICON_MAP[k];
-    if (icon) list.push(icon);
+function buildIconListForItem(item) {
+  const ALLOWED = new Set(["genel", "cinsellik", "siddet", "yetiskin"]);
+  const iconScores = {
+    genel: 0,
+    cinsellik: 0,
+    siddet: 0,
+    yetiskin: 0,
+  };
+
+  const bucketScores = _bucketScoresFromItem(item);
+  for (const [bucketKey, score] of bucketScores) {
+    const icon = BUCKET_ICON_MAP[bucketKey];
+    if (!icon) continue;
+    iconScores[icon] += score * (BUCKET_ICON_WEIGHT[bucketKey] ?? 0.35);
   }
 
   const codes = _descCodesFromItem(item);
-  for (const c of codes) list.push(c);
+  for (const c of codes) {
+    if (ALLOWED.has(c) && c !== "genel") iconScores[c] += 1.15;
+  }
+
+  const dict = getDescriptorKeywordMap();
+  const joined = [
+    item?.Overview || "",
+    (item?.Taglines || []).join(" "),
+    (item?.Tags || item?.Keywords || []).join(" "),
+  ].join(" ");
+  iconScores.cinsellik += 0.8 * (
+    countMatches(joined, dict?.sex || []) +
+    countMatches(joined, dict?.nudity || [])
+  );
+  iconScores.siddet += 0.72 * (
+    countMatches(joined, dict?.violence || []) +
+    countMatches(joined, dict?.war || []) +
+    countMatches(joined, dict?.crime || [])
+  );
+  iconScores.yetiskin += 0.85 * (
+    countMatches(joined, dict?.mature || []) +
+    countMatches(joined, dict?.drugs || []) +
+    countMatches(joined, dict?.profanity || []) +
+    countMatches(joined, dict?.discrimination || [])
+  );
+
   const raw = item?.OfficialRating || "";
   const norm = String(normalizeAgeRating(raw) || "").toLowerCase();
   const ageNum = parseInt(norm, 10);
+  if (Number.isFinite(ageNum)) {
+    if (ageNum >= 18) iconScores.yetiskin += 4.3;
+    else if (ageNum >= 16) iconScores.yetiskin += 2.4;
+    else if (ageNum >= 13) iconScores.siddet += 1.15;
+    else if (ageNum <= 7) iconScores.genel += 1.8;
+  }
+
   const isAdult =
     (Number.isFinite(ageNum) && ageNum >= 18) ||
     /(^|\b)(r|nc-?17|tvma|18\+)/i.test(raw);
+  if (isAdult) iconScores.yetiskin += 3.4;
 
-  if (isAdult) list.push("yetiskin");
-  if (!list.length) {
-    const genelLbl = String(labels?.genel || "genel").toLowerCase();
-    const isGeneral =
-      norm.includes("genel") ||
-      norm === "7+" ||
-      norm === "0+" ||
-      norm.includes(genelLbl) ||
-      /^g$|^tvg$/i.test(raw);
-    list.push(isAdult ? "yetiskin" : (isGeneral ? "genel" : "genel"));
-  }
-  let out = Array.from(new Set(list.filter(n => ALLOWED.has(n))));
-  if (out.includes("yetiskin")) {
-    out = out.filter(n => n !== "genel");
+  const genelLbl = String(labels?.genel || "genel").toLowerCase();
+  const isGeneral =
+    norm.includes("genel") ||
+    norm === "7+" ||
+    norm === "0+" ||
+    norm.includes(genelLbl) ||
+    /^g$|^tvg$/i.test(raw);
+  if (isGeneral) iconScores.genel += 1.35;
+
+  const hasHardRiskSignal =
+    (bucketScores.get("violence") || 0) >= 1.4 ||
+    (bucketScores.get("war") || 0) >= 1.2 ||
+    (bucketScores.get("crime") || 0) >= 1.35 ||
+    (bucketScores.get("mature") || 0) >= 1.15 ||
+    (bucketScores.get("drugs") || 0) >= 1.1 ||
+    (bucketScores.get("sex") || 0) >= 1.1 ||
+    (bucketScores.get("nudity") || 0) >= 1.0;
+
+  if (Number.isFinite(ageNum) && ageNum <= 7 && !hasHardRiskSignal) {
+    return ["genel"];
   }
 
-  return out;
+  const out = [];
+  if (iconScores.yetiskin >= ICON_THRESHOLD.yetiskin) out.push("yetiskin");
+  if (iconScores.siddet >= ICON_THRESHOLD.siddet) out.push("siddet");
+  if (iconScores.cinsellik >= ICON_THRESHOLD.cinsellik) out.push("cinsellik");
+
+  const shouldIncludeGenel =
+    (iconScores.genel >= 1.2 || isGeneral || (Number.isFinite(ageNum) && ageNum <= 7)) &&
+    iconScores.yetiskin < ICON_THRESHOLD.yetiskin;
+  if (shouldIncludeGenel) out.unshift("genel");
+
+  let uniq = Array.from(new Set(out)).filter((n) => ALLOWED.has(n));
+  if (!uniq.length) uniq = ["genel"];
+  return uniq;
 }
 
 function showIconBadges(itemOrIcons, durationMs) {
