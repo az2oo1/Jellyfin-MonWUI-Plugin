@@ -85,20 +85,22 @@ function ensureHost() {
     host.id = HOST_ID;
 
     Object.assign(host.style, {
-      display: "inline-flex",
-      alignItems: "center",
-      gap: "5px",
-      whiteSpace: "nowrap",
-      pointerEvents: "none",
-      userSelect: "none",
-      color: "#fff",
-      fontWeight: "600",
-      alignSelf: "center",
-      lineHeight: "1",
-      opacity: "0",
-      transform: "translate3d(-10px,0,0)",
-      transition: "opacity 0.25s ease-in-out, transform 0.25s ease-in-out",
-      willChange: "opacity, transform"
+      display: 'flex',
+      alignItems: 'center',
+      gap: '5px',
+      whiteSpace: 'nowrap',
+      pointerEvents: 'none',
+      userSelect: 'none',
+      color: 'rgb(255, 255, 255)',
+      fontWeight: '600',
+      alignSelf: 'center',
+      lineHeight: '1',
+      opacity: '1',
+      transform: 'translate3d(0px, 0px, 0px)',
+      transition: 'opacity 0.25s ease-in-out, transform 0.25s ease-in-out',
+      willChange: 'opacity, transform',
+      padding: '4px 6px',
+      margin: '0 0 0 .3em'
     });
   }
   syncHostPlacement(titleEl, host);
@@ -216,16 +218,16 @@ function applyModernStyles(host) {
     if (!(container instanceof HTMLElement)) return;
 
     Object.assign(container.style, {
-      display: "inline-flex",
+      display: "flex",
       alignItems: "center",
-      gap: "6px",
-      padding: "0.2em 0.58em",
+      gap: "3px",
       pointerEvents: "none",
       userSelect: "none",
       lineHeight: "1",
       color: "#fff",
       fontWeight: "650",
       fontSize: "0.9em",
+      justifyContent: 'center',
     });
   });
 
@@ -351,6 +353,9 @@ function addAnimationStyles() {
         opacity: 0;
         transform: scale(0.9);
       }
+    }
+  .headerLeft .pageTitle {
+        display: flex !important;
     }
   `;
   document.head.appendChild(style);
