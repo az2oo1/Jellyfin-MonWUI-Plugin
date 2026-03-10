@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/img/icon.png",
     "versions": [
       {
+        "version": "2.0.2.0",
+        "changelog": "fix: hoverTrailer CPU spike and global settings save",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://github.com/G-grbz/Jellyfin-MonWUI-Plugin/releases/download/v2.0.0/JMSFusion-2.0.2.0-server.zip",
+        "checksum": "0bf08421703f91df0ca09d74b5d9da15",
+        "timestamp": "2026-03-10T20:22:19.0445181Z"
+      },
+      {
         "version": "2.0.1.0",
         "changelog": "Fix missing imported function issue",
         "targetAbi": "10.10.0.0",
