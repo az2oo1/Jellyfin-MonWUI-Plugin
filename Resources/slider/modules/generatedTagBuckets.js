@@ -1,4 +1,3 @@
-/* Auto-generated from jellyfin-tags.txt. Do not edit manually. */
 export const GENERATED_BUCKET_APPENDS = {
   "superhero": [
     "aging superhero",

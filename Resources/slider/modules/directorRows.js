@@ -427,23 +427,21 @@ function withCacheBust(url) {
 }
 
 function scheduleImgRetry(img, phase, delayMs) {
-  if (!img) return false;
+  if (!img || !img.isConnected) return false;
   const st = (img.__retryState ||= { lq: { tries: 0 }, hi: { tries: 0 } });
   const slot = st[phase] || (st[phase] = { tries: 0 });
-
-  const maxTries = (phase === "hi") ? 8 : 6;
-  if (slot.tries >= maxTries) return false;
-
-  slot.tries++;
+  slot.tries = Math.min((slot.tries || 0) + 1, 64);
   clearTimeout(slot.tid);
 
   slot.tid = setTimeout(() => {
+    if (!img || !img.isConnected) return;
     const data = img.__data || {};
-    const fb = data.fallback || PLACEHOLDER_URL;
+    img.__fallbackRecoveryActive = false;
 
     try { img.removeAttribute("srcset"); } catch {}
 
-    if (phase === "hi" && data.hqSrc) {
+    if (phase === "hi") {
+      if (!data.hqSrc) return;
       img.__phase = "hi";
       img.__hiRequested = true;
       img.src = withCacheBust(data.hqSrc);
@@ -455,10 +453,11 @@ function scheduleImgRetry(img, phase, delayMs) {
       return;
     }
 
+    if (!data.lqSrc) return;
     img.__phase = "lq";
     img.__hiRequested = false;
-    img.src = withCacheBust(data.lqSrc || fb);
-  }, Math.max(250, delayMs|0));
+    img.src = withCacheBust(data.lqSrc);
+  }, Math.max(250, Math.min(30_000, delayMs|0)));
   return true;
 }
 
@@ -585,9 +584,8 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
       return;
     }
 
-    if (!img.currentSrc && !img.src) {
-      try { img.src = fb; } catch {}
-    }
+    img.__fallbackRecoveryActive = true;
+    try { img.src = fb; } catch {}
     const delay = 600 * Math.min(5, (img.__retryState?.lq?.tries || 0) + 1);
     const queued = scheduleImgRetry(img, "lq", delay);
     if (!queued) {
@@ -597,17 +595,23 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
 };
 
   const onLoad = () => {
-  if (img.__retryState) {
+  const fallbackRecoveryActive = !!img.__fallbackRecoveryActive;
+
+  if (img.__retryState && !fallbackRecoveryActive) {
     try { clearTimeout(img.__retryState.lq?.tid); } catch {}
     try { clearTimeout(img.__retryState.hi?.tid); } catch {}
     img.__retryState.lq && (img.__retryState.lq.tries = 0);
     img.__retryState.hi && (img.__retryState.hi.tries = 0);
   }
 
-  if (img.__phase === "hi" || img.__phase === "settled") {
+  if (img.__phase === "hi" || img.__phase === "settled" || fallbackRecoveryActive) {
     img.classList.add("__hydrated");
     img.classList.remove("is-lqip");
     img.__hydrated = true;
+  }
+
+  if (!fallbackRecoveryActive) {
+    delete img.__fallbackRecoveryActive;
   }
 };
 
@@ -633,6 +637,48 @@ function unobserveImage(img) {
   } catch {}
   delete img.__retryState;
   delete img.__fallbackState;
+  delete img.__fallbackRecoveryActive;
+}
+
+function retryRecoverableImages() {
+  document.querySelectorAll("img.cardImage, img.dir-row-hero-bg").forEach((img) => {
+    if (!img?.__data || !img.isConnected) return;
+
+    const hasRetries =
+      !!((img.__retryState?.lq?.tries || 0) > 0 || (img.__retryState?.hi?.tries || 0) > 0);
+    const shouldRetry =
+      img.__fallbackRecoveryActive === true ||
+      img.__phase === "settled" ||
+      img.__hydrated === false ||
+      hasRetries ||
+      (img.complete && img.naturalWidth === 0);
+
+    if (!shouldRetry) return;
+
+    const { lqSrc, hqSrc, hqSrcset, fallback } = img.__data;
+    try {
+      hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback });
+    } catch {}
+  });
+}
+
+if (!window.__directorRowsImageRecoveryBound) {
+  window.__directorRowsImageRecoveryBound = true;
+
+  const kick = () => {
+    try { retryRecoverableImages(); } catch {}
+  };
+
+  window.addEventListener("online", kick);
+  window.addEventListener("focus", kick, { passive: true });
+  window.addEventListener("pageshow", kick, { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) kick();
+  }, { passive: true });
+
+  window.__directorRowsImageRecoveryTimer = window.setInterval(() => {
+    if (!document.hidden) kick();
+  }, 45_000);
 }
 
 if (!window.__dirRowsPageShowBound) {

@@ -669,8 +669,10 @@ const USER_ONLY_KEYS = [
         try { initOsdHeaderRatings(); } catch {}
         localStorage.removeItem('gradientOverlayImageType');
 
+        const forcedAdminPublish = !!(cfgGuard?.forceGlobalUserSettings && isAdmin);
+        let publishResult = { attempted: false, forced: false, ok: true };
         if (!(cfgGuard?.forceGlobalUserSettings && !isAdmin)) {
-          publishAdminSnapshotIfForced();
+          publishResult = await publishAdminSnapshotIfForced();
         }
         updateSlidePosition();
         updateHeaderUserAvatar();
@@ -693,8 +695,6 @@ const USER_ONLY_KEYS = [
       );
     }
 
-    if (reload) location.reload();
-
     const avatarSettingsChanged =
         config.createAvatar !== updatedConfig.createAvatar ||
         config.avatarStyle !== updatedConfig.avatarStyle ||
@@ -715,7 +715,29 @@ const USER_ONLY_KEYS = [
         updateAvatarStyles();
     }
 
-        if (reload) location.reload();
+    if (forcedAdminPublish && publishResult?.attempted && !publishResult.ok) {
+      const failText =
+        cfgGuard?.languageLabels?.forceGlobalPublishFailed ||
+        "Global kullanıcı ayarları publish edilemedi. Sayfa yenilenmedi.";
+      showNotification(
+        `<i class="fas fa-triangle-exclamation" style="margin-right:8px;"></i> ${failText}`,
+        4200,
+        "error"
+      );
+      return {
+        ok: false,
+        publishResult,
+        forcedAdminPublish
+      };
+    }
+
+    if (reload) location.reload();
+
+    return {
+      ok: true,
+      publishResult,
+      forcedAdminPublish
+    };
     }
 
 export function applyRawConfig(config) {

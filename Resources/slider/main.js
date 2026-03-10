@@ -821,30 +821,35 @@ export async function loadHls() {
 }
 
 function observeDOMChanges() {
+  let scheduled = false;
+  const scheduleHoverRefresh = () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      try { setupHoverForAllItems(); } catch {}
+    });
+  };
+
   const observer = new MutationObserver((mutations) => {
     if (document.documentElement.dataset.jmsSoftBlock === "1") return;
-    mutations.forEach((mutation) => {
-      if (!mutation.addedNodes.length) return;
-      const relevantContainers = ["cardImageContainer"];
-
-      const isRelevant = Array.from(mutation.addedNodes).some((node) => {
-        if (node.nodeType === 1 && relevantContainers.some((c) => node.classList?.contains(c))) {
-          return true;
-        }
-        return relevantContainers.some((c) => node.querySelector?.(`.${c}`));
+    const hasRelevantAddition = mutations.some((mutation) => {
+      if (!mutation.addedNodes.length) return false;
+      return Array.from(mutation.addedNodes).some((node) => {
+        if (node.nodeType !== 1) return false;
+        if (node.classList?.contains("cardImageContainer")) return true;
+        return !!node.querySelector?.(".cardImageContainer");
       });
-
-      if (isRelevant) {
-        setupHoverForAllItems();
-      }
     });
+
+    if (hasRelevantAddition) {
+      scheduleHoverRefresh();
+    }
   });
 
-  observer.observe(document.body, {
+  observer.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
-    attributes: true,
-    attributeFilter: ["data-id", "class"],
   });
 
   return observer;

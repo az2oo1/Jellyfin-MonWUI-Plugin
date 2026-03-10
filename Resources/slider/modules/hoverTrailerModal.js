@@ -81,9 +81,23 @@ const pendingHasTrailer = new Map();
 const _seriesIdCache = new Map();
 const CONCURRENCY = Math.max(2, Math.min(6, (navigator.deviceMemory || 4) | 0));
 const rIC = window.requestIdleCallback || (cb => setTimeout(() => cb({ timeRemaining: () => 0, didTimeout: true }), 50));
+let __trailerBadgeObserver = null;
+let __hoverModalDelegatesBound = false;
+let __hoverTouchDelegatesBound = false;
+let __hoverInfraReady = false;
 
 function isTouchDevice() {
   return (typeof window !== 'undefined') && (('ontouchstart' in window) || (navigator.maxTouchPoints > 0));
+}
+
+function ensureHoverInfra() {
+  if (__hoverInfraReady) return;
+  __hoverInfraReady = true;
+  try { injectOrUpdateModalStyle(); } catch {}
+}
+
+function isInsideDotArea(node) {
+  return !!(node?.closest?.('.dot-navigation-container') || node?.closest?.('.poster-dot'));
 }
 
 try {
@@ -1208,22 +1222,56 @@ function scanAndMarkCardsForTrailers() {
   ensureTrailerBadgeCSS();
   const items = document.querySelectorAll('.cardImageContainer');
   if (!items.length) return;
-  const labels = (getConfig()?.languageLabels) || {};
-  const LTRAILER = labels.fragman || 'Fragman';
 
-  const io = new IntersectionObserver(async (entries) => {
-    for (const ent of entries) {
-      if (!ent.isIntersecting) continue;
-      const card = ent.target;
-      if (card.dataset.hastrailer === 'true' || card.dataset.hastrailer === 'false') continue;
-      const itemId = card.dataset.itemId || card.dataset.id || card.closest?.('[data-id]')?.dataset?.id;
-      if (!itemId) { card.dataset.hastrailer = 'false'; continue; }
-      const has = await hasTrailerForItemId(itemId);
-      card.dataset.hastrailer = has ? 'true' : 'false';
-      if (has) mountTrailerBadge(card, LTRAILER);
+  if (!__trailerBadgeObserver) {
+    __trailerBadgeObserver = new IntersectionObserver(async (entries) => {
+      for (const ent of entries) {
+        if (!ent.isIntersecting) continue;
+        const card = ent.target;
+        if (!card || card.__jmsTrailerBadgePending) continue;
+        if (card.dataset.hastrailer === 'true') {
+          const labels = (getConfig()?.languageLabels) || {};
+          mountTrailerBadge(card, labels.fragman || 'Fragman');
+          try { __trailerBadgeObserver.unobserve(card); } catch {}
+          continue;
+        }
+        if (card.dataset.hastrailer === 'false') {
+          try { __trailerBadgeObserver.unobserve(card); } catch {}
+          continue;
+        }
+
+        card.__jmsTrailerBadgePending = true;
+        try {
+          const itemId = card.dataset.itemId || card.dataset.id || card.closest?.('[data-id]')?.dataset?.id;
+          if (!itemId) {
+            card.dataset.hastrailer = 'false';
+            continue;
+          }
+          const has = await hasTrailerForItemId(itemId);
+          card.dataset.hastrailer = has ? 'true' : 'false';
+          if (has) {
+            const labels = (getConfig()?.languageLabels) || {};
+            mountTrailerBadge(card, labels.fragman || 'Fragman');
+          }
+        } finally {
+          card.__jmsTrailerBadgePending = false;
+          try { __trailerBadgeObserver.unobserve(card); } catch {}
+        }
+      }
+    }, { rootMargin: '200px 0px', threshold: 0.01 });
+  }
+
+  items.forEach((card) => {
+    if (!card) return;
+    if (card.dataset.hastrailer === 'true') {
+      const labels = (getConfig()?.languageLabels) || {};
+      mountTrailerBadge(card, labels.fragman || 'Fragman');
+      return;
     }
-  }, { rootMargin: '200px 0px', threshold: 0.01 });
-  items.forEach(el => io.observe(el));
+    if (card.dataset.hastrailer === 'false' || card.__jmsTrailerBadgeObserved) return;
+    card.__jmsTrailerBadgeObserved = true;
+    __trailerBadgeObserver.observe(card);
+  });
 }
 
 function canOpenItem(itemId) {
@@ -2423,125 +2471,115 @@ export function setupHoverForAllItems() {
   const mode = config.globalPreviewMode || 'modal';
 
   const items = document.querySelectorAll('.cardImageContainer');
-  if (!items.length) return;
   if (isTouch) {
-  const ALLOWED_TYPES = new Set(['Movie','Episode','Series','Season']);
-  const LONG_PRESS_MS = 380;
-  const MOVE_TOL = 12;
+    if (!__hoverTouchDelegatesBound) {
+      __hoverTouchDelegatesBound = true;
 
-  let lpTimer = null, startX = 0, startY = 0;
-  let activeItem = null, activeId = null;
-  let longPressFiredAt = 0;
-  const SUPPRESS_MS = 450;
+      const ALLOWED_TYPES = new Set(['Movie','Episode','Series','Season']);
+      const LONG_PRESS_MS = 380;
+      const MOVE_TOL = 12;
+      const SUPPRESS_MS = 450;
 
-  const getId = (el) =>
-    el?.dataset?.itemId || el?.dataset?.id || el?.closest?.('[data-id]')?.dataset?.id || null;
+      let lpTimer = null;
+      let startX = 0;
+      let startY = 0;
+      let activeItem = null;
+      let activeId = null;
+      let longPressFiredAt = 0;
 
-  function isSuppressionActive() {
-    return (Date.now() - longPressFiredAt) < SUPPRESS_MS;
-  }
-  function fireLongPress() {
-    longPressFiredAt = Date.now();
-    try { navigator.vibrate?.(10); } catch {}
-    if (activeItem && activeId) {
-    modalState.__suppressOpenUntil = 0;
-    openPreviewModalForItem(activeId, activeItem, { bypass: true });
-  }
-}
-  function cancelLP() {
-    clearTimeout(lpTimer);
-    lpTimer = null;
-    if (activeItem) activeItem.style.touchAction = '';
-    activeItem = null; activeId = null;
-  }
-  const suppressIfNeeded = (e) => {
-   if (e.target?.closest?.('.jms-trailer-badge')) return;
-    if (!isSuppressionActive()) return;
-    if (e.cancelable) e.preventDefault();
-    e.stopImmediatePropagation();
-    e.stopPropagation();
-  };
-  ['click','mousedown','mouseup','pointerup','pointerdown','touchend','touchstart','contextmenu']
-  .forEach(type => {
-    document.addEventListener(type, (e) => {
-     if (e.target?.closest?.('.jms-trailer-badge')) return;
-     suppressIfNeeded(e);
-   }, { capture:true, passive:false });
-    if (!window.__hoverOpenSuppressInstalled) {
-  window.__hoverOpenSuppressInstalled = true;
+      const getId = (el) =>
+        el?.dataset?.itemId || el?.dataset?.id || el?.closest?.('[data-id]')?.dataset?.id || null;
 
-  const killHover = () => suppressHoverOpens(1200);
-  const cardDown = (e) => {
-    const card = e.target?.closest?.('.cardImageContainer,[data-id]');
-    if (!card) return;
-    killHover();
-  };
-  document.addEventListener('pointerdown', cardDown, { capture: true, passive: false });
-  document.addEventListener('mousedown',   cardDown, { capture: true, passive: false });
-  document.addEventListener('touchstart',  cardDown, { capture: true, passive: false });
-  const linkDown = (e) => {
-    const a = e.target?.closest?.('a[href]');
-    if (!a) return;
-    killHover();
-  };
-  document.addEventListener('pointerdown', linkDown, { capture: true, passive: false });
-  document.addEventListener('mousedown',   linkDown, { capture: true, passive: false });
-  document.addEventListener('touchstart',  linkDown, { capture: true, passive: false });
-  const onNav = () => suppressHoverOpens(1200);
-  window.addEventListener('popstate',  onNav, true);
-  window.addEventListener('hashchange',onNav, true);
-  window.addEventListener('beforeunload', () => suppressHoverOpens(5000));
-  window.addEventListener('pagehide',     () => suppressHoverOpens(5000));
-}
-  });
+      const isSuppressionActive = () => (Date.now() - longPressFiredAt) < SUPPRESS_MS;
 
-  const onTouchStart = async (e) => {
-    if (e.target?.closest?.('.jms-trailer-badge')) return;
-   const card = e.target?.closest?.('.cardImageContainer');
-    if (!card) return;
-    const itemId = getId(card);
-    if (!itemId) return;
-    let type = getCardItemType(card);
-    if (!type) type = await getItemTypeCached(itemId);
-    if (!type || !ALLOWED_TYPES.has(type)) return;
-    activeItem = card; activeId = itemId;
-    activeItem.style.touchAction = 'none';
-    const t = e.touches?.[0];
-    startX = t?.clientX ?? 0;
-    startY = t?.clientY ?? 0;
-    clearTimeout(lpTimer);
-    lpTimer = setTimeout(() => {
-      fireLongPress();
-    }, LONG_PRESS_MS);
-  };
-  const onTouchMove = (e) => {
-    if (!lpTimer) return;
-    const t = e.touches?.[0];
-    if (!t) return;
-    const dx = Math.abs((t.clientX ?? 0) - startX);
-    const dy = Math.abs((t.clientY ?? 0) - startY);
-    if (dx > MOVE_TOL || dy > MOVE_TOL) {
-      cancelLP();
-    } else {
-      if (e.cancelable) e.preventDefault();
+      const fireLongPress = () => {
+        longPressFiredAt = Date.now();
+        try { navigator.vibrate?.(10); } catch {}
+        if (activeItem && activeId) {
+          modalState.__suppressOpenUntil = 0;
+          openPreviewModalForItem(activeId, activeItem, { bypass: true });
+        }
+      };
+
+      const cancelLP = () => {
+        clearTimeout(lpTimer);
+        lpTimer = null;
+        if (activeItem) activeItem.style.touchAction = '';
+        activeItem = null;
+        activeId = null;
+      };
+
+      const suppressIfNeeded = (e) => {
+        if (e.target?.closest?.('.jms-trailer-badge')) return;
+        if (!isSuppressionActive()) return;
+        if (e.cancelable) e.preventDefault();
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+      };
+
+      ['click','mousedown','mouseup','pointerup','pointerdown','touchend','touchstart','contextmenu']
+        .forEach((type) => {
+          document.addEventListener(type, (e) => {
+            if (e.target?.closest?.('.jms-trailer-badge')) return;
+            suppressIfNeeded(e);
+          }, { capture: true, passive: false });
+        });
+
+      const onTouchStart = async (e) => {
+        if (e.target?.closest?.('.jms-trailer-badge')) return;
+        const card = e.target?.closest?.('.cardImageContainer');
+        if (!card) return;
+        const itemId = getId(card);
+        if (!itemId) return;
+        let type = getCardItemType(card);
+        if (!type) type = await getItemTypeCached(itemId);
+        if (!type || !ALLOWED_TYPES.has(type)) return;
+        activeItem = card;
+        activeId = itemId;
+        activeItem.style.touchAction = 'none';
+        const t = e.touches?.[0];
+        startX = t?.clientX ?? 0;
+        startY = t?.clientY ?? 0;
+        clearTimeout(lpTimer);
+        lpTimer = setTimeout(() => {
+          fireLongPress();
+        }, LONG_PRESS_MS);
+      };
+
+      const onTouchMove = (e) => {
+        if (!lpTimer) return;
+        const t = e.touches?.[0];
+        if (!t) return;
+        const dx = Math.abs((t.clientX ?? 0) - startX);
+        const dy = Math.abs((t.clientY ?? 0) - startY);
+        if (dx > MOVE_TOL || dy > MOVE_TOL) {
+          cancelLP();
+        } else if (e.cancelable) {
+          e.preventDefault();
+        }
+      };
+
+      const onTouchEnd = (e) => {
+        if (isSuppressionActive()) {
+          if (e.cancelable) e.preventDefault();
+          e.stopImmediatePropagation();
+          e.stopPropagation();
+        }
+        cancelLP();
+      };
+
+      const onTouchCancel = () => cancelLP();
+
+      document.addEventListener('touchstart', onTouchStart, { passive: false, capture: true });
+      document.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
+      document.addEventListener('touchend', onTouchEnd, { passive: false, capture: true });
+      document.addEventListener('touchcancel', onTouchCancel, { passive: true, capture: true });
     }
-  };
-  const onTouchEnd = (e) => {
-    if (isSuppressionActive()) {
-      if (e.cancelable) e.preventDefault();
-      e.stopImmediatePropagation();
-      e.stopPropagation();
-    }
-    cancelLP();
-  };
-  const onTouchCancel = () => cancelLP();
-  document.addEventListener('touchstart',  onTouchStart,  { passive: false, capture: true });
-  document.addEventListener('touchmove',   onTouchMove,   { passive: false, capture: true });
-  document.addEventListener('touchend',    onTouchEnd,    { passive: false, capture: true });
-  document.addEventListener('touchcancel', onTouchCancel, { passive: true,  capture: true });
 
-  return;
-}
+    return;
+  }
+
+  if (!items.length) return;
 
   if (mode === 'studioMini') {
     installStudioMiniAutobind();
@@ -2559,19 +2597,12 @@ export function setupHoverForAllItems() {
     return;
   }
 
-  if (typeof config !== 'undefined' && config.allPreviewModal !== false) {
-    let __hoverInfraReady = false;
-    function ensureHoverInfra() {
-      if (__hoverInfraReady) return;
-      __hoverInfraReady = true;
-      try { injectOrUpdateModalStyle(); } catch {}
-    }
+  if (typeof config !== 'undefined' && config.allPreviewModal !== false && !__hoverModalDelegatesBound) {
+    __hoverModalDelegatesBound = true;
 
-    const isInsideDotArea = (node) =>
-      !!(node?.closest?.('.dot-navigation-container') || node?.closest?.('.poster-dot'));
-     const onEnter = async (e) => {
+    const onEnter = async (e) => {
       if (Date.now() < (modalState.__suppressOpenUntil || 0)) return;
-      if (!__hoverInfraReady) ensureHoverInfra();
+      ensureHoverInfra();
       const item = e.target?.closest?.('.cardImageContainer');
       if (!item || isInsideDotArea(item)) return;
       const itemId =
@@ -2644,8 +2675,9 @@ export function setupHoverForAllItems() {
       if (modalState.itemHoverAbortController) modalState.itemHoverAbortController.abort();
       startModalHideTimer();
     };
+
     document.addEventListener('pointerenter', onEnter, { passive: true, capture: true });
-    document.addEventListener('pointerleave', onLeave,  { passive: true, capture: true });
+    document.addEventListener('pointerleave', onLeave, { passive: true, capture: true });
   }
 }
 

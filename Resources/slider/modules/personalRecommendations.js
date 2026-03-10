@@ -1110,7 +1110,9 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
   };
 
   const onLoad = () => {
-    if (img.__phase === 'hi' || !wantsHi || img.__allowLqHydrate) {
+    const fallbackRecoveryActive = !!img.__allowLqHydrate;
+
+    if (img.__phase === 'hi' || !wantsHi) {
       img.classList.add('__hydrated');
       img.classList.remove('is-lqip');
       img.__hydrated = true;
@@ -1119,6 +1121,19 @@ function hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback }) {
       try { img.removeEventListener('load',  onLoad); } catch {}
       delete img.__onErr;
       delete img.__onLoad;
+      delete img.__allowLqHydrate;
+      delete img.__retryAfter;
+      return;
+    }
+
+    if (fallbackRecoveryActive) {
+      img.classList.add('__hydrated');
+      img.classList.remove('is-lqip');
+      img.__hydrated = true;
+      img.__hiRequested = false;
+      img.__retryAfter = Math.max(Number(img.__retryAfter || 0), Date.now() + 12_000);
+      try { __imgIO.unobserve(img); } catch {}
+      try { __imgIO.observe(img); } catch {}
     }
   };
 
@@ -1142,6 +1157,8 @@ function unobserveImage(img) {
   delete img.__hiRequested;
   delete img.__disableHi;
   delete img.__allowLqHydrate;
+  delete img.__retryAfter;
+  delete img.__retryToken;
   delete img.__fallbackState;
   if (img) {
     try { img.removeAttribute('srcset'); } catch {}
@@ -3310,17 +3327,34 @@ function scheduleHomeScrollerRefresh(ms = 120) {
 })();
 
 function __forceRetryAllBroken() {
-  document.querySelectorAll('img.cardImage').forEach(img => {
-    if (!img || !img.__data) return;
-    img.__hiFailed = false;
-    img.__hiRequested = false;
-    img.__retryAfter = 0;
-    try { __imgIO.unobserve(img); } catch {}
-    try { __imgIO.observe(img); } catch {}
+  document.querySelectorAll('img.cardImage, img.dir-row-hero-bg').forEach(img => {
+    if (!img?.__data || !img.isConnected) return;
+
+    const shouldRetry =
+      img.__allowLqHydrate === true ||
+      img.__hiFailed === true ||
+      img.__hydrated === false ||
+      Number(img.__retryAfter || 0) > 0 ||
+      (img.complete && img.naturalWidth === 0);
+
+    if (!shouldRetry) return;
+
+    const { lqSrc, hqSrc, hqSrcset, fallback } = img.__data;
+    try {
+      hydrateBlurUp(img, { lqSrc, hqSrc, hqSrcset, fallback });
+    } catch {}
   });
 }
 
 window.addEventListener('online', __forceRetryAllBroken);
+window.addEventListener('focus', __forceRetryAllBroken, { passive: true });
+window.addEventListener('pageshow', __forceRetryAllBroken, { passive: true });
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) __forceRetryAllBroken();
 });
+
+if (!window.__prcImageRecoveryTimer) {
+  window.__prcImageRecoveryTimer = window.setInterval(() => {
+    if (!document.hidden) __forceRetryAllBroken();
+  }, 45_000);
+}

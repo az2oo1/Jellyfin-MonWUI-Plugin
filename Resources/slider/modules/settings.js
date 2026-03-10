@@ -123,6 +123,16 @@ export function createSettingsModal() {
       } catch {}
     }
 
+    if (config?.currentUserIsAdmin && config?.forceGlobalUserSettings) {
+      const forcedHint = document.createElement('div');
+      forcedHint.className = 'description-text2';
+      forcedHint.style.margin = '0 0 12px';
+      forcedHint.textContent =
+        labels?.forceGlobalAdminHint ||
+        'Genel Kullanıcı Ayarlarını Zorla aktif. Kaydet/Uygula seçili ayar profilini tum kullanicilar icin global publish eder.';
+      modalContent.appendChild(forcedHint);
+    }
+
     const tabContainer = document.createElement('div');
     tabContainer.className = 'settings-tabs';
 
@@ -267,18 +277,91 @@ export function createSettingsModal() {
         );
     };
 
-    form.onsubmit = (e) => {
+    const saveLabel = saveBtn.textContent;
+    const applyLabel = applyBtn.textContent;
+    const resetLabel = resetBtn.textContent;
+    let settingsActionBusy = false;
+
+    function setBusyState(isBusy) {
+      const controls = [saveBtn, applyBtn, resetBtn, themeToggleBtn].filter(Boolean);
+      controls.forEach((btn) => {
+        if (!btn) return;
+        if (isBusy) {
+          if (btn.__busyPrevDisabled === undefined) {
+            btn.__busyPrevDisabled = btn.disabled;
+            btn.__busyPrevPointerEvents = btn.style.pointerEvents;
+            btn.__busyPrevOpacity = btn.style.opacity;
+          }
+          btn.disabled = true;
+          btn.style.pointerEvents = 'none';
+          btn.style.opacity = '0.6';
+          return;
+        }
+
+        if (btn.__busyPrevDisabled !== undefined) {
+          btn.disabled = btn.__busyPrevDisabled;
+          btn.style.pointerEvents = btn.__busyPrevPointerEvents || '';
+          btn.style.opacity = btn.__busyPrevOpacity || '';
+          delete btn.__busyPrevDisabled;
+          delete btn.__busyPrevPointerEvents;
+          delete btn.__busyPrevOpacity;
+        }
+      });
+
+      saveBtn.textContent = isBusy ? (labels?.saving || 'Kaydediliyor...') : saveLabel;
+      applyBtn.textContent = isBusy ? (labels?.applying || 'Uygulaniyor...') : applyLabel;
+      resetBtn.textContent = resetLabel;
+    }
+
+    async function runSaveAction(reload = false) {
+      if (settingsActionBusy) return;
+      settingsActionBusy = true;
+      setBusyState(true);
+
+      try {
+        const result = await applySettings(reload);
+        if (reload || result?.ok === false) return result;
+
+        if (result?.forcedAdminPublish && result?.publishResult?.attempted && result?.publishResult?.ok) {
+          const profileLabel =
+            result?.publishResult?.profile === 'mobile'
+              ? (labels?.profileMobile || 'Mobil Profil')
+              : (labels?.profileDesktop || 'Masaustu Profil');
+          showNotification(
+            `<i class="fas fa-globe" style="margin-right: 8px;"></i> ${labels?.forceGlobalPublishOk || `Global ayarlar ${profileLabel} icin yayinlandi.`}`,
+            3200,
+            'info'
+          );
+          return result;
+        }
+
+        showNotification(
+          `<i class="fas fa-floppy-disk" style="margin-right: 8px;"></i> ${config.languageLabels.settingsSavedModal || "Ayarlar kaydedildi. Değişikliklerin aktif olması için slider sayfasını yenileyin."}`,
+          3000,
+          'info'
+        );
+        return result;
+      } catch (err) {
+        console.error('Settings save failed:', err);
+        showNotification(
+          `<i class="fas fa-triangle-exclamation" style="margin-right: 8px;"></i> ${labels?.settingsSaveFailed || 'Ayarlar kaydedilemedi.'}`,
+          4200,
+          'error'
+        );
+        return { ok: false, error: err };
+      } finally {
+        settingsActionBusy = false;
+        setBusyState(false);
+      }
+    }
+
+    form.onsubmit = async (e) => {
         e.preventDefault();
-        applySettings(true);
+        await runSaveAction(true);
     };
 
-    applyBtn.onclick = () => {
-        applySettings(false);
-        showNotification(
-            `<i class="fas fa-floppy-disk" style="margin-right: 8px;"></i> ${config.languageLabels.settingsSavedModal || "Ayarlar kaydedildi. Değişikliklerin aktif olması için slider sayfasını yenileyin."}`,
-            3000,
-            'info'
-        );
+    applyBtn.onclick = async () => {
+        await runSaveAction(false);
     };
 
     btnDiv.append(saveBtn, applyBtn, resetBtn, );
@@ -299,41 +382,57 @@ function setSettingsThemeToggleVisuals() {
     : (labels.lightTheme || 'Aydınlık Tema');
 }
 
-themeToggleBtn.onclick = () => {
+themeToggleBtn.onclick = async () => {
+  if (themeToggleBtn.dataset.busy === '1') return;
+  themeToggleBtn.dataset.busy = '1';
+  themeToggleBtn.disabled = true;
   const cfg = getConfig();
   const newTheme = cfg.playerTheme === 'light' ? 'dark' : 'light';
 
-  updateConfig({ ...cfg, playerTheme: newTheme });
-  loadCSS();
+  try {
+    updateConfig({ ...cfg, playerTheme: newTheme });
+    loadCSS();
 
-  const playerThemeBtn = document.querySelector('#modern-music-player .theme-toggle-btn');
-  if (playerThemeBtn) {
-    playerThemeBtn.innerHTML = `<i class="fas fa-${newTheme === 'light' ? 'moon' : 'sun'}"></i>`;
+    const playerThemeBtn = document.querySelector('#modern-music-player .theme-toggle-btn');
+    if (playerThemeBtn) {
+      playerThemeBtn.innerHTML = `<i class="fas fa-${newTheme === 'light' ? 'moon' : 'sun'}"></i>`;
+      const labels = cfg.languageLabels || {};
+      playerThemeBtn.title = newTheme === 'light'
+        ? (labels.darkTheme || 'Karanlık Tema')
+        : (labels.lightTheme || 'Aydınlık Tema');
+    }
+
+    setSettingsThemeToggleVisuals();
+
     const labels = cfg.languageLabels || {};
-    playerThemeBtn.title = newTheme === 'light'
-      ? (labels.darkTheme || 'Karanlık Tema')
-      : (labels.lightTheme || 'Aydınlık Tema');
+      showNotification(
+        `<i class="fas fa-${newTheme === 'light' ? 'sun' : 'moon'}"></i> ${
+          newTheme === 'light'
+            ? (labels.lightThemeEnabled || 'Aydınlık tema etkin')
+            : (labels.darkThemeEnabled || 'Karanlık tema etkin')
+        }`,
+        2000,
+        'info'
+      );
+      try {
+        window.dispatchEvent(new CustomEvent('app:theme-changed', { detail: { theme: newTheme } }));
+        const themeSelect = document.getElementById('themeSelect');
+        if (themeSelect) themeSelect.value = newTheme;
+      } catch {}
+
+    const publishResult = await publishAdminSnapshotIfForced();
+    if (cfg?.forceGlobalUserSettings && cfg?.currentUserIsAdmin && publishResult?.attempted && !publishResult?.ok) {
+      showNotification(
+        `<i class="fas fa-triangle-exclamation" style="margin-right: 8px;"></i> ${labels?.forceGlobalPublishFailed || 'Global kullanıcı ayarları publish edilemedi.'}`,
+        4200,
+        'error'
+      );
+    }
+  } finally {
+    delete themeToggleBtn.dataset.busy;
+    themeToggleBtn.disabled = false;
   }
-
-  setSettingsThemeToggleVisuals();
-
-  const labels = cfg.languageLabels || {};
-    showNotification(
-      `<i class="fas fa-${newTheme === 'light' ? 'sun' : 'moon'}"></i> ${
-        newTheme === 'light'
-          ? (labels.lightThemeEnabled || 'Aydınlık tema etkin')
-          : (labels.darkThemeEnabled || 'Karanlık tema etkin')
-      }`,
-      2000,
-      'info'
-    );
-    try {
-      window.dispatchEvent(new CustomEvent('app:theme-changed', { detail: { theme: newTheme } }));
-      const themeSelect = document.getElementById('themeSelect');
-      if (themeSelect) themeSelect.value = newTheme;
-    } catch {}
-    publishAdminSnapshotIfForced();
-  };
+};
 
     setSettingsThemeToggleVisuals();
     btnDiv.append(themeToggleBtn);

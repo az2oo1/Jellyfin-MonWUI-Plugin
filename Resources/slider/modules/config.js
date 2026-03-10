@@ -791,14 +791,18 @@ function pruneGlobalConfig(cfg) {
 export async function publishAdminSnapshotIfForced() {
   try {
     const cfg = getConfig();
-    if (!cfg?.currentUserIsAdmin) return;
+    if (!cfg?.currentUserIsAdmin) {
+      return { attempted: false, forced: false, ok: true, reason: "not-admin" };
+    }
 
     const targetProfile = getAdminTargetProfile();
     const r = await fetch(`/Plugins/JMSFusion/UserSettings?ts=${Date.now()}&profile=${targetProfile}`, {
       cache: "no-store"
     });
     const j = r.ok ? await r.json() : null;
-    if (!j?.forceGlobal) return;
+    if (!j?.forceGlobal) {
+      return { attempted: false, forced: false, ok: true, reason: "not-forced", profile: targetProfile };
+    }
 
     const globalConfig = pruneGlobalConfig(cfg);
     const token =
@@ -808,7 +812,7 @@ export async function publishAdminSnapshotIfForced() {
 
     if (!token) {
       console.warn("[JMSFusion] Auto publish skipped (no token).");
-      return;
+      return { attempted: true, forced: true, ok: false, reason: "no-token", profile: targetProfile };
     }
 
     const pr = await fetch(`/Plugins/JMSFusion/UserSettings/Publish?ts=${Date.now()}&profile=${targetProfile}`, {
@@ -821,10 +825,22 @@ export async function publishAdminSnapshotIfForced() {
       body: JSON.stringify({ global: globalConfig, profile: targetProfile })
     });
 
-    if (!pr.ok) console.warn("[JMSFusion] Auto publish failed:", pr.status);
-    else console.log("[JMSFusion] Auto publish success.");
+    if (!pr.ok) {
+      console.warn("[JMSFusion] Auto publish failed:", pr.status);
+      return { attempted: true, forced: true, ok: false, reason: "http-error", status: pr.status, profile: targetProfile };
+    }
+
+    console.log("[JMSFusion] Auto publish success.");
+    return { attempted: true, forced: true, ok: true, profile: targetProfile };
   } catch (e) {
     console.warn("[JMSFusion] Auto publish error:", e);
+    return {
+      attempted: true,
+      forced: true,
+      ok: false,
+      reason: "exception",
+      error: e?.message || String(e)
+    };
   }
 }
 
