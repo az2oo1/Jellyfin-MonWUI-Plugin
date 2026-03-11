@@ -266,7 +266,12 @@ function shortPreload(url, ms = 1200) {
   return () => { clearTimeout(id); try { link.remove(); } catch {} };
 }
 
-async function createSlide(item) {
+async function createSlide(item, options = {}) {
+  const {
+    insertAt = null,
+    suppressInitialDisplay = false,
+    deferPeakReveal = false
+  } = options || {};
   const indexPage = document.querySelector("#indexPage:not(.hide)") || document.querySelector("#homePage:not(.hide)");
   if (!indexPage) return;
 
@@ -359,7 +364,8 @@ async function createSlide(item) {
     mo.observe(slidesContainer, { childList:true, subtree:true });
     slidesContainer.__cleanupMO = mo;
   }
-  const isFirstSlide = slidesContainer.children.length === 0;
+  const existingSlides = Array.from(slidesContainer.children).filter((child) => child.classList?.contains("slide"));
+  const isFirstSlide = existingSlides.length === 0;
   const itemId = item.Id;
 
   const {
@@ -428,6 +434,9 @@ async function createSlide(item) {
 
   const slide = document.createElement("div");
   slide.className = "slide";
+  if (deferPeakReveal && config.peakSlider) {
+    slide.classList.add("peak-batch-pending");
+  }
   slide.style.position = "absolute";
   slide.style.display = "none";
   slide.dataset.detailUrl = `/web/#/details?id=${itemId}`;
@@ -674,10 +683,21 @@ async function createSlide(item) {
   slide.append(metaContainer, mainContentContainer, buttonContainer, actorSlider, infoContainer, directorContainer);
   const frag = document.createDocumentFragment();
   frag.appendChild(slide);
-  slidesContainer.appendChild(frag);
-  if (slidesContainer.children.length === 1) {
+  const slideChildren = Array.from(slidesContainer.children).filter((child) => child.classList?.contains("slide"));
+  const dotNav = Array.from(slidesContainer.children).find((child) => child.classList?.contains("dot-navigation-container")) || null;
+  const hasExplicitInsertAt = Number.isInteger(insertAt) && insertAt >= 0;
+  const refNode = hasExplicitInsertAt && insertAt < slideChildren.length
+    ? slideChildren[insertAt]
+    : dotNav;
+  if (refNode) {
+    slidesContainer.insertBefore(frag, refNode);
+  } else {
+    slidesContainer.appendChild(frag);
+  }
+  if (!suppressInitialDisplay && slideChildren.length === 0) {
     import("./navigation.js").then(mod => mod.displaySlide(0));
   }
+  return slide;
 }
 
 function addSlideToSettingsBackground(itemId, backdropUrl) {
