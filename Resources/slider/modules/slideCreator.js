@@ -80,6 +80,7 @@ function bgFlushHydrationFrame() {
       will-change: scroll-position;
       overscroll-behavior: contain;
       backface-visibility: hidden;
+      touch-action: pan-y pinch-zoom;
     }
 
     #slides-container .slide {
