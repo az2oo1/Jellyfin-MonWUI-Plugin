@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/img/icon.png",
     "versions": [
       {
+        "version": "2.0.3.0",
+        "changelog": "This version improves the Peak slide functionality with sequential loading, making it visible sooner.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://github.com/G-grbz/Jellyfin-MonWUI-Plugin/releases/download/v2.0.0/JMSFusion-2.0.3.0-server.zip",
+        "checksum": "d31bd1eeae7e78d9a65d43c727a28b31",
+        "timestamp": "2026-03-11T13:21:32.9409177Z"
+      },
+      {
         "version": "2.0.2.0",
         "changelog": "fix: hoverTrailer CPU spike and global settings save",
         "targetAbi": "10.10.0.0",
