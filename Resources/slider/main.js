@@ -5,7 +5,7 @@ import { getCurrentIndex, setCurrentIndex } from "./modules/sliderState.js";
 import { startSlideTimer, stopSlideTimer, pauseSlideTimer, resumeSlideTimer } from "./modules/timer.js";
 import { ensureProgressBarExists, resetProgressBar, pauseProgressBar, resumeProgressBar } from "./modules/progressBar.js";
 import { createSlide } from "./modules/slideCreator.js";
-import { changeSlide, createDotNavigation, enablePeakNeighborActivation, getPeakDisplayOptions, primePeakFirstPaint, syncPeakStructureNow, updatePeakClasses } from "./modules/navigation.js";
+import { changeSlide, createDotNavigation, enablePeakNeighborActivation, getPeakDisplayOptions, initSwipeEvents, primePeakFirstPaint, syncPeakStructureNow, updatePeakClasses } from "./modules/navigation.js";
 import { attachMouseEvents } from "./modules/events.js";
 import { fetchItemDetails as fetchItemDetailsNet, getSessionInfo, getAuthHeader, waitForAuthReadyStrict, isAuthReadyStrict } from "./modules/api.js";
 import { cachedFetchJson, cachedFetchText, createCachedItemDetailsFetcher, startLibraryDeltaWatcher } from "./modules/sliderCache.js";
@@ -1803,6 +1803,7 @@ function initializeSlider() {
     primeProgressBar(indexPage);
     ensureInitialActivation(indexPage);
     hydrateFirstSlide(indexPage);
+    initSwipeEvents();
     if (config.peakSlider) {
       const sc = indexPage.querySelector('#slides-container');
       const slides = indexPage.querySelectorAll('.slide');
@@ -1847,6 +1848,7 @@ function startWhenAllReady() {
   primeProgressBar(indexPage);
   ensureInitialActivation(indexPage);
   hydrateFirstSlide(indexPage);
+  initSwipeEvents();
   startNewCycleClock();
   safeRaf(() => {
     hardProgressReset();
