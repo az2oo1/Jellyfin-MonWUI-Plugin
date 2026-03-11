@@ -5,7 +5,7 @@ import { getCurrentIndex, setCurrentIndex } from "./modules/sliderState.js";
 import { startSlideTimer, stopSlideTimer, pauseSlideTimer, resumeSlideTimer } from "./modules/timer.js";
 import { ensureProgressBarExists, resetProgressBar, pauseProgressBar, resumeProgressBar } from "./modules/progressBar.js";
 import { createSlide } from "./modules/slideCreator.js";
-import { changeSlide, createDotNavigation, primePeakFirstPaint, schedulePeakStructureSync, updatePeakClasses } from "./modules/navigation.js";
+import { changeSlide, createDotNavigation, enablePeakNeighborActivation, getPeakDisplayOptions, primePeakFirstPaint, syncPeakStructureNow, updatePeakClasses } from "./modules/navigation.js";
 import { attachMouseEvents } from "./modules/events.js";
 import { fetchItemDetails as fetchItemDetailsNet, getSessionInfo, getAuthHeader, waitForAuthReadyStrict, isAuthReadyStrict } from "./modules/api.js";
 import { cachedFetchJson, cachedFetchText, createCachedItemDetailsFetcher, startLibraryDeltaWatcher } from "./modules/sliderCache.js";
@@ -350,6 +350,58 @@ function markSlideCreated() {
       document.dispatchEvent(new CustomEvent("jms:all-slides-ready"));
     } catch {}
   }
+}
+
+function chunkArray(arr, size = 2) {
+  const out = [];
+  const safeSize = Math.max(1, Number(size) || 1);
+  for (let i = 0; i < arr.length; i += safeSize) {
+    out.push(arr.slice(i, i + safeSize));
+  }
+  return out;
+}
+
+function wrapIndex(index, len) {
+  if (!len) return 0;
+  return ((index % len) + len) % len;
+}
+
+function buildPeakCreationBatches(total, peakOpts = {}) {
+  if (!Number.isFinite(total) || total <= 0) return [];
+
+  const { spanLeft = 1, spanRight = 1 } = peakOpts || {};
+  const seen = new Set();
+  const firstBatch = [];
+  const laterVisible = [];
+  const initialLeft = Math.min(Math.max(0, spanLeft), 5);
+  const initialRight = Math.min(Math.max(0, spanRight), 5);
+  const add = (target, idx) => {
+    const safe = wrapIndex(idx, total);
+    if (seen.has(safe)) return;
+    seen.add(safe);
+    target.push(safe);
+  };
+
+  add(firstBatch, 0);
+  for (let step = 1; step <= initialRight; step++) {
+    add(firstBatch, step);
+  }
+  for (let step = 1; step <= initialLeft; step++) {
+    add(firstBatch, total - step);
+  }
+
+  const maxVisibleSpan = Math.max(spanLeft, spanRight, initialLeft, initialRight);
+  for (let step = 1; step <= maxVisibleSpan; step++) {
+    if (step > initialRight && step <= spanRight) add(laterVisible, step);
+    if (step > initialLeft && step <= spanLeft) add(laterVisible, total - step);
+  }
+
+  const background = [];
+  for (let idx = 0; idx < total; idx++) {
+    add(background, idx);
+  }
+
+  return [firstBatch, ...chunkArray([...laterVisible, ...background], 2)].filter((batch) => batch.length);
 }
 
 function hardProgressReset() {
@@ -1104,9 +1156,6 @@ function triggerSlideEnterHooks(indexPage) {
   const active = indexPage.querySelector(".slide.active") || indexPage.querySelector(".slide");
   if (!active) return;
   try {
-    if (typeof changeSlide === "function") changeSlide(0);
-  } catch {}
-  try {
     active.dispatchEvent(new CustomEvent("jms:slide-enter", { bubbles: true }));
   } catch {}
 }
@@ -1654,11 +1703,34 @@ export async function slidesInit() {
   window.__totalSlidesPlanned = items.length;
   window.__slidesCreated = 0;
 
-    const first = items[0];
-    await createSlide(first);
-    markFirstSlideReady();
-    try { annotateDomWithQualityHints(document); } catch {}
-    markSlideCreated();
+    const peakBatches = config.peakSlider ? buildPeakCreationBatches(items.length, getPeakDisplayOptions()) : [];
+    const createItemAt = async (itemIndex, options = {}) => {
+      const item = items[itemIndex];
+      if (!item) return;
+      const slide = await createSlide(item, { insertAt: itemIndex, ...options });
+      if (itemIndex === 0) {
+        markFirstSlideReady();
+      }
+      try { annotateDomWithQualityHints(document); } catch {}
+      markSlideCreated();
+      return slide;
+    };
+
+    if (config.peakSlider) {
+      const [firstBatch = [0]] = peakBatches;
+      for (const itemIndex of firstBatch) {
+        await createItemAt(itemIndex, {
+          suppressInitialDisplay: true,
+          deferPeakReveal: itemIndex !== 0
+        });
+      }
+    } else {
+      const first = items[0];
+      await createSlide(first);
+      markFirstSlideReady();
+      try { annotateDomWithQualityHints(document); } catch {}
+      markSlideCreated();
+    }
 
     const idxPage = document.querySelector("#indexPage:not(.hide)") || document.querySelector("#homePage:not(.hide)");
     if (idxPage) upsertSlidesContainerAtTop(idxPage);
@@ -1666,18 +1738,39 @@ export async function slidesInit() {
       updateSlidePosition();
     } catch {}
 
+    if (config.peakSlider) {
+      window.__peakBooting = false;
+    }
     initializeSlider();
-    const rest = items.slice(1);
+    const rest = config.peakSlider
+      ? peakBatches.slice(1)
+      : chunkArray(items.map((_, index) => index).slice(1), 1);
     idle(() => {
       (async () => {
-        for (const it of rest) {
+        for (const batch of rest) {
           try {
-            await createSlide(it);
-            try { annotateDomWithQualityHints(document); } catch {}
-            markSlideCreated();
+            const createdSlides = [];
+            for (const itemIndex of batch) {
+              const slide = await createItemAt(itemIndex, {
+                suppressInitialDisplay: true,
+                deferPeakReveal: config.peakSlider
+              });
+              if (slide) createdSlides.push(slide);
+            }
             if (config.peakSlider) {
-            const idxPage = document.querySelector('#indexPage:not(.hide), #homePage:not(.hide)');
-            if (idxPage) schedulePeakStructureSync(idxPage);
+              const idxPage = document.querySelector('#indexPage:not(.hide), #homePage:not(.hide)');
+              if (idxPage) syncPeakStructureNow(idxPage);
+              const releasePending = () => {
+                createdSlides.forEach((slide) => slide.classList.remove('peak-batch-pending'));
+              };
+              const container = idxPage?.querySelector?.('#slides-container');
+              if (container?.classList?.contains('peak-ready')) {
+                requestAnimationFrame(releasePending);
+              } else {
+                requestAnimationFrame(() => {
+                  requestAnimationFrame(releasePending);
+                });
+              }
             }
           } catch (e) {
             console.warn("Arka plan slayt oluşturma hatası:", e);
@@ -1711,15 +1804,14 @@ function initializeSlider() {
     ensureInitialActivation(indexPage);
     hydrateFirstSlide(indexPage);
     if (config.peakSlider) {
-    const sc = indexPage.querySelector('#slides-container');
-    const slides = indexPage.querySelectorAll('.slide');
-    if (sc && slides.length) {
-    const spanLeft  = Number(config?.peakSpanLeft  ?? 2);
-    const spanRight = Number(config?.peakSpanRight ?? spanLeft);
-    const diagonal  = !!config?.peakDiagonal;
-    primePeakFirstPaint(slides, getCurrentIndex(), sc, { spanLeft, spanRight, diagonal });
-  }
-}
+      const sc = indexPage.querySelector('#slides-container');
+      const slides = indexPage.querySelectorAll('.slide');
+      if (sc && slides.length) {
+        sc.classList.add('peak-mode');
+        primePeakFirstPaint(slides, getCurrentIndex(), sc, getPeakDisplayOptions());
+        enablePeakNeighborActivation();
+      }
+    }
     triggerSlideEnterHooks(indexPage);
 
     try {
@@ -1768,12 +1860,9 @@ function startWhenAllReady() {
         const sc = indexPage.querySelector('#slides-container');
         const slides = indexPage.querySelectorAll('.slide');
         if (sc && slides.length) {
-          const spanLeft  = Number(config?.peakSpanLeft  ?? 2);
-          const spanRight = Number(config?.peakSpanRight ?? spanLeft);
-          const diagonal  = !!config?.peakDiagonal;
           sc.classList.add('peak-ready');
           sc.classList.remove('peak-init');
-          updatePeakClasses(slides, getCurrentIndex(), { spanLeft, spanRight, diagonal });
+          updatePeakClasses(slides, getCurrentIndex(), getPeakDisplayOptions());
         }
       }
     } catch {}
