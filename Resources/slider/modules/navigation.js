@@ -47,9 +47,31 @@ function ensureFlickerFixCSS() {
       visibility: hidden !important;
       pointer-events: none !important;
     }
+    #slides-container.peak-first-reveal {
+      opacity: 0 !important;
+    }
+    #slides-container.peak-first-reveal.peak-first-reveal-active {
+      opacity: 1 !important;
+      transition: opacity .22s cubic-bezier(.2,.6,.2,1) !important;
+    }
     .slide.is-visible {
       visibility: visible !important;
       pointer-events: auto !important;
+    }
+    .slide.peak-batch-pending,
+    .slide.peak-batch-pending * {
+      animation: none !important;
+      transition: none !important;
+    }
+    .slide.peak-batch-pending {
+      opacity: 0 !important;
+      pointer-events: none !important;
+      visibility: hidden !important;
+    }
+    #slides-container.peak-ready .slide.peak-snap-in,
+    #slides-container.peak-ready .slide.peak-snap-in * {
+      transition: none !important;
+      animation: none !important;
     }
 	    #slides-container.peak-ready .slide.off-left,
 	    #slides-container.peak-ready .slide.off-right {
@@ -176,7 +198,7 @@ function syncPeakLiteMode(container = document.querySelector('#slides-container'
   return enabled;
 }
 
-function getPeakDisplayOptions() {
+export function getPeakDisplayOptions() {
   const cfg = getConfig();
   if (isLowPowerPeakRuntime()) {
     return {
@@ -296,11 +318,19 @@ function getPeakSlideState(index, activeIndex, len, spanLeft, spanRight) {
 function applyPeakSlideState(slide, nextState) {
   if (!slide) return;
   const prev = slide.__peakState || {};
+  const enteringVisible = !prev.visible && !!nextState.visible;
   removeLegacyPeakPosClasses(slide);
 
-  if (prev.visible !== nextState.visible) {
-    if (nextState.visible) showSlide(slide);
-    else hideSlide(slide, { soft: true });
+  if (enteringVisible) {
+    if (slide.__peakSnapRafA) cancelAnimationFrame(slide.__peakSnapRafA);
+    if (slide.__peakSnapRafB) cancelAnimationFrame(slide.__peakSnapRafB);
+    slide.__peakSnapRafA = 0;
+    slide.__peakSnapRafB = 0;
+    slide.classList.add('peak-snap-in');
+  }
+
+  if (prev.visible !== nextState.visible && !nextState.visible) {
+    hideSlide(slide, { soft: true });
   }
   if (!!prev.active !== !!nextState.active) {
     slide.classList.toggle('active', !!nextState.active);
@@ -323,8 +353,22 @@ function applyPeakSlideState(slide, nextState) {
     else slide.style.removeProperty('--k');
   }
 
+  if (prev.visible !== nextState.visible && nextState.visible) {
+    showSlide(slide);
+  }
+
   syncPeakBackdropForState(slide, prev, nextState);
   slide.__peakState = nextState;
+
+  if (enteringVisible) {
+    slide.__peakSnapRafA = requestAnimationFrame(() => {
+      slide.__peakSnapRafA = 0;
+      slide.__peakSnapRafB = requestAnimationFrame(() => {
+        slide.__peakSnapRafB = 0;
+        slide.classList.remove('peak-snap-in');
+      });
+    });
+  }
 }
 
 function rebuildPeakState(arr, activeIndex, opts) {
@@ -505,6 +549,36 @@ function showSlide(el) {
   el.classList.add('is-visible');
   el.classList.remove('is-hidden');
   if (el.style.display) el.style.removeProperty('display');
+}
+
+function armPeakInitialReveal(container) {
+  if (!container || container.dataset.peakInitialRevealDone === '1') return;
+  container.dataset.peakInitialRevealDone = '1';
+
+  const prefersReduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  if (prefersReduced) return;
+
+  if (container.__peakInitialRevealTimer) {
+    clearTimeout(container.__peakInitialRevealTimer);
+    container.__peakInitialRevealTimer = 0;
+  }
+
+  container.classList.add('peak-first-reveal');
+  container.classList.remove('peak-first-reveal-active');
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (!container.isConnected) return;
+      container.classList.add('peak-first-reveal-active');
+    });
+  });
+
+  container.__peakInitialRevealTimer = setTimeout(() => {
+    container.__peakInitialRevealTimer = 0;
+    if (!container.isConnected) return;
+    container.classList.remove('peak-first-reveal');
+    container.classList.remove('peak-first-reveal-active');
+  }, 320);
 }
 
 function hideSlide(el, { soft = true } = {}) {
@@ -1357,6 +1431,9 @@ export function updatePeakClasses(slides, activeIndex, spanOrOpts = 2) {
   const opts = normalizePeakOptions(spanOrOpts);
   const { spanLeft, spanRight, diagonal } = opts;
   const container = arr[0]?.closest?.('#slides-container') || getPeakViewportContainer();
+  if (container) {
+    applyPeakContainerState(container, diagonal);
+  }
   const prevState = container?.__peakStateCache || null;
   const nextVisible = buildPeakVisibleIndexSet(len, safeActiveIndex, spanLeft, spanRight);
   const needsFullRebuild = !prevState || prevState.len !== len;
@@ -1379,7 +1456,6 @@ export function updatePeakClasses(slides, activeIndex, spanOrOpts = 2) {
   }
 
   if (container) {
-    applyPeakContainerState(container, diagonal);
     container.__peakStateCache = {
       activeIndex: safeActiveIndex,
       diagonal: !!diagonal,
@@ -1392,12 +1468,17 @@ export function updatePeakClasses(slides, activeIndex, spanOrOpts = 2) {
 }
 
 export function primePeakFirstPaint(slides, activeIndex, slidesContainer, spanOrOpts = 2) {
+  const opts = (typeof spanOrOpts === 'object')
+    ? { spanLeft: 2, spanRight: 2, diagonal: false, ...spanOrOpts }
+    : { spanLeft: spanOrOpts, spanRight: spanOrOpts, diagonal: false };
+
   if (window.__peakBooting) {
     const arr = Array.from(slides);
     if (slidesContainer) {
       slidesContainer.__peakStateCache = null;
       ensurePeakVars(slidesContainer);
       syncPeakLiteMode(slidesContainer);
+      applyPeakContainerState(slidesContainer, opts.diagonal);
       slidesContainer.dataset.peakPrimed = '1';
       slidesContainer.classList.add('peak-init');
       slidesContainer.classList.remove('peak-ready');
@@ -1412,13 +1493,13 @@ export function primePeakFirstPaint(slides, activeIndex, slidesContainer, spanOr
       s.style.removeProperty('--k');
     });
     requestAnimationFrame(() => {
-      arr.forEach(s => s.style.removeProperty('transition'));
+      arr.forEach((s) => {
+        s.style.removeProperty('transition');
+        s.classList.remove('peak-batch-pending');
+      });
     });
     return;
   }
-  const opts = (typeof spanOrOpts === 'object')
-    ? { spanLeft: 2, spanRight: 2, diagonal: false, ...spanOrOpts }
-    : { spanLeft: spanOrOpts, spanRight: spanOrOpts, diagonal: false };
 
   if (!slidesContainer || slidesContainer.dataset.peakPrimed === '1') {
     updatePeakClasses(slides, activeIndex, opts);
@@ -1427,6 +1508,7 @@ export function primePeakFirstPaint(slides, activeIndex, slidesContainer, spanOr
   slidesContainer.__peakStateCache = null;
   ensurePeakVars(slidesContainer);
   syncPeakLiteMode(slidesContainer);
+  applyPeakContainerState(slidesContainer, opts.diagonal);
   slidesContainer.dataset.peakPrimed = '1';
   slidesContainer.classList.add('peak-init');
 
@@ -1466,7 +1548,11 @@ export function primePeakFirstPaint(slides, activeIndex, slidesContainer, spanOr
       slidesContainer.classList.add('peak-ready');
       slidesContainer.classList.remove('peak-init');
       updatePeakClasses(slides, activeIndex, opts);
-      arr.forEach(s => s.removeAttribute('data-prime-pos'));
+      arr.forEach((s) => {
+        s.removeAttribute('data-prime-pos');
+        s.classList.remove('peak-batch-pending');
+      });
+      armPeakInitialReveal(slidesContainer);
     });
   });
 }
@@ -1502,6 +1588,10 @@ function syncPeakStructure(root = null, { forcePrime = false } = {}) {
     return;
   }
   updatePeakClasses(slides, activeIndex, opts);
+}
+
+export function syncPeakStructureNow(root = null, { forcePrime = false } = {}) {
+  syncPeakStructure(root, { forcePrime });
 }
 
 export function schedulePeakStructureSync(root = null, { forcePrime = false } = {}) {
@@ -1683,7 +1773,7 @@ function ensureDotQualityBadgeCSS() {
   document.head.appendChild(style);
 }
 
-function enablePeakNeighborActivation() {
+export function enablePeakNeighborActivation() {
   const container = document.querySelector('#slides-container');
   if (!container || container.__peakClickBound) return;
   container.__peakClickBound = true;
