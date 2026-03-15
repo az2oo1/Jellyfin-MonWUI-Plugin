@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/img/icon.png",
     "versions": [
       {
+        "version": "2.0.4.0",
+        "changelog": "Improve overall performance and fix various issues across the plugin",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://github.com/G-grbz/Jellyfin-MonWUI-Plugin/releases/download/v2.0.0/JMSFusion-2.0.4.0-server.zip",
+        "checksum": "d5f26b50d59c6b6d490d8dd424b11ef2",
+        "timestamp": "2026-03-15T15:50:53.3544364Z"
+      },
+      {
         "version": "2.0.3.0",
         "changelog": "This version improves the Peak slide functionality with sequential loading, making it visible sooner.",
         "targetAbi": "10.10.0.0",
