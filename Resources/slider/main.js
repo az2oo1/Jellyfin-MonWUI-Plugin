@@ -3,7 +3,7 @@ import { getConfig } from "./modules/config.js";
 import { getLanguageLabels, getDefaultLanguage } from "./language/index.js";
 import { getCurrentIndex, setCurrentIndex } from "./modules/sliderState.js";
 import { startSlideTimer, stopSlideTimer, pauseSlideTimer, resumeSlideTimer } from "./modules/timer.js";
-import { ensureProgressBarExists, resetProgressBar, pauseProgressBar, resumeProgressBar } from "./modules/progressBar.js";
+import { ensureProgressBarExists, resetProgressBar, pauseProgressBar, resumeProgressBar, updateProgressBarPosition } from "./modules/progressBar.js";
 import { createSlide } from "./modules/slideCreator.js";
 import { changeSlide, createDotNavigation, enablePeakNeighborActivation, getPeakDisplayOptions, initSwipeEvents, primePeakFirstPaint, syncPeakStructureNow, updatePeakClasses } from "./modules/navigation.js";
 import { attachMouseEvents } from "./modules/events.js";
@@ -18,18 +18,16 @@ import { startUpdatePolling } from "./modules/update.js";
 import { ensureStudioHubsMounted } from "./modules/studioHubs.js";
 import { updateSlidePosition } from "./modules/positionUtils.js";
 import { renderPersonalRecommendations } from "./modules/personalRecommendations.js";
-import { mountDirectorRowsLazy, warmDirectorRowsDb } from "./modules/directorRows.js";
+import { mountDirectorRowsLazy } from "./modules/directorRows.js";
 import { setupHoverForAllItems  } from "./modules/hoverTrailerModal.js";
-import { teardownAnimations } from "./modules/animations.js";
+import { teardownAnimations, hardCleanupSlide } from "./modules/animations.js";
 import { mountRecentRowsLazy, cleanupRecentRows } from "./modules/recentRows.js";
 import { withServer } from "./modules/jfUrl.js";
 import { initUserProfileAvatarPicker } from "./modules/avatarPicker.js";
-import { startGlobalDbFullscanScheduler } from "./modules/player/ui/artistModal.js";
 import { startBackgroundCollectionIndexer, getBackgroundCollectionIndexerStatus } from "./modules/collectionIndexer.js";
-import { initProfileChooser } from "./modules/profileChooser.js";
+import { initProfileChooser, syncProfileChooserHeaderButtonVisibility } from "./modules/profileChooser.js";
 import { initSubtitleCustomizer } from "./modules/subtitleCustomizer.js";
 import { initOsdHeaderRatings } from "./modules/osdHeaderRatings.js";
-
 const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 0));
 
 function installHomeTabSliderOnlyGate() {
@@ -232,6 +230,7 @@ function whenFirstSlideReadyOrTimeout(cb, timeoutMs = 7000) {
   }
 
   const variant = getCssVariant();
+  addCSS('/slider/src/fontawesome/all.min.css', 'jms-css-fontawesome');
   addCSS('/slider/src/notifications.css', 'jms-css-notifications');
   addCSS('/slider/src/pauseModul.css', 'jms-css-pause');
   addCSS('/slider/src/personalRecommendations.css', 'jms-css-recs');
@@ -518,6 +517,7 @@ function getSlideDurationMs() {
 })();
 
 const config = getConfig();
+syncProfileChooserHeaderButtonVisibility(config?.enableProfileChooser !== false);
 
 function isSliderEnabled() {
   try {
@@ -533,7 +533,6 @@ let pauseBooted = false;
 let navObsBooted = false;
 window.sliderResetInProgress = window.sliderResetInProgress || false;
 window.__slidesInitRunning = window.__slidesInitRunning || false;
-window.__shuffleSavedThisLoad = false;
 
 function startPauseOverlayOnce() {
   if (pauseBooted) return;
@@ -640,14 +639,6 @@ function runNonCriticalUiBootOnce() {
         try { window.cleanupQualityBadges = initializeQualityBadges(); } catch {}
       }
 
-      try {
-        if (!window.__jmsMusicSchedulerBooted) {
-          window.__jmsMusicSchedulerBooted = true;
-          startGlobalDbFullscanScheduler();
-        }
-      } catch (e) {
-        console.warn("startGlobalDbFullscanScheduler hata:", e);
-      }
     });
   }, 7000);
 }
@@ -692,68 +683,11 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 window.__recsRebuildTimer = window.__recsRebuildTimer || null;
-window.__dirRowsWarmupRetryTimer = window.__dirRowsWarmupRetryTimer || null;
-window.__dirRowsWarmupInFlight = window.__dirRowsWarmupInFlight || false;
-window.__dirRowsWarmupDone = window.__dirRowsWarmupDone || false;
 window.__jmsIndexerRetryTimer = window.__jmsIndexerRetryTimer || null;
 window.__jmsIndexerRetryInFlight = window.__jmsIndexerRetryInFlight || false;
-
-function scheduleDirectorRowsWarmupRetry(delayMs = 1200) {
-  if (window.__dirRowsWarmupDone) return;
-  if (window.__dirRowsWarmupRetryTimer) return;
-  window.__dirRowsWarmupRetryTimer = setTimeout(() => {
-    window.__dirRowsWarmupRetryTimer = null;
-    kickDirectorRowsWarmup({ force: true });
-  }, Math.max(500, delayMs | 0));
-}
-
-function kickDirectorRowsWarmup({ force = false } = {}) {
-  try {
-    const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
-    if (!cfg.enableDirectorRows || typeof warmDirectorRowsDb !== "function") return;
-    if (window.__dirRowsWarmupDone && !force) return;
-    if (window.__dirRowsWarmupInFlight) return;
-
-    window.__dirRowsWarmupInFlight = true;
-
-    (async () => {
-      let ready = false;
-      let result = null;
-
-      try { ready = await waitAuthWarmupFallback(force ? 12000 : 1500); } catch {}
-      if (ready) {
-        try { result = await warmDirectorRowsDb({ force }); } catch (e) {
-          console.warn("directorRows early warmup hata:", e);
-        }
-      }
-
-      if (result && !result.skipped) {
-        window.__dirRowsWarmupDone = true;
-        if (window.__dirRowsWarmupRetryTimer) {
-          clearTimeout(window.__dirRowsWarmupRetryTimer);
-          window.__dirRowsWarmupRetryTimer = null;
-        }
-      } else {
-        scheduleDirectorRowsWarmupRetry(force ? 1500 : 1000);
-      }
-    })().finally(() => {
-      window.__dirRowsWarmupInFlight = false;
-    });
-  } catch {}
-}
-
-if (!window.__dirRowsWarmupVisBound) {
-  window.__dirRowsWarmupVisBound = true;
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) kickDirectorRowsWarmup();
-  }, { passive: true });
-  window.addEventListener("pageshow", () => {
-    kickDirectorRowsWarmup();
-  }, { passive: true });
-  window.addEventListener("focus", () => {
-    kickDirectorRowsWarmup();
-  }, { passive: true });
-}
+window.__jmsIndexerAutoStartTimer = window.__jmsIndexerAutoStartTimer || null;
+window.__jmsIndexerAutoStartReady = window.__jmsIndexerAutoStartReady || false;
+window.__jmsIndexerAutoStartPending = window.__jmsIndexerAutoStartPending || false;
 
 function schedulePersonalRecsReinit(delayMs = 10000) {
   try { clearTimeout(window.__recsRebuildTimer); } catch {}
@@ -1160,6 +1094,147 @@ function triggerSlideEnterHooks(indexPage) {
   } catch {}
 }
 
+function repairVisibleSliderLayout({ forcePrime = false } = {}) {
+  if (document.hidden) return;
+  const indexPage =
+    document.querySelector("#indexPage:not(.hide)") ||
+    document.querySelector("#homePage:not(.hide)");
+  if (!indexPage) return;
+
+  const slides = Array.from(indexPage.querySelectorAll(".slide"));
+  if (!slides.length) return;
+
+  const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
+  const isPeak = !!cfg.peakSlider;
+  const slidesContainer = indexPage.querySelector("#slides-container");
+  const safeIndex = Math.min(
+    Math.max(Number(getCurrentIndex()) || 0, 0),
+    Math.max(0, slides.length - 1)
+  );
+
+  setCurrentIndex(safeIndex);
+
+  if (slidesContainer) {
+    slidesContainer.classList.remove("peak-shifting");
+    if (isPeak) {
+      slidesContainer.classList.add("peak-mode");
+      if (forcePrime) {
+        slidesContainer.classList.remove("peak-ready");
+        slidesContainer.classList.add("peak-init");
+        try { delete slidesContainer.dataset.peakPrimed; } catch {}
+      }
+    } else {
+      slidesContainer.classList.remove("peak-mode", "peak-ready", "peak-init");
+      try { delete slidesContainer.dataset.peakPrimed; } catch {}
+    }
+  }
+
+  slides.forEach((slide, index) => {
+    try { hardCleanupSlide(slide); } catch {}
+    slide.classList.remove("peak-batch-pending", "peak-snap-in");
+    slide.style.removeProperty("left");
+    slide.style.removeProperty("top");
+
+    const active = index === safeIndex;
+    slide.classList.toggle("active", active);
+
+    if (isPeak) {
+      slide.classList.remove("is-hidden");
+      slide.style.removeProperty("display");
+      slide.style.removeProperty("opacity");
+      return;
+    }
+
+    slide.classList.toggle("is-visible", active);
+    slide.classList.toggle("is-hidden", !active);
+    if (active) {
+      slide.style.removeProperty("display");
+      slide.style.removeProperty("opacity");
+    } else {
+      slide.style.opacity = "0";
+      slide.style.display = "none";
+    }
+  });
+
+  hydrateFirstSlide(indexPage);
+  try { updateSlidePosition(); } catch {}
+
+  if (isPeak) {
+    try { syncPeakStructureNow(indexPage, { forcePrime: forcePrime || !slidesContainer?.classList.contains("peak-ready") }); } catch {}
+  }
+
+  try { updateProgressBarPosition(); } catch {}
+  triggerSlideEnterHooks(indexPage);
+}
+
+let __sliderRepairRafA = 0;
+let __sliderRepairRafB = 0;
+let __sliderRepairForcePrime = false;
+
+function cancelPendingSliderRepair() {
+  if (__sliderRepairRafA) cancelAnimationFrame(__sliderRepairRafA);
+  if (__sliderRepairRafB) cancelAnimationFrame(__sliderRepairRafB);
+  __sliderRepairRafA = 0;
+  __sliderRepairRafB = 0;
+}
+
+function scheduleVisibleSliderRepair({ forcePrime = false } = {}) {
+  if (document.hidden) return;
+  __sliderRepairForcePrime = __sliderRepairForcePrime || !!forcePrime;
+  cancelPendingSliderRepair();
+  __sliderRepairRafA = requestAnimationFrame(() => {
+    __sliderRepairRafA = 0;
+    __sliderRepairRafB = requestAnimationFrame(() => {
+      __sliderRepairRafB = 0;
+      const doForcePrime = __sliderRepairForcePrime;
+      __sliderRepairForcePrime = false;
+      repairVisibleSliderLayout({ forcePrime: doForcePrime });
+    });
+  });
+}
+
+function shouldRepairVisibleSliderOnRestore({ forcePrime = false } = {}) {
+  if (document.hidden) return false;
+
+  const indexPage =
+    document.querySelector("#indexPage:not(.hide)") ||
+    document.querySelector("#homePage:not(.hide)");
+  if (!indexPage) return false;
+
+  const slidesContainer = indexPage.querySelector("#slides-container");
+  if (!slidesContainer || !isVisible(slidesContainer)) return false;
+
+  const slides = Array.from(indexPage.querySelectorAll(".slide"));
+  if (!slides.length) return false;
+
+  const safeIndex = Math.min(
+    Math.max(Number(getCurrentIndex()) || 0, 0),
+    Math.max(0, slides.length - 1)
+  );
+  const activeSlide = slides[safeIndex] || slides.find((slide) => slide.classList.contains("active")) || slides[0];
+  if (!activeSlide) return true;
+  if (!activeSlide.classList.contains("active")) return true;
+
+  const activeRect = activeSlide.getBoundingClientRect?.();
+  if (!activeRect || activeRect.width < 1 || activeRect.height < 1) return true;
+  if (activeSlide.classList.contains("is-hidden")) return true;
+  if (activeSlide.style.display === "none") return true;
+
+  const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
+  if (!cfg.peakSlider) return false;
+
+  if (!slidesContainer.classList.contains("peak-mode")) return true;
+  if (!slidesContainer.classList.contains("peak-ready")) return !!forcePrime;
+  if (activeSlide.style.opacity === "0") return true;
+
+  return false;
+}
+
+function scheduleVisibleSliderRestoreRepair(options = {}) {
+  if (!shouldRepairVisibleSliderOnRestore(options)) return;
+  scheduleVisibleSliderRepair(options);
+}
+
 function startTimerAndRevealPB(indexPage) {
   if (!indexPage) return;
   const pb = indexPage.querySelector(".slide-progress-bar");
@@ -1266,7 +1341,6 @@ export async function slidesInit() {
     return;
   }
   window.__slidesInitRunning = true;
-  window.__shuffleSavedThisLoad = false;
   try {
     await waitAuthWarmupFallback(5000);
   } catch {}
@@ -1284,7 +1358,15 @@ export async function slidesInit() {
     function isQuotaErr(e){ return e && (e.name === 'QuotaExceededError' || e.code === 22); }
 
     function safeLocalGet(key, fallback="[]"){
-      try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+      try {
+        const localValue = localStorage.getItem(key);
+        if (localValue != null) return localValue;
+      } catch {}
+      try {
+        const sessionValue = sessionStorage.getItem(key);
+        if (sessionValue != null) return sessionValue;
+      } catch {}
+      return fallback;
     }
 
     function safeLocalRemove(key){
@@ -1624,44 +1706,51 @@ export async function slidesInit() {
               let history = getShuffleHistory(userId);
               const allSet = new Set(allItemIds);
               history = Array.from(new Set(history.filter((id) => allSet.has(id))));
+              let historyWasReset = false;
               if (history.length >= shuffleSeedLimit) {
                 resetShuffleHistory(userId);
                 history = [];
+                historyWasReset = true;
               }
-              let attempt = 0;
               let pickedIds = [];
-              let updatedHistory = history.slice();
-              while (attempt < 2 && pickedIds.length < remainingSlots) {
-                let unseenIds = allItemIds.filter(
-                  (id) => !updatedHistory.includes(id) && !alreadySelected.has(id)
+              const pickedSet = new Set();
+              const pushFromPool = (poolIds, count) => {
+                if (count <= 0 || !Array.isArray(poolIds) || !poolIds.length) return;
+                const uniquePool = poolIds.filter(
+                  (id) => !alreadySelected.has(id) && !pickedSet.has(id)
                 );
-                if ((unseenIds.length < remainingSlots || updatedHistory.length >= shuffleSeedLimit) && attempt === 0) {
-                  resetShuffleHistory(userId);
-                  updatedHistory = [];
-                  attempt++;
-                  continue;
-                }
-                const shuffled = shuffleArray(unseenIds);
-                const need = remainingSlots - pickedIds.length;
-                pickedIds = pickedIds.concat(shuffled.slice(0, need));
-                break;
-              }
+                if (!uniquePool.length) return;
+                const chosen = shuffleArray(uniquePool).slice(0, count);
+                chosen.forEach((id) => pickedSet.add(id));
+                pickedIds = pickedIds.concat(chosen);
+              };
+
+              const unseenIds = allItemIds.filter(
+                (id) => !history.includes(id) && !alreadySelected.has(id)
+              );
+              pushFromPool(unseenIds, remainingSlots);
+
               if (pickedIds.length < remainingSlots) {
-                const need = remainingSlots - pickedIds.length;
-                const fallbackPool = allItemIds.filter((id) => !alreadySelected.has(id) && !pickedIds.includes(id));
-                pickedIds = pickedIds.concat(fallbackPool.slice(0, need));
-              }
-              const selectedItemsFromShuffle = allItems.filter((item) => pickedIds.includes(item.Id));
-              selectedItems.push(...selectedItemsFromShuffle);
-              if (!window.__shuffleSavedThisLoad) {
-                const newHistory = Array.from(new Set([...history, ...pickedIds])).slice(-shuffleSeedLimit);
-                try {
-                  saveShuffleHistory(userId, newHistory);
-                  console.debug("[JMS] shuffle history kaydedildi:", userId, newHistory.length);
-                } catch (e) {
-                  console.warn("[JMS] shuffle history kaydedilemedi:", e);
+                if (history.length) {
+                  resetShuffleHistory(userId);
+                  history = [];
+                  historyWasReset = true;
                 }
-                window.__shuffleSavedThisLoad = true;
+                const need = remainingSlots - pickedIds.length;
+                const fallbackPool = allItemIds.filter(
+                  (id) => !alreadySelected.has(id) && !pickedSet.has(id)
+                );
+                pushFromPool(fallbackPool, need);
+              }
+              const selectedItemsFromShuffle = allItems.filter((item) => pickedSet.has(item.Id));
+              selectedItems.push(...selectedItemsFromShuffle);
+              const historyBase = historyWasReset ? [] : history;
+              const newHistory = Array.from(new Set([...historyBase, ...pickedIds])).slice(-shuffleSeedLimit);
+              try {
+                saveShuffleHistory(userId, newHistory);
+                console.debug("[JMS] shuffle history kaydedildi:", userId, newHistory.length);
+              } catch (e) {
+                console.warn("[JMS] shuffle history kaydedilemedi:", e);
               }
             }
           } else {
@@ -1704,12 +1793,23 @@ export async function slidesInit() {
   window.__slidesCreated = 0;
 
     const peakBatches = config.peakSlider ? buildPeakCreationBatches(items.length, getPeakDisplayOptions()) : [];
+    const markSlideReadyWhenVisualSyncOpens = (slide) => {
+      if (typeof slide?.__waitForBackdropReady === "function") {
+        slide.__waitForBackdropReady({
+          timeoutMs: config.peakSlider ? 2200 : 1400
+        }).finally(() => {
+          markFirstSlideReady();
+        });
+        return;
+      }
+      markFirstSlideReady();
+    };
     const createItemAt = async (itemIndex, options = {}) => {
       const item = items[itemIndex];
       if (!item) return;
       const slide = await createSlide(item, { insertAt: itemIndex, ...options });
       if (itemIndex === 0) {
-        markFirstSlideReady();
+        markSlideReadyWhenVisualSyncOpens(slide);
       }
       try { annotateDomWithQualityHints(document); } catch {}
       markSlideCreated();
@@ -1726,8 +1826,8 @@ export async function slidesInit() {
       }
     } else {
       const first = items[0];
-      await createSlide(first);
-      markFirstSlideReady();
+      const firstSlide = await createSlide(first);
+      markSlideReadyWhenVisualSyncOpens(firstSlide);
       try { annotateDomWithQualityHints(document); } catch {}
       markSlideCreated();
     }
@@ -1761,7 +1861,13 @@ export async function slidesInit() {
               const idxPage = document.querySelector('#indexPage:not(.hide), #homePage:not(.hide)');
               if (idxPage) syncPeakStructureNow(idxPage);
               const releasePending = () => {
-                createdSlides.forEach((slide) => slide.classList.remove('peak-batch-pending'));
+                createdSlides.forEach((slide) => {
+                  if (typeof slide?.__releasePeakReveal === "function") {
+                    slide.__releasePeakReveal();
+                    return;
+                  }
+                  slide?.classList?.remove('peak-batch-pending');
+                });
               };
               const container = idxPage?.querySelector?.('#slides-container');
               if (container?.classList?.contains('peak-ready')) {
@@ -2015,7 +2121,6 @@ function setupNavigationObserver() {
 
 function initializeSliderOnHome() {
   try { window.__jmsHomeTabPaused = false; } catch {}
-  try { kickDirectorRowsWarmup(); } catch {}
 
   if (!isSliderEnabled()) {
     try { cleanupSlider(); } catch {}
@@ -2196,6 +2301,66 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
 
 (async function robustBoot() {
   try {
+    const INDEXER_INTERVAL_MS = 2 * 60 * 60 * 1000;
+
+    function isIndexerAutoStartEnabled() {
+      try {
+        const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
+        return cfg.enableCollectionIndexerAutoStart !== false;
+      } catch {
+        return true;
+      }
+    }
+
+    function getIndexerAutoStartDelayMs() {
+      try {
+        const cfg = (typeof getConfig === "function" ? getConfig() : config) || {};
+        const raw = Number(cfg.collectionIndexerAutoStartDelayMs);
+        if (Number.isFinite(raw) && raw > 0) {
+          return Math.max(60_000, Math.min(90_000, raw | 0));
+        }
+      } catch {}
+      return 75_000;
+    }
+
+    function clearIndexerAutoStartTimer() {
+      if (!window.__jmsIndexerAutoStartTimer) return;
+      clearTimeout(window.__jmsIndexerAutoStartTimer);
+      window.__jmsIndexerAutoStartTimer = null;
+    }
+
+    function requestIndexerAutoStart(reason = "boot-idle") {
+      if (!isIndexerAutoStartEnabled()) return false;
+      if (!window.__jmsIndexerAutoStartReady) return false;
+      if (document.hidden) return false;
+      if (window.__jmsIndexerAutoStartPending) return true;
+
+      window.__jmsIndexerAutoStartPending = true;
+      idle(() => {
+        Promise.resolve(
+          runIndexerIfDue({ intervalMs: INDEXER_INTERVAL_MS, reason })
+        ).catch(() => {}).finally(() => {
+          window.__jmsIndexerAutoStartPending = false;
+        });
+      });
+      return true;
+    }
+
+    function armIndexerAutoStart(reason = "boot-idle") {
+      if (!isIndexerAutoStartEnabled()) return false;
+      if (window.__jmsIndexerAutoStartReady) {
+        return requestIndexerAutoStart(reason);
+      }
+      if (window.__jmsIndexerAutoStartTimer) return true;
+
+      window.__jmsIndexerAutoStartTimer = setTimeout(() => {
+        window.__jmsIndexerAutoStartTimer = null;
+        window.__jmsIndexerAutoStartReady = true;
+        requestIndexerAutoStart(reason);
+      }, getIndexerAutoStartDelayMs());
+      return true;
+    }
+
     async function bootIndexerOnce() {
       if (window.__JMS_INDEXER_BOOTED__) return;
       window.__JMS_INDEXER_BOOTED__ = true;
@@ -2212,6 +2377,8 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
         });
         window.__JMS_INDEXER_STARTED__ = !!ret?.started;
         if (ret?.started) {
+          clearIndexerAutoStartTimer();
+          window.__jmsIndexerAutoStartReady = true;
           markIndexerRunNow();
         }
       } catch (e) {
@@ -2268,6 +2435,7 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
     }
 
     function scheduleIndexerRetry(delayMs = 2000, reason = "retry") {
+      if (!isIndexerAutoStartEnabled()) return;
       if (window.__jmsIndexerRetryTimer) return;
       window.__jmsIndexerRetryTimer = setTimeout(() => {
         window.__jmsIndexerRetryTimer = null;
@@ -2281,6 +2449,9 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
 
     async function runIndexerIfDue({ intervalMs = 2 * 60 * 60 * 1000, reason = "scheduled" } = {}) {
       try {
+        if (!isIndexerAutoStartEnabled()) {
+          return false;
+        }
         const gate = await getIndexerGateDecision(intervalMs);
         if (!gate.shouldRun) {
           return false;
@@ -2297,6 +2468,8 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
           });
           window.__JMS_INDEXER_STARTED__ = !!ret?.started;
           if (ret?.started) {
+            clearIndexerAutoStartTimer();
+            window.__jmsIndexerAutoStartReady = true;
             if (window.__jmsIndexerRetryTimer) {
               clearTimeout(window.__jmsIndexerRetryTimer);
               window.__jmsIndexerRetryTimer = null;
@@ -2330,34 +2503,49 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
     try { window.__jmsBootIndexer = bootIndexerOnce; } catch {}
 
     (function scheduleIndexerStart() {
-      const INTERVAL_MS = 2 * 60 * 60 * 1000;
-
-      runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "boot-check" });
+      armIndexerAutoStart("boot-idle");
 
       const onReady = () => {
-        runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "all-slides-ready" });
+        requestIndexerAutoStart("all-slides-ready");
       };
 
       document.addEventListener("jms:all-slides-ready", onReady, { once: true });
 
       setTimeout(() => {
-        runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "fallback-timeout" });
+        requestIndexerAutoStart("fallback-timeout");
       }, 10_000);
 
       setInterval(() => {
-        runIndexerIfDue({ intervalMs: INTERVAL_MS, reason: "interval-tick" });
+        if (!window.__jmsIndexerAutoStartReady) {
+          armIndexerAutoStart("interval-arm");
+          return;
+        }
+        requestIndexerAutoStart("interval-tick");
       }, 5 * 60 * 1000);
     })();
 
     if (!window.__jmsIndexerResumeHooksBound) {
       window.__jmsIndexerResumeHooksBound = true;
       document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) scheduleIndexerRetry(1200, "visible-retry");
+        if (document.hidden) return;
+        if (!window.__jmsIndexerAutoStartReady) {
+          armIndexerAutoStart("visible-arm");
+          return;
+        }
+        scheduleIndexerRetry(1200, "visible-retry");
       }, { passive: true });
       window.addEventListener("focus", () => {
+        if (!window.__jmsIndexerAutoStartReady) {
+          armIndexerAutoStart("focus-arm");
+          return;
+        }
         scheduleIndexerRetry(1200, "focus-retry");
       }, { passive: true });
       window.addEventListener("pageshow", () => {
+        if (!window.__jmsIndexerAutoStartReady) {
+          armIndexerAutoStart("pageshow-arm");
+          return;
+        }
         scheduleIndexerRetry(1200, "pageshow-retry");
       }, { passive: true });
     }
@@ -2373,9 +2561,6 @@ function observeWhenHomeReady(cb, maxMs = 20000) {
         stop();
       }, 15000);
     }
-
-    kickDirectorRowsWarmup();
-
     idle(async () => {
       try {
         await waitForStylesReady();
@@ -2405,13 +2590,25 @@ window.addEventListener(
     try {
       updateSlidePosition();
     } catch {}
+    try {
+      if (getConfig()?.peakSlider) scheduleVisibleSliderRepair({ forcePrime: false });
+    } catch {}
   }, 150)
 );
 window.addEventListener("pageshow", () => {
-  try {
-    updateSlidePosition();
-  } catch {}
+  scheduleVisibleSliderRestoreRepair({ forcePrime: true });
 });
+
+if (!window.__sliderRestoreRepairBound) {
+  window.__sliderRestoreRepairBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    scheduleVisibleSliderRestoreRepair({ forcePrime: true });
+  }, { passive: true });
+  window.addEventListener("focus", () => {
+    scheduleVisibleSliderRestoreRepair({ forcePrime: true });
+  }, { passive: true });
+}
 
 window.addEventListener("unhandledrejection", (event) => {
   if (event?.reason?.message && event.reason.message.includes("quality badge")) {

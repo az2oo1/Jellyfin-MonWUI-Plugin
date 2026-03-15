@@ -1635,6 +1635,10 @@ export const languageLabels = {
     tag_philosophy_concepts: "Thèmes Philosophiques",
     tag_franchise_references: "Univers et Franchises",
     tag_action_events: "Événements et Action",
-    tag_general_themes: "Thèmes Généraux"
+    tag_general_themes: "Thèmes Généraux",
+    tag_redemption: "Rédemption et Renouveau",
+    tag_nostalgia: "Nostalgie et Souvenirs",
+    tag_absurd_irony: "Absurdité et Ironie",
+    tag_heroism: "Héroïsme et Sacrifice"
   }
 };

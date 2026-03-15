@@ -1638,6 +1638,10 @@ export const languageLabels = {
     tag_philosophy_concepts: "Philosophical Themes",
     tag_franchise_references: "Franchise and Universe Links",
     tag_action_events: "Major Events and Action",
-    tag_general_themes: "General Themes"
+    tag_general_themes: "General Themes",
+    tag_redemption: "Redemption and Renewal",
+    tag_nostalgia: "Nostalgia and Memories",
+    tag_absurd_irony: "Absurdity and Irony",
+    tag_heroism: "Heroism and Sacrifice"
   },
 };

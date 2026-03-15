@@ -1635,6 +1635,10 @@ export const languageLabels = {
     tag_philosophy_concepts: "Felsefi Temalar",
     tag_franchise_references: "Evren ve Seri Bağlantıları",
     tag_action_events: "Büyük Olaylar ve Aksiyon",
-    tag_general_themes: "Genel Temalar"
+    tag_general_themes: "Genel Temalar",
+    tag_redemption: "Yeniden Doğuş ve Umut",
+    tag_nostalgia: "Nostalji ve Anılar",
+    tag_absurd_irony: "Absürtlük ve İroni",
+    tag_heroism: "Kahramanlık ve Fedakârlık"
   },
 };

@@ -1635,6 +1635,10 @@ export const languageLabels = {
     tag_philosophy_concepts: "Философские Темы",
     tag_franchise_references: "Франшизы и Вселенные",
     tag_action_events: "Крупные События и Экшен",
-    tag_general_themes: "Общие Темы"
+    tag_general_themes: "Общие Темы",
+    tag_redemption: "Искупление и Возрождение",
+    tag_nostalgia: "Ностальгия и Воспоминания",
+    tag_absurd_irony: "Абсурд и Ирония",
+    tag_heroism: "Героизм и Самопожертвование"
   }
 };
