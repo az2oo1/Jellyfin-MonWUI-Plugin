@@ -166,9 +166,9 @@ function buildStarRatingHtml(communityRating) {
       <span class="jms-star-wrapper" aria-label="Community rating">
         <span class="jms-star-box">
           <span class="jms-star-filled" style="clip-path: inset(${100 - ratingPercentage}% 0 0 0);">
-            <i class="fa-solid fa-star fa-lg" data-jms-star="full"></i>
+            <i class="fa-solid fa-star" data-jms-star="full"></i>
           </span>
-          <i class="fa-regular fa-star fa-lg" data-jms-star="empty"></i>
+          <i class="fa-regular fa-star" data-jms-star="empty"></i>
         </span>
       </span>
       <span class="jms-rating-value">${ratingValue}</span>
@@ -183,7 +183,7 @@ function buildTomatoHtml(criticRating) {
 
   return `
     <span class="jms-tomato-container" data-jms-rating="tomato" style="opacity:0; transform:scale(0.9); animation:jmsRatingFadeIn 0.2s ease-out forwards;">
-      ${getTomatoIconHtml({ size: "1.1em" })}
+      ${getTomatoIconHtml({ size: "1.25em" })}
       <span class="jms-tomato-value">${Math.round(n)}</span>
     </span>
   `.trim();
@@ -196,7 +196,7 @@ function buildOfficialHtml(officialRating) {
   if (!v) return "";
   return `
     <span class="jms-official-container" data-jms-rating="official" style="opacity:0; transform:scale(0.9); animation:jmsRatingFadeIn 0.2s ease-out forwards;">
-      <i class="fa-solid fa-user-group fa-lg"></i>
+      <i class="fa-solid fa-user-group"></i>
       <span class="jms-official-value">${v}</span>
     </span>
   `.trim();

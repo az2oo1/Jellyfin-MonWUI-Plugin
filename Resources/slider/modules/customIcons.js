@@ -17,10 +17,9 @@ function getTomatoInlineStyle(size, style = "") {
     `width:${size}`,
     `height:${size}`,
     "display:inline-block",
-    "flex:0 0 auto",
     "object-fit:contain",
     "pointer-events:none",
-    "vertical-align:-0.125em",
+    "vertical-align:-.075em",
     `filter:${TOMATO_ICON_FILTER}`,
     style
   ]);
@@ -48,7 +47,7 @@ export function getRepeatOneIconHtml({ className = "", size = "1.4em", style = "
     `height:${size}`,
     "display:inline-block",
     "flex:0 0 auto",
-    "vertical-align:-0.125em",
+    "vertical-align:-.075em",
     style
   ]);
 

@@ -515,7 +515,7 @@ export function createLanguageContainer({ config, MediaStreams, itemType }) {
   }
 
   if (!hasTurkishAudio && hasTurkishSubtitle) {
-    subtitleLabel = `<i class="fa-solid fa-subtitles"></i> ${config.languageLabels.subtitle}`;
+    subtitleLabel = `<i class="fa-solid fa-closed-captioning"></i> ${config.languageLabels.subtitle}`;
   }
 
   const selectedAudioStream =

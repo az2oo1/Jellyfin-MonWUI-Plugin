@@ -671,7 +671,7 @@ async function updateSingleTrackLyrics(trackId) {
 
       if (musicPlayerState.lyricsCache[trackId]) {
         showNotification(
-          `<i class="fas fa-subtitles"></i> ${config.languageLabels.syncSingle}`,
+          `<i class="fas fa-closed-captioning"></i> ${config.languageLabels.syncSingle}`,
           2000,
           "db"
         );
@@ -681,7 +681,7 @@ async function updateSingleTrackLyrics(trackId) {
   } catch (err) {
     console.error("Şarkı sözü güncelleme hatası:", err);
     showNotification(
-      `<i class="fas fa-subtitles-slash"></i> ${config.languageLabels.syncSingleError}`,
+      `<i class="fas fa-closed-captioning-slash"></i> ${config.languageLabels.syncSingleError}`,
       2000,
       "error"
     );
