@@ -16,10 +16,12 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
     public class TrailersController : ControllerBase
     {
         private readonly IUserManager _users;
+        private readonly TrailerAutomationService _trailerService;
 
-        public TrailersController(IUserManager users)
+        public TrailersController(IUserManager users, TrailerAutomationService trailerService)
         {
             _users = users;
+            _trailerService = trailerService;
         }
         private class JobState
         {
@@ -162,8 +164,8 @@ public IActionResult Run([FromBody] RunRequest req, CancellationToken outerCt)
             return StatusCode(403, new { error = "Script çalıştırma kapalı (AllowScriptExecution=false)." });
 
         var steps = new List<string>();
-        if (req.runDownloader && cfg.EnableTrailerDownloader) steps.Add("trailers.sh");
-        if (req.runUrlNfo && cfg.EnableTrailerUrlNfo) steps.Add("trailersurl.sh");
+        if (req.runDownloader && cfg.EnableTrailerDownloader) steps.Add(TrailerAutomationService.DownloaderStep);
+        if (req.runUrlNfo && cfg.EnableTrailerUrlNfo) steps.Add(TrailerAutomationService.UrlNfoStep);
         if (steps.Count == 0)
             return BadRequest(new { error = "Hiçbir görev etkin değil." });
 
@@ -180,13 +182,22 @@ public IActionResult Run([FromBody] RunRequest req, CancellationToken outerCt)
                     });
                 }
 
-                var envBase = new Dictionary<string, string?>
+                var runOptions = new TrailerAutomationService.TrailerRunOptions
                 {
-                    ["JF_BASE"] = req.jfBase ?? cfg.JFBase,
-                    ["JF_API_KEY"] = req.jfApiKey ?? cfg.JFApiKey,
-                    ["TMDB_API_KEY"] = req.tmdbApiKey ?? cfg.TmdbApiKey,
-                    ["PREFERRED_LANG"] = req.preferredLang ?? cfg.PreferredLang,
-                    ["FALLBACK_LANG"] = req.fallbackLang ?? cfg.FallbackLang
+                    JfBase = req.jfBase ?? cfg.JFBase,
+                    JfApiKey = req.jfApiKey ?? cfg.JFApiKey,
+                    TmdbApiKey = req.tmdbApiKey ?? cfg.TmdbApiKey,
+                    PreferredLang = req.preferredLang ?? cfg.PreferredLang,
+                    FallbackLang = req.fallbackLang ?? cfg.FallbackLang,
+                    IncludeTypes = cfg.IncludeTypes,
+                    PageSize = cfg.PageSize,
+                    SleepSecs = cfg.SleepSecs,
+                    JfUserId = cfg.JFUserId,
+                    OverwritePolicy = !string.IsNullOrWhiteSpace(req.overwritePolicy)
+                        ? req.overwritePolicy!
+                        : MapOverwritePolicy(cfg.OverwritePolicy),
+                    EnableThemeLink = req.enableThemeLink ?? cfg.EnableThemeLink,
+                    ThemeLinkMode = req.themeLinkMode ?? cfg.ThemeLinkMode
                 };
 
                 var job = new JobState
@@ -243,36 +254,24 @@ public IActionResult Run([FromBody] RunRequest req, CancellationToken outerCt)
                             }
                         }
 
-                        if (step == "trailers.sh")
+                        if (step == TrailerAutomationService.DownloaderStep)
                         {
-                            var resName = FindRes("Resources.slider.trailers.sh");
-                            var script = EmbeddedScriptRunner.ExtractResourceToTemp(resName, "trailers.sh");
-
-                            var policyWire = !string.IsNullOrWhiteSpace(req.overwritePolicy)
-                                ? req.overwritePolicy!
-                                : MapOverwritePolicy(cfg.OverwritePolicy);
-                            job.AddLog($"OVERWRITE_POLICY(req)={req.overwritePolicy ?? "<null>"}; cfg={cfg.OverwritePolicy}; wire={policyWire}");
-
-                            var env = new Dictionary<string, string?>(envBase)
-                            {
-                                ["OVERWRITE_POLICY"] = policyWire,
-                                ["ENABLE_THEME_LINK"] = (req.enableThemeLink ?? cfg.EnableThemeLink).ToString(),
-                                ["THEME_LINK_MODE"] = req.themeLinkMode ?? cfg.ThemeLinkMode
-                            };
-
-                            var (code, so, se) = await EmbeddedScriptRunner.RunBashAsync(
-                                script, env, ct: job.Cts.Token, onLine: HandleLine);
-                            job.Results.Add(new { script = "trailers.sh", exitCode = code, stdout = so });
+                            job.AddLog($"OVERWRITE_POLICY(req)={req.overwritePolicy ?? "<null>"}; cfg={cfg.OverwritePolicy}; wire={runOptions.OverwritePolicy}");
                         }
-                        else if (step == "trailersurl.sh")
+
+                        var result = await _trailerService.RunStepAsync(
+                            step,
+                            runOptions,
+                            onLine: HandleLine,
+                            ct: job.Cts.Token);
+
+                        job.Results.Add(new
                         {
-                            var resName = FindRes("Resources.slider.trailersurl.sh");
-                            var script = EmbeddedScriptRunner.ExtractResourceToTemp(resName, "trailersurl.sh");
-
-                            var (code, so, se) = await EmbeddedScriptRunner.RunBashAsync(
-                                script, envBase, ct: job.Cts.Token, onLine: HandleLine);
-                            job.Results.Add(new { script = "trailersurl.sh", exitCode = code });
-                        }
+                            script = result.Script,
+                            exitCode = result.ExitCode,
+                            stdout = result.Stdout,
+                            stderr = result.Stderr
+                        });
 
                         job.Progress01 = StepProgress(currentIndex, steps.Count);
                         job.LastMessage = $"{step} bitti.";
@@ -297,10 +296,8 @@ public IActionResult Run([FromBody] RunRequest req, CancellationToken outerCt)
 public IActionResult Diag()
 {
     var cfg = JMSFusionPlugin.Instance?.Configuration;
-    var asm = typeof(EmbeddedScriptRunner).Assembly;
-    var names = asm.GetManifestResourceNames();
-
-    var hasBash = System.IO.File.Exists("/bin/bash");
+    var hasYtDlp = _trailerService.HasCommand("yt-dlp");
+    var hasFfprobe = _trailerService.HasCommand("ffprobe");
     var tmpOk = true;
     try {
         var p = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "jmsf._probe");
@@ -315,20 +312,14 @@ public IActionResult Diag()
         enableTrailerDownloader = cfg?.EnableTrailerDownloader,
         enableTrailerUrlNfo = cfg?.EnableTrailerUrlNfo,
         tempWritable = tmpOk,
-        hasBash,
-        embeddedResourcesSample = names.Where(n => n.Contains("Resources.slider")).Take(5).ToArray()
+        hasYtDlp,
+        hasFfprobe,
+        managedRunner = true
     });
 }
 
 
         private bool IsAdminUser(object userObj) { return true; }
-
-        private static string FindRes(string tail)
-        {
-            var asm = typeof(EmbeddedScriptRunner).Assembly;
-            return asm.GetManifestResourceNames().First(n => n.EndsWith(tail, StringComparison.OrdinalIgnoreCase));
-        }
-
         private static string MapOverwritePolicy(OverwritePolicy p) =>
             p switch
             {

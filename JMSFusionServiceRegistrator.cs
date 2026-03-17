@@ -1,5 +1,6 @@
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
+using Jellyfin.Plugin.JMSFusion.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.Hosting;
 
@@ -9,6 +10,7 @@ namespace Jellyfin.Plugin.JMSFusion
     {
         public void RegisterServices(IServiceCollection services, IServerApplicationHost applicationHost)
         {
+            services.AddSingleton<TrailerAutomationService>();
             services.AddTransient<IStartupFilter, JMSStartupFilter>();
         }
     }
