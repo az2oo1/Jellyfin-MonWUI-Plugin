@@ -24,8 +24,6 @@ const DEFAULT_ARTWORK = "./slider/src/images/defaultArt.png";
 const DEFAULT_ARTWORK_CSS = `url('${DEFAULT_ARTWORK}')`;
 
 let __topTracksAborter = null;
-const FULLSCREEN_FLIP_DURATION = 420;
-const FULLSCREEN_FLIP_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
 
 function trackGlobalTimeout(id) {
   if (!musicPlayerState.__timeouts) musicPlayerState.__timeouts = new Set();
@@ -855,75 +853,37 @@ function applyFullscreenState(player, fullscreenBtn, enabled) {
 }
 
 function animateFullscreenState(player, fullscreenBtn, enabled) {
-  if (!player || player.classList.contains('style-toggle')) {
-    stopFullscreenAnimation(player);
+  stopFullscreenAnimation(player);
+  if (!player) return;
+
+  if (player.classList.contains('style-toggle')) {
     applyFullscreenState(player, fullscreenBtn, enabled);
     return;
   }
 
-  stopFullscreenAnimation(player);
-
-  const fromRect = player.getBoundingClientRect();
-  player.classList.add('fullscreen-layout-lock');
-  applyFullscreenState(player, fullscreenBtn, enabled);
-  const toRect = player.getBoundingClientRect();
-
-  const deltaX = fromRect.left - toRect.left;
-  const deltaY = fromRect.top - toRect.top;
-  const scaleX = fromRect.width / Math.max(toRect.width, 1);
-  const scaleY = fromRect.height / Math.max(toRect.height, 1);
-
-  const shouldAnimate = [deltaX, deltaY, scaleX, scaleY].every(Number.isFinite)
-    && (
-      Math.abs(deltaX) > 1
-      || Math.abs(deltaY) > 1
-      || Math.abs(scaleX - 1) > 0.01
-      || Math.abs(scaleY - 1) > 0.01
-    );
-
-  if (!shouldAnimate) {
-    player.classList.remove('fullscreen-layout-lock');
-    return;
-  }
-
-  player.style.transition = 'none';
-  player.style.transformOrigin = 'top left';
-  player.style.willChange = 'transform, opacity';
-  player.style.transform = `translate(${deltaX}px, ${deltaY}px) scale(${scaleX}, ${scaleY})`;
-  player.getBoundingClientRect();
-
   let cleaned = false;
+  let unlockFrameA = 0;
+  let unlockFrameB = 0;
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    if (player.__fullscreenAnimationFrame) {
-      try { cancelAnimationFrame(player.__fullscreenAnimationFrame); } catch {}
-      player.__fullscreenAnimationFrame = null;
+    if (unlockFrameA) {
+      try { cancelAnimationFrame(unlockFrameA); } catch {}
+      unlockFrameA = 0;
     }
-    if (player.__fullscreenAnimationTimeout) {
-      try { clearTimeout(player.__fullscreenAnimationTimeout); } catch {}
-      player.__fullscreenAnimationTimeout = null;
+    if (unlockFrameB) {
+      try { cancelAnimationFrame(unlockFrameB); } catch {}
+      unlockFrameB = 0;
     }
-    player.removeEventListener('transitionend', onTransitionEnd);
     player.classList.remove('fullscreen-layout-lock');
-    player.style.transition = '';
-    player.style.transformOrigin = '';
-    player.style.willChange = '';
-    player.style.transform = '';
     player.__fullscreenAnimationCleanup = null;
   };
 
-  const onTransitionEnd = (event) => {
-    if (event.target !== player || event.propertyName !== 'transform') return;
-    cleanup();
-  };
-
   player.__fullscreenAnimationCleanup = cleanup;
-  player.addEventListener('transitionend', onTransitionEnd);
-  player.__fullscreenAnimationTimeout = setTimeout(cleanup, FULLSCREEN_FLIP_DURATION + 80);
-  player.__fullscreenAnimationFrame = requestAnimationFrame(() => {
-    player.style.transition = `transform ${FULLSCREEN_FLIP_DURATION}ms ${FULLSCREEN_FLIP_EASING}, opacity ${FULLSCREEN_FLIP_DURATION}ms ${FULLSCREEN_FLIP_EASING}`;
-    player.style.transform = '';
+  player.classList.add('fullscreen-layout-lock');
+  applyFullscreenState(player, fullscreenBtn, enabled);
+  unlockFrameA = requestAnimationFrame(() => {
+    unlockFrameB = requestAnimationFrame(cleanup);
   });
 }
 
