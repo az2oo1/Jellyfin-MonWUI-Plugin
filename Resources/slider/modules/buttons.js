@@ -351,9 +351,7 @@ async function castToCurrentDevice(itemId) {
   try {
     const config = getConfig();
     const success = await playNow(itemId);
-    if (success) {
-      showNotification(config.languageLabels.castbasarili, 'success');
-    } else {
+    if (!success) {
       showNotification(config.languageLabels.casthata, 'error');
     }
   } catch (error) {

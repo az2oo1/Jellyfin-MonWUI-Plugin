@@ -20,6 +20,7 @@ function getTomatoInlineStyle(size, style = "") {
     "object-fit:contain",
     "pointer-events:none",
     "vertical-align:-.075em",
+    "padding: var(--padding-fa)",
     `filter:${TOMATO_ICON_FILTER}`,
     style
   ]);

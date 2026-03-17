@@ -92,17 +92,44 @@ function __transformStr(t) {
   return `translate3d(${t.tx}px, ${t.ty}px, 0) scale(${t.sx}, ${t.sy})`;
 }
 
+function __ensureModalVisible(root) {
+  try {
+    if (!root) return;
+    const backdropEl = root?.querySelector?.(".jmsdm-backdrop");
+    const cardEl = root?.querySelector?.(".jmsdm-card");
+    root.style.visibility = "visible";
+    root.style.opacity = "1";
+    if (backdropEl) backdropEl.style.opacity = "1";
+    if (cardEl) {
+      cardEl.style.transform = "";
+      cardEl.style.opacity = "1";
+    }
+  } catch {}
+}
+
 async function __animateInFromOrigin(root) {
   try {
-    if (__prefersReducedMotion()) return;
+    if (__prefersReducedMotion()) {
+      __ensureModalVisible(root);
+      return;
+    }
     const originRect = _openOrigin?.rect || null;
-    if (!originRect) return;
+    if (!originRect) {
+      __ensureModalVisible(root);
+      return;
+    }
 
     const backdropEl = root?.querySelector?.(".jmsdm-backdrop");
     const cardEl = root?.querySelector?.(".jmsdm-card");
-    if (!cardEl || !cardEl.getBoundingClientRect) return;
+    if (!cardEl || !cardEl.getBoundingClientRect) {
+      __ensureModalVisible(root);
+      return;
+    }
     const toRect = cardEl.getBoundingClientRect();
-    if (!toRect || toRect.width < 10 || toRect.height < 10) return;
+    if (!toRect || toRect.width < 10 || toRect.height < 10) {
+      __ensureModalVisible(root);
+      return;
+    }
 
     const t = __calcTransform(originRect, toRect);
 
@@ -135,9 +162,7 @@ async function __animateInFromOrigin(root) {
       if (backdropEl) backdropEl.style.opacity = "1";
     }
 
-    cardEl.style.transform = "";
-    cardEl.style.opacity = "1";
-    if (backdropEl) backdropEl.style.opacity = "1";
+    __ensureModalVisible(root);
   } catch {}
 }
 

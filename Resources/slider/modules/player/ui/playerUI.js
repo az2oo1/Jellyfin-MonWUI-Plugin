@@ -24,6 +24,8 @@ const DEFAULT_ARTWORK = "./slider/src/images/defaultArt.png";
 const DEFAULT_ARTWORK_CSS = `url('${DEFAULT_ARTWORK}')`;
 
 let __topTracksAborter = null;
+const FULLSCREEN_FLIP_DURATION = 420;
+const FULLSCREEN_FLIP_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
 
 function trackGlobalTimeout(id) {
   if (!musicPlayerState.__timeouts) musicPlayerState.__timeouts = new Set();
@@ -407,6 +409,7 @@ export function createModernPlayerUI() {
 
   const teardown = () => {
     try { setPageScrollLocked(false); } catch {}
+    try { stopFullscreenAnimation(player); } catch {}
     if (musicPlayerState.nextTracksObserver) {
       try {
         const list = musicPlayerState.nextTracksList;
@@ -535,15 +538,6 @@ export async function updateNextTracks() {
     threshold: 0.1
   });
 
-  musicPlayerState.nextTracksObserver = observer;
-  setupImageLoading(trackElements, observer);
-  setupScrollControls(
-    trackElements,
-    uiElements.list,
-    uiElements.scrollLeft,
-    uiElements.scrollRight
-  );
-
   const scrollControlsContainer = document.createElement('div');
   scrollControlsContainer.className = 'next-tracks-scroll-controls';
   scrollControlsContainer.append(uiElements.scrollLeft, uiElements.scrollRight);
@@ -557,6 +551,17 @@ export async function updateNextTracks() {
   } else {
     nextTracksContainer.append(uiElements.wrapper, uiElements.name);
   }
+
+  musicPlayerState.nextTracksObserver = observer;
+  setupImageLoading(trackElements, observer);
+  requestAnimationFrame(() => {
+    setupScrollControls(
+      trackElements,
+      uiElements.list,
+      uiElements.scrollLeft,
+      uiElements.scrollRight
+    );
+  });
 
   trackGlobalTimeout(setTimeout(() => {
     uiElements.name.classList.remove('hidden');
@@ -791,34 +796,22 @@ export async function updateAlbumArt(artUrl) {
 
 function toggleFullscreenMode() {
   const config = getConfig();
+  const player = document.getElementById('modern-music-player');
+  const fullscreenBtn = document.querySelector('.fullscreen-btn i');
 
   if (!isMobileDevice()) {
     localStorage.setItem('fullscreenMode', 'false');
     updateConfig({ ...config, fullscreenMode: false });
     setPageScrollLocked(false);
-
-    const player = document.getElementById('modern-music-player');
-    player?.classList.remove('fullscreen-mode');
-    loadCSS();
+    applyFullscreenState(player, fullscreenBtn, false);
     return;
   }
 
   const newMode = !config.fullscreenMode;
   localStorage.setItem('fullscreenMode', String(newMode));
-
   updateConfig({ ...config, fullscreenMode: newMode });
-  loadCSS();
-
-  const player = document.getElementById('modern-music-player');
-  if (player) {
-    if (newMode) {
-      player.classList.add('fullscreen-mode');
-      setPageScrollLocked(true);
-    } else {
-      player.classList.remove('fullscreen-mode');
-      setPageScrollLocked(false);
-    }
-  }
+  setPageScrollLocked(newMode);
+  animateFullscreenState(player, fullscreenBtn, newMode);
 }
 
 function initializePlayerStyle() {
@@ -846,20 +839,96 @@ function initializeFullscreen() {
 
   if (!isMobileDevice()) {
     setPageScrollLocked(false);
-    player?.classList.remove('fullscreen-mode');
-    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-maximize';
+    applyFullscreenState(player, fullscreenBtn, false);
     return;
   }
 
-  if (config.fullscreenMode) {
-    player?.classList.add('fullscreen-mode');
-    setPageScrollLocked(true);
-    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-minimize';
-  } else {
-    player?.classList.remove('fullscreen-mode');
-    setPageScrollLocked(false);
-    if (fullscreenBtn) fullscreenBtn.className = 'fa-solid fa-maximize';
+  setPageScrollLocked(!!config.fullscreenMode);
+  applyFullscreenState(player, fullscreenBtn, !!config.fullscreenMode);
+}
+
+function applyFullscreenState(player, fullscreenBtn, enabled) {
+  player?.classList.toggle('fullscreen-mode', enabled);
+  if (fullscreenBtn) {
+    fullscreenBtn.className = enabled ? 'fa-solid fa-minimize' : 'fa-solid fa-maximize';
   }
+}
+
+function animateFullscreenState(player, fullscreenBtn, enabled) {
+  if (!player || player.classList.contains('style-toggle')) {
+    stopFullscreenAnimation(player);
+    applyFullscreenState(player, fullscreenBtn, enabled);
+    return;
+  }
+
+  stopFullscreenAnimation(player);
+
+  const fromRect = player.getBoundingClientRect();
+  player.classList.add('fullscreen-layout-lock');
+  applyFullscreenState(player, fullscreenBtn, enabled);
+  const toRect = player.getBoundingClientRect();
+
+  const deltaX = fromRect.left - toRect.left;
+  const deltaY = fromRect.top - toRect.top;
+  const scaleX = fromRect.width / Math.max(toRect.width, 1);
+  const scaleY = fromRect.height / Math.max(toRect.height, 1);
+
+  const shouldAnimate = [deltaX, deltaY, scaleX, scaleY].every(Number.isFinite)
+    && (
+      Math.abs(deltaX) > 1
+      || Math.abs(deltaY) > 1
+      || Math.abs(scaleX - 1) > 0.01
+      || Math.abs(scaleY - 1) > 0.01
+    );
+
+  if (!shouldAnimate) {
+    player.classList.remove('fullscreen-layout-lock');
+    return;
+  }
+
+  player.style.transition = 'none';
+  player.style.transformOrigin = 'top left';
+  player.style.willChange = 'transform, opacity';
+  player.style.transform = `translate(${deltaX}px, ${deltaY}px) scale(${scaleX}, ${scaleY})`;
+  player.getBoundingClientRect();
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (player.__fullscreenAnimationFrame) {
+      try { cancelAnimationFrame(player.__fullscreenAnimationFrame); } catch {}
+      player.__fullscreenAnimationFrame = null;
+    }
+    if (player.__fullscreenAnimationTimeout) {
+      try { clearTimeout(player.__fullscreenAnimationTimeout); } catch {}
+      player.__fullscreenAnimationTimeout = null;
+    }
+    player.removeEventListener('transitionend', onTransitionEnd);
+    player.classList.remove('fullscreen-layout-lock');
+    player.style.transition = '';
+    player.style.transformOrigin = '';
+    player.style.willChange = '';
+    player.style.transform = '';
+    player.__fullscreenAnimationCleanup = null;
+  };
+
+  const onTransitionEnd = (event) => {
+    if (event.target !== player || event.propertyName !== 'transform') return;
+    cleanup();
+  };
+
+  player.__fullscreenAnimationCleanup = cleanup;
+  player.addEventListener('transitionend', onTransitionEnd);
+  player.__fullscreenAnimationTimeout = setTimeout(cleanup, FULLSCREEN_FLIP_DURATION + 80);
+  player.__fullscreenAnimationFrame = requestAnimationFrame(() => {
+    player.style.transition = `transform ${FULLSCREEN_FLIP_DURATION}ms ${FULLSCREEN_FLIP_EASING}, opacity ${FULLSCREEN_FLIP_DURATION}ms ${FULLSCREEN_FLIP_EASING}`;
+    player.style.transform = '';
+  });
+}
+
+function stopFullscreenAnimation(player) {
+  player?.__fullscreenAnimationCleanup?.();
 }
 
 async function showTopTracksInMainView(tab) {
@@ -916,6 +985,8 @@ async function showTopTracksInMainView(tab) {
       arr.findIndex(t => isSameTrack(t, track)) === idx
     );
 
+    let trackElements = [];
+
     if (tracks.length === 0) {
       const noTracksElement = document.createElement('div');
       noTracksElement.className = 'no-tracks';
@@ -928,7 +999,7 @@ async function showTopTracksInMainView(tab) {
         'info'
       );
     } else {
-      const trackElements = tracks.map((track, index) => {
+      trackElements = tracks.map((track, index) => {
         const { trackElement, coverElement } = createTrackElement(
           track,
           index,
@@ -941,12 +1012,6 @@ async function showTopTracksInMainView(tab) {
         return { track, trackElement, coverElement, index };
       });
 
-      setupScrollControls(
-        trackElements,
-        uiElements.list,
-        uiElements.scrollLeft,
-        uiElements.scrollRight
-      );
     }
 
     const scrollControlsContainer = document.createElement('div');
@@ -961,6 +1026,17 @@ async function showTopTracksInMainView(tab) {
       );
     } else {
       nextTracksContainer.append(uiElements.wrapper, uiElements.name);
+    }
+
+    if (tracks.length > 0) {
+      requestAnimationFrame(() => {
+        setupScrollControls(
+          trackElements,
+          uiElements.list,
+          uiElements.scrollLeft,
+          uiElements.scrollRight
+        );
+      });
     }
 
     trackGlobalTimeout(setTimeout(() => {
@@ -1042,23 +1118,77 @@ function createNextTracksUI() {
 }
 
 function setupScrollControls(trackElements, nextTracksList, scrollLeftBtn, scrollRightBtn) {
-  let scrollIndex = 0;
-  const visibleCount = 4;
-  const itemWidth = 75;
+  if (!nextTracksList || !scrollLeftBtn || !scrollRightBtn) return;
 
-  const updateScroll = () => {
-    nextTracksList.style.transform = `translateX(-${scrollIndex * itemWidth}px)`;
+  if (typeof nextTracksList.__cleanupScrollControls === 'function') {
+    try { nextTracksList.__cleanupScrollControls(); } catch {}
+  }
+
+  nextTracksList.style.transform = '';
+
+  const getMetrics = () => {
+    const wrapper = nextTracksList.parentElement;
+    const firstItem = nextTracksList.querySelector('.next-track-item');
+    const wrapperWidth = wrapper?.clientWidth || nextTracksList.clientWidth || 0;
+    const itemWidth = firstItem?.getBoundingClientRect?.().width || 70;
+    const gap = (() => {
+      try {
+        const styles = window.getComputedStyle(nextTracksList);
+        const raw = styles.columnGap || styles.gap || '0';
+        const parsed = parseFloat(raw);
+        return Number.isFinite(parsed) ? parsed : 0;
+      } catch {
+        return 0;
+      }
+    })();
+    const step = Math.max(itemWidth + gap, wrapperWidth || 0);
+    const maxScrollLeft = Math.max(0, nextTracksList.scrollWidth - wrapperWidth);
+    return { step, maxScrollLeft };
   };
 
-  scrollLeftBtn.onclick = () => {
-    scrollIndex = Math.max(0, scrollIndex - visibleCount);
-    updateScroll();
+  const syncButtons = () => {
+    const { maxScrollLeft } = getMetrics();
+    const pos = Math.max(0, nextTracksList.scrollLeft || 0);
+    const atStart = pos <= 2;
+    const atEnd = pos >= Math.max(0, maxScrollLeft - 2);
+    scrollLeftBtn.style.opacity = atStart ? '0.45' : '1';
+    scrollRightBtn.style.opacity = atEnd ? '0.45' : '1';
+    scrollLeftBtn.style.pointerEvents = atStart ? 'none' : 'auto';
+    scrollRightBtn.style.pointerEvents = atEnd ? 'none' : 'auto';
   };
 
-  scrollRightBtn.onclick = () => {
-    scrollIndex = Math.min(trackElements.length - visibleCount, scrollIndex + visibleCount);
-    updateScroll();
+  const scrollByPage = (direction) => {
+    const { step, maxScrollLeft } = getMetrics();
+    const current = Math.max(0, nextTracksList.scrollLeft || 0);
+    const target = Math.max(0, Math.min(maxScrollLeft, current + (direction * step)));
+    if (typeof nextTracksList.scrollTo === 'function') {
+      nextTracksList.scrollTo({ left: target, behavior: 'smooth' });
+    } else {
+      nextTracksList.scrollLeft = target;
+    }
+    requestAnimationFrame(syncButtons);
   };
+
+  const onScroll = () => syncButtons();
+  const onResize = () => {
+    if (!nextTracksList.isConnected) {
+      window.removeEventListener('resize', onResize);
+      return;
+    }
+    syncButtons();
+  };
+
+  scrollLeftBtn.onclick = () => scrollByPage(-1);
+  scrollRightBtn.onclick = () => scrollByPage(1);
+  nextTracksList.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onResize, { passive: true });
+  nextTracksList.__cleanupScrollControls = () => {
+    try { nextTracksList.removeEventListener('scroll', onScroll); } catch {}
+    try { window.removeEventListener('resize', onResize); } catch {}
+    nextTracksList.__cleanupScrollControls = null;
+  };
+  syncButtons();
+  requestAnimationFrame(syncButtons);
 }
 
 export function destroyModernPlayerUI() {

@@ -1,11 +1,12 @@
 import { getYoutubeEmbedUrl, getProviderUrl, isValidUrl, createTrailerIframe, debounce, getHighResImageUrls, prefetchImages, getHighestQualityBackdropIndex, createImageWarmQueue } from "./utils.js";
-import { updateFavoriteStatus, updatePlayedStatus, fetchItemDetails, goToDetailsPage } from "./api.js";
+import { updateFavoriteStatus, updatePlayedStatus, fetchItemDetails, getSessionInfo } from "./api.js";
 import { getConfig } from "./config.js";
 import { getLanguageLabels, getDefaultLanguage } from "../language/index.js";
 import { createSlidesContainer, createHorizontalGradientOverlay, createLogoContainer, createStatusContainer, createActorSlider, createInfoContainer, createDirectorContainer, createRatingContainer, createLanguageContainer, createMetaContainer, createMainContentContainer, createPlotContainer, createTitleContainer } from "./containerUtils.js";
 import { createButtons, createProviderContainer } from './buttons.js';
 import { withServer, withServerSrcset } from "./jfUrl.js";
 import { createTomatoIconElement } from "./customIcons.js";
+import { openDetailsModal } from "./detailsModal.js";
 
 const S = (u) => withServer(u);
 const config = getConfig();
@@ -643,16 +644,31 @@ async function createSlide(item, options = {}) {
     perSlideObservers.push(ioPreload);
   }
 
-  backdropImg.addEventListener('click', (ev) => {
-  const slideEl = ev.currentTarget.closest('.slide');
-  const sc = document.querySelector('#slides-container');
-  const isPeak = sc?.classList.contains('peak-mode');
-  const isActive = slideEl?.classList.contains('active');
-  if (isPeak && !isActive) {
-    return;
-  }
-  goToDetailsPage(itemId);
-}, { signal });
+  backdropImg.addEventListener('click', async (ev) => {
+    const slideEl = ev.currentTarget.closest('.slide');
+    const sc = document.querySelector('#slides-container');
+    const isPeak = sc?.classList.contains('peak-mode');
+    const isActive = slideEl?.classList.contains('active');
+    if (isPeak && !isActive) {
+      return;
+    }
+
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const preferBackdropIndex = localStorage.getItem("jms_backdrop_index") || highestQualityBackdropIndex || "0";
+    const serverId = getSessionInfo?.()?.serverId || "";
+    try {
+      await openDetailsModal({
+        itemId,
+        serverId,
+        preferBackdropIndex,
+        originEl: ev.currentTarget || slideEl || backdropImg,
+      });
+    } catch (err) {
+      console.warn("openDetailsModal failed (slider click):", err);
+    }
+  }, { signal });
 
   const prevTeardown = slide.__cleanupSlide;
   const teardown = () => {

@@ -1,9 +1,10 @@
-import { makeApiRequest, getSessionInfo, fetchItemDetails, getVideoStreamUrl, playNow, goToDetailsPage, isCurrentUserAdmin, fetchItemsBulk } from "./api.js";
+import { makeApiRequest, getSessionInfo, fetchItemDetails, getVideoStreamUrl, playNow, isCurrentUserAdmin, fetchItemsBulk } from "./api.js";
 import { getConfig, getServerAddress } from "./config.js";
 import { getVideoQualityText } from "./containerUtils.js";
 import { getCurrentVersionFromEnv, compareSemver } from "./update.js";
 import { withServer } from "./jfUrl.js";
 import { faIconHtml } from "./faIcons.js";
+import { openDetailsModal } from "./detailsModal.js";
 
 const config = getConfig();
 
@@ -967,10 +968,15 @@ function getDetailFor(n) {
   });
 
   if (status !== "removed" && n.itemId) {
-    li.addEventListener("click", () => {
+    li.addEventListener("click", async () => {
       markNotificationRead(n.id, { silent: true });
-      closeModal();
-      goToDetailsPage(n.itemId);
+      try {
+        const openPromise = openDetailsModal({ itemId: n.itemId, originEl: li });
+        closeModal();
+        await openPromise;
+      } catch (err) {
+        console.warn("notification details modal open error:", err);
+      }
     });
   }
 

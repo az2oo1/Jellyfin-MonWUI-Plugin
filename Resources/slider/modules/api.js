@@ -16,6 +16,44 @@ const MAX_DOT_GENRE_CACHE = 1200;
 const MAX_PREVIEW_CACHE = 200;
 const MAX_TOMBSTONES = 2000;
 
+function getPlayNowSuccessMessage() {
+  try {
+    const liveConfig = (typeof getConfig === "function" ? getConfig() : null) || config || {};
+    return liveConfig?.languageLabels?.castbasarili || "Oynatma baslatildi";
+  } catch {
+    return "Oynatma baslatildi";
+  }
+}
+
+function showPlayNowSuccessNotification(duration = 3000) {
+  try {
+    const message = getPlayNowSuccessMessage();
+    const existingNotification = document.querySelector(".playback-notification");
+    if (existingNotification) {
+      existingNotification.remove();
+    }
+
+    const notification = document.createElement("div");
+    notification.className = "playback-notification success";
+    notification.innerHTML = `
+      <div class="notification-content">
+        <i class="fa-solid fa-check-circle"></i>
+        <span>${message}</span>
+      </div>
+    `;
+    document.body.appendChild(notification);
+    setTimeout(() => {
+      notification.classList.add("show");
+    }, 10);
+    setTimeout(() => {
+      notification.classList.remove("show");
+      setTimeout(() => {
+        notification.remove();
+      }, 300);
+    }, duration);
+  } catch {}
+}
+
 async function __getGmmp() {
   try {
     if (typeof window !== "undefined" && window.__GMMP?.playTrackById) return window.__GMMP;
@@ -1652,24 +1690,39 @@ export async function playNow(itemId) {
       }
       if (isMusicLeaf && gmmp?.playTrackById) {
         const ok = await gmmp.playTrackById(itemId, { revealPlayer: true }).catch(() => false);
-        if (ok) return true;
+        if (ok) {
+          showPlayNowSuccessNotification();
+          return true;
+        }
       }
       if (isMusicContainer) {
         if (type === "MusicAlbum" && gmmp?.playAlbumById) {
           const ok = await gmmp.playAlbumById(itemId, { revealPlayer: true }).catch(() => false);
-          if (ok) return true;
+          if (ok) {
+            showPlayNowSuccessNotification();
+            return true;
+          }
         }
         if (type === "MusicArtist" && gmmp?.playArtistById) {
           const ok = await gmmp.playArtistById(itemId, { revealPlayer: true }).catch(() => false);
-          if (ok) return true;
+          if (ok) {
+            showPlayNowSuccessNotification();
+            return true;
+          }
         }
         if (type === "Playlist" && gmmp?.playPlaylistById) {
           const ok = await gmmp.playPlaylistById(itemId, { revealPlayer: true }).catch(() => false);
-          if (ok) return true;
+          if (ok) {
+            showPlayNowSuccessNotification();
+            return true;
+          }
         }
         if (type === "Folder" && gmmp?.playFolderById) {
           const ok = await gmmp.playFolderById(itemId, { revealPlayer: true }).catch(() => false);
-          if (ok) return true;
+          if (ok) {
+            showPlayNowSuccessNotification();
+            return true;
+          }
         }
       }
       console.warn("playNow(music): GMMP handler yok", { type });
@@ -1704,6 +1757,7 @@ export async function playNow(itemId) {
         requesterUserId,
         method: "local-direct"
       });
+      showPlayNowSuccessNotification();
       return true;
     }
 
@@ -1760,6 +1814,7 @@ export async function playNow(itemId) {
         window.__jmsLastPlayNowTargetDebug = soft;
         localStorage.setItem("jms:lastPlayNowDebug", JSON.stringify(soft));
       } catch {}
+      showPlayNowSuccessNotification();
       return true;
     }
 

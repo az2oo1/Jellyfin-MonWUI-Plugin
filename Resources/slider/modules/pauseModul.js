@@ -221,6 +221,20 @@ function getItemIdFromDom() {
   return null;
 }
 
+function getRecentPlayNowTargetId(maxAgeMs = 30_000) {
+  try {
+    const dbg = window.__jmsLastPlayNowTargetDebug || null;
+    const id = String(dbg?.itemId || "").trim();
+    const stage = String(dbg?.stage || "").trim().toLowerCase();
+    const at = Number(dbg?.at || 0);
+    if (!id || stage === "error" || !Number.isFinite(at) || at <= 0) return null;
+    if ((Date.now() - at) > maxAgeMs) return null;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
 function getStableItemIdDomFirst() {
   const domId = getItemIdFromDom();
   if (domId) return domId;
@@ -261,10 +275,29 @@ function relaxScanDepth() { _scanDepth = 4; }
 
 function parsePlayableIdFromVideo(videoEl) {
   try {
-    const u = new URL(videoEl?.currentSrc || videoEl?.src || "", location.href);
+    const rawSrc = String(videoEl?.currentSrc || videoEl?.src || "").trim();
+    if (!rawSrc) return null;
+
+    const u = new URL(rawSrc, location.href);
+    const itemId = u.searchParams.get("ItemId") || u.searchParams.get("itemId");
+    if (itemId) return itemId;
+
+    const pathId = u.pathname.match(/\/(?:Videos|Audio)\/([^/?#]+)/i)?.[1];
+    if (pathId) return decodeURIComponent(pathId);
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseMediaSourceIdFromVideo(videoEl) {
+  try {
+    const rawSrc = String(videoEl?.currentSrc || videoEl?.src || "").trim();
+    if (!rawSrc) return null;
+
+    const u = new URL(rawSrc, location.href);
     return (
-      u.searchParams.get("ItemId") ||
-      u.searchParams.get("itemId") ||
       u.searchParams.get("MediaSourceId") ||
       u.searchParams.get("mediaSourceId") ||
       null
@@ -421,6 +454,46 @@ function getUserIdSafe() {
 
 async function getStableItemIdFromSessionsStable(minStableMs = 350){
   return await getStableItemIdViaSessions(minStableMs);
+}
+
+async function resolvePlaybackItemId({ minStableMs = 350 } = {}) {
+  const domId = getItemIdFromDom();
+  const videoId = activeVideo ? parsePlayableIdFromVideo(activeVideo) : null;
+  if (videoId) return videoId;
+
+  const playNowId = getRecentPlayNowTargetId();
+  let stableSessionId = null;
+  let rawSessionId = null;
+
+  try {
+    stableSessionId = await getStableItemIdFromSessionsStable(minStableMs);
+  } catch {}
+
+  try {
+    const snap = await fetchNowPlayingFromSessions();
+    rawSessionId = snap?.itemId || null;
+  } catch {}
+
+  const effectiveSessionId = stableSessionId || rawSessionId || null;
+
+  if (playNowId && playNowId !== domId) {
+    if (effectiveSessionId && effectiveSessionId !== domId && effectiveSessionId !== playNowId) {
+      return effectiveSessionId;
+    }
+    return playNowId;
+  }
+
+  if (stableSessionId && stableSessionId !== domId) return stableSessionId;
+  if (rawSessionId && rawSessionId !== domId) return rawSessionId;
+  if (playNowId) return playNowId;
+  if (stableSessionId) return stableSessionId;
+  if (rawSessionId) return rawSessionId;
+
+  const domFirstId = getStableItemIdDomFirst();
+  if (domFirstId) return domFirstId;
+
+  if (activeVideo) return parseMediaSourceIdFromVideo(activeVideo);
+  return null;
 }
 
 async function fetchFiltersFor(type) {
@@ -2485,12 +2558,7 @@ function hideOverlay(opts = {}) {
     const durationOk = (isFinite(dur) && dur >= MIN_DUR) || (!isFinite(dur) && ct >= BADGE_MIN_CT_SEC);
     if (!durationOk) return false;
 
-    let itemId = getStableItemIdDomFirst();
-    if (!itemId) {
-      const viaSessStable = await getStableItemIdFromSessionsStable(350).catch(() => null);
-      if (viaSessStable) itemId = viaSessStable;
-      if (!itemId && activeVideo) itemId = parsePlayableIdFromVideo(activeVideo);
-    }
+    const itemId = await resolvePlaybackItemId({ minStableMs: 350 }).catch(() => null);
     if (!itemId) return false;
 
     const data = await fetchItemDetailsCached(itemId).catch(() => null);
@@ -2655,18 +2723,16 @@ function hideOverlay(opts = {}) {
         const ok = (isFinite(dur) && dur >= getMinVideoDurationSec()) || (!isFinite(dur) && (video.currentTime || 0) >= 2);
         if (!ok) return;
 
-        ddbg('[pause] paused', { domId: getItemIdFromDom(), stable: getStableItemIdDomFirst(), cpiLast: _cpiLastRawId });
+        ddbg('[pause] paused', {
+          domId: getItemIdFromDom(),
+          stable: getStableItemIdDomFirst(),
+          playNowId: getRecentPlayNowTargetId(),
+          videoId: parsePlayableIdFromVideo(activeVideo),
+          cpiLast: _cpiLastRawId
+        });
 
-        let itemId = getStableItemIdDomFirst();
-        ddbg('[pause] picked itemId=', itemId);
-
-        if (!itemId) {
-          await new Promise(r => setTimeout(r, 220));
-          itemId = await getStableItemIdFromSessionsStable(350).catch(() => null);
-     }
-        if (!itemId) {
-          if (activeVideo) itemId = parsePlayableIdFromVideo(activeVideo);
-        }
+        await new Promise(r => setTimeout(r, 220));
+        const itemId = await resolvePlaybackItemId({ minStableMs: 350 }).catch(() => null);
         if (!itemId) return;
         ddbg('[pause] resolved itemId=', itemId);
 

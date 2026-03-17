@@ -60,17 +60,31 @@ function fmtStr(str, params) {
   return String(str ?? '').replace(/\{(\w+)\}/g, (_, k) => (params[k] ?? ''));
 }
 
+function escapeRegExp(str) {
+  return String(str ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchFirst(text, patterns) {
+  for (const pattern of patterns) {
+    if (!pattern) continue;
+    const m = text.match(pattern);
+    if (m) return m;
+  }
+  return null;
+}
+
 function translateLogLine(line, L) {
   if (!line) return line;
+  const rawLine = String(line);
 
   line = line
-    .replace(/^\[INFO\]/,  L.logInfo)
-    .replace(/^\[WARN\]/,  L.logWarn)
-    .replace(/^\[HATA\]/,  L.logError)
-    .replace(/^\[OK\]/,    L.logOk)
-    .replace(/^\[ATLA\]/,  L.logSkip)
-    .replace(/^\[INDIR\]/, L.logDownload)
-    .replace(/^\[DEBUG\]/, L.logDebug);
+    .replace(/\[INFO\]/g,  L.logInfo)
+    .replace(/\[WARN\]/g,  L.logWarn)
+    .replace(/\[HATA\]/g,  L.logError)
+    .replace(/\[OK\]/g,    L.logOk)
+    .replace(/\[ATLA\]/g,  L.logSkip)
+    .replace(/\[INDIR\]/g, L.logDownload)
+    .replace(/\[DEBUG\]/g, L.logDebug);
 
   const rules = [
     { re: /Bu script bash gerektirir/i, out: L.shRequiresBash },
@@ -90,12 +104,14 @@ function translateLogLine(line, L) {
     { re: /Series TMDb yok|Series TMDb/i, out: L.shSeriesTmdbMissing },
     { re: /Tür desteklenmiyor/i,       out: L.shUnsupportedType },
     { re: /Yol yok/i,                  out: L.shNoPath },
+    { re: /Yazılamayan klasör,\s*atlanıyor:\s*(.+?)\s*->\s*(.+?)\s*\(([^()]*)\)\s*$/i,
+      out: (m) => fmtStr(L.shDirNotWritable, { dir: m[1], name: m[2], year: m[3] }) },
     { re: /Hedefte yetersiz boş alan/i, out: L.shInsufficientSpaceDest },
     { re: /Çalışma klasöründe yetersiz boş alan/i, out: L.shInsufficientSpaceWork },
     { re: /Denenen #(\d+):\s*([a-z]+):([A-Za-z0-9_\-]+)/i,
       out: (m) => fmtStr(L.shTryingCandidate, { n: m[1], site: m[2], key: m[3] }) },
-    { re: /->\s*(.+?)\s*\[([a-z]+):([A-Za-z0-9_\-]+)\]\s*\(source quality\)/i,
-      out: (m) => fmtStr(L.shDownloading, { name: '', year: '', out: m[1], site: m[2], key: m[3] }) },
+    { re: /\[INDIR\]\s*(.+?)\s*\((.*?)\)\s*->\s*(.+?)\s*\[([a-z]+):([A-Za-z0-9_\-]+)\]\s*\((?:best mp4|source quality)\)/i,
+      out: (m) => fmtStr(L.shDownloading, { name: m[1], year: m[2], out: m[3], site: m[4], key: m[5] }) },
     { re: /yt-dlp deneme #(\d+) başarısız/i,
       out: (m) => fmtStr(L.shYtDlpRetryFail, { n: m[1] }) },
     { re: /Diskte yer kalmamış/i, out: L.shNoSpaceLeft },
@@ -106,12 +122,13 @@ function translateLogLine(line, L) {
     { re: /Eklendi ve yenilendi/i,     out: L.shMovedAddedRefreshed },
     { re: /Uygun indirilebilir trailer bulunamadı/i, out: L.shNoDownloadableFound },
     { re: /Geçici dosyalar temizleniyor/i, out: L.shCleaningTemps },
-    { re: new RegExp('^' + L.rxFinishedProcessed + '$', 'i'), out: (m) => fmtStr(L.shFinishedCount, { n: m[1] }) },
-    { re: new RegExp(L.rxSummaryOkFail, 'i'), out: (m) => fmtStr(L.shSummaryLine, { ok: m[1], fail: m[2], skip: '?' }) },
+    { re: /BİTTİ:\s*işlenen\s*=\s*(\d+)/i, out: (m) => fmtStr(L.shFinishedCount, { n: m[1] }) },
+    { re: /ÖZET\s*->\s*indirilen\s*=\s*(\d+)\s*,\s*başarısız\s*=\s*(\d+)(?:\s*,\s*atlanan(?:\(zaten vardı\))?\s*=\s*(\d+))?/i,
+      out: (m) => fmtStr(L.shSummaryLine, { ok: m[1], fail: m[2], skip: m[3] ?? '?' }) },
   ];
 
   for (const rule of rules) {
-    const m = line.match(rule.re);
+    const m = rawLine.match(rule.re) || line.match(rule.re);
     if (m) return typeof rule.out === 'function' ? rule.out(m) : rule.out;
   }
   return line;
@@ -142,6 +159,7 @@ export function createTrailersPanel(config, labels) {
     runNow: labels?.runNow || 'Şimdi Çalıştır',
     saving: labels?.saving || 'Kaydediliyor...',
     running: labels?.running || 'Çalışıyor...',
+    preparing: labels?.preparing || 'Hazırlanıyor...',
     settingsSaved: labels?.settingsSaved || 'Ayarlar kaydedildi.',
     atLeastOneOption: labels?.atLeastOneOption || 'En az bir seçenek işaretlenmeli.',
     done: labels?.done || 'İşlem tamamlandı.',
@@ -206,6 +224,7 @@ export function createTrailersPanel(config, labels) {
     shSeriesTmdbMissing: labels?.shSeriesTmdbMissing || 'Dizi TMDb ID yok',
     shUnsupportedType: labels?.shUnsupportedType || 'Tür desteklenmiyor',
     shNoPath: labels?.shNoPath || 'Yol yok',
+    shDirNotWritable: labels?.shDirNotWritable || 'Yazılamayan klasör, atlanıyor: {dir} -> {name} ({year})',
     shInsufficientSpaceDest: labels?.shInsufficientSpaceDest || 'Hedefte yetersiz boş alan',
     shInsufficientSpaceWork: labels?.shInsufficientSpaceWork || 'Çalışma klasöründe yetersiz boş alan',
     shTryingCandidate: labels?.shTryingCandidate || 'Denenen aday #{n}: {site}:{key}',
@@ -498,31 +517,37 @@ export function createTrailersPanel(config, labels) {
   function parseDownloaderSummary(stdout) {
     let total=0, success=0, fail=0;
     try {
-      const reFinished = new RegExp(L.rxFinishedProcessed, 'i');
-      const reSummary  = new RegExp(L.rxSummaryOkFail, 'i');
-      const mTotal = stdout.match(reFinished);
+      const mTotal = matchFirst(stdout, [
+        /BİTTİ:\s*işlenen\s*=\s*(\d+)/i,
+        new RegExp(L.rxFinishedProcessed, 'i'),
+      ]);
       if (mTotal) total = parseIntSafe(mTotal[1]);
-      const mLine  = stdout.match(reSummary);
+      const mLine  = matchFirst(stdout, [
+        /ÖZET\s*->\s*indirilen\s*=\s*(\d+)\s*,\s*başarısız\s*=\s*(\d+)/i,
+        new RegExp(L.rxSummaryOkFail, 'i'),
+      ]);
       if (mLine) { success = parseIntSafe(mLine[1]); fail = parseIntSafe(mLine[2]); }
     } catch {}
     return { success, failed: fail, total };
   }
 
   function parseUrlNfoSummary(stdout) {
-    const pick = (label) => {
-      const re = new RegExp(label + "\\s*:\\s*(\\d+)", 'i');
-      const m = stdout.match(re);
+    const pick = (...labels) => {
+      const patterns = labels
+        .filter(Boolean)
+        .map((label) => new RegExp(`${escapeRegExp(label)}\\s*:\\s*(\\d+)`, 'i'));
+      const m = matchFirst(stdout, patterns);
       return m ? parseIntSafe(m[1]) : 0;
     };
-    const total = pick(L.urlNfoTotal);
-    const ok = pick(L.urlNfoOk);
-    const notFound = pick(L.urlNfoNotFound);
-    const failWrite = pick(L.urlNfoFailWrite);
-    const failRefresh = pick(L.urlNfoFailRefresh);
-    const noTmdb = pick(L.urlNfoNoTmdb);
-    const noPath = pick(L.urlNfoNoPath);
-    const unsupported = pick(L.urlNfoUnsupported);
-    const misc = pick(L.urlNfoMisc);
+    const total = pick(L.urlNfoTotal, 'Toplam işlenen öğe');
+    const ok = pick(L.urlNfoOk, 'Başarılı (NFO eklendi)');
+    const notFound = pick(L.urlNfoNotFound, 'Trailer bulunamadı');
+    const failWrite = pick(L.urlNfoFailWrite, 'NFO yazma hatası');
+    const failRefresh = pick(L.urlNfoFailRefresh, 'Refresh hatası');
+    const noTmdb = pick(L.urlNfoNoTmdb, 'TMDb ID yok');
+    const noPath = pick(L.urlNfoNoPath, 'Yol (Path) yok');
+    const unsupported = pick(L.urlNfoUnsupported, 'Desteklenmeyen tür');
+    const misc = pick(L.urlNfoMisc, 'Diğer/çeşitli');
     const failed = notFound + failWrite + failRefresh + noTmdb + noPath + unsupported + misc;
     return { success: ok, failed, total };
   }
@@ -591,7 +616,7 @@ export function createTrailersPanel(config, labels) {
         return;
       }
       openProgressUi();
-      updateProgressUi({ running: true, progress: 5, currentStep: 'Hazırlanıyor...' });
+      updateProgressUi({ running: true, progress: 5, currentStep: L.preparing });
 
       const headers = await getAuthHeaders();
       const res = await fetch('/JMSFusion/trailers/run', { method: 'POST', headers, body: JSON.stringify(body) });

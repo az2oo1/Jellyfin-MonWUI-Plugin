@@ -84,22 +84,35 @@ function waitForElement(selector, timeout = 5000) {
 }
 
 export function loadCSS() {
-  const { playerTheme: theme = "dark", playerStyle = "player", fullscreenMode = false } = getConfig();
-  document.querySelectorAll('link[data-jellyfin-player-css]').forEach(l => l.remove());
+  const { playerTheme: theme = "dark", playerStyle = "player" } = getConfig();
+  const expected = new Map([
+    ["base", `./slider/src/${playerStyle}-${theme}.css`],
+  ]);
 
-  const baseLink = document.createElement("link");
-  baseLink.rel = "stylesheet";
-  baseLink.setAttribute("data-jellyfin-player-css", "base");
-  baseLink.href = `./slider/src/${playerStyle}-${theme}.css`;
-  document.head.appendChild(baseLink);
-
-  if (fullscreenMode && isMobileDevice()) {
-    const fsLink = document.createElement("link");
-    fsLink.rel = "stylesheet";
-    fsLink.setAttribute("data-jellyfin-player-css", "fullscreen");
-    fsLink.href = `./slider/src/fullscreen.css`;
-    document.head.appendChild(fsLink);
+  if (isMobileDevice()) {
+    expected.set("fullscreen", "./slider/src/fullscreen.css");
   }
+
+  expected.forEach((href, key) => {
+    let link = document.querySelector(`link[data-jellyfin-player-css="${key}"]`);
+
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.setAttribute("data-jellyfin-player-css", key);
+      document.head.appendChild(link);
+    }
+
+    if (link.getAttribute("href") !== href) {
+      link.href = href;
+    }
+  });
+
+  document.querySelectorAll('link[data-jellyfin-player-css]').forEach(link => {
+    if (!expected.has(link.getAttribute("data-jellyfin-player-css"))) {
+      link.remove();
+    }
+  });
 }
 
 export function isMobileDevice() {
