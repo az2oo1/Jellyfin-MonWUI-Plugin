@@ -13,8 +13,6 @@ An all-in-one JavaScript toolkit for Jellyfin, featuring a customizable Media Sl
 * [✨ Features](#features)
 * [🙏 Acknowledgment to BobHasNoSoul](#BobHasNoSoul)
 * [⚙️ Installation](#install)
-* [🎵 Synchronized Lyrics Script](#lyrics)
-* [🎬 Trailer Scripts](#trailers)
 * [📄 License](#license)
 
 
@@ -122,119 +120,10 @@ To remove **JMSFusion**:
 4. Return to the homepage.
 5. Refresh the page a few times using **Ctrl + F5**.
 
----
-
 ## 💡 Notes
 
 * A hard refresh (**Ctrl + F5**) is required to clear cached assets.
 * It may take a couple of refresh attempts for UI changes to fully apply.
-
----
-
-<a id="lyrics"></a>
-
-## 🎵 Synchronized Lyrics Script
-
-A standalone script to fetch synchronized lyrics from `lrclib.net`.
-
-**Requirements:** `curl`, `jq`, `find`
-
-Filename format: `'artist' - 'track title'`
-
-Install:
-
-```bash
-curl -fsSL -o trailers.sh "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/Resources/slider/lrclib.sh"
-chmod +x lrclib.sh
-```
-
-Usage:
-
-```bash
-sh lrclib.sh /Path/To/Music
-```
-
-Overwrite:
-
-```bash
-sh lrclib.sh /Path/To/Music --overwrite
-```
-
----
-
-<a id="trailers"></a>
-
-## 🎬 Trailer Scripts
-
-Two scripts:
-
-* `trailers.sh` → downloads MP4 trailers
-* `trailersurl.sh` → adds trailer URL into NFO files
-
-Both use TMDb.
-
-### Which one?
-
-* Use `trailers.sh` for **offline MP4 trailers**
-* Use `trailersurl.sh` for **online streaming trailers** (no downloads)
-
-### Features
-
-* Movies + Series support
-* Multilanguage trailer lookup
-* Metadata refresh
-* Summary report
-
-### Requirements
-
-* `curl`, `jq`
-* plus `yt-dlp` + optional `ffprobe` for `trailers.sh`
-
-### Installation
-
-(Commands for major distros included in original text.)
-
-### Get scripts
-
-```bash
-curl -fsSL -o trailers.sh "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/Resources/slider/trailers.sh"
-curl -fsSL -o trailersurl.sh "https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/Resources/slider/trailersurl.sh"
-chmod +x trailers.sh trailersurl.sh
-```
-
-### Environment Variables
-
-(Full table retained, only English content preserved.)
-
----
-
-### Usage
-
-Download trailers:
-
-```bash
-JF_BASE="http://server:8096" \
-JF_API_KEY="KEY" \
-TMDB_API_KEY="TMDB" \
-COOKIES_BROWSER=chrome \
-MIN_FREE_MB=2048 \
-ENABLE_THEME_LINK=1 \
-OVERWRITE_POLICY=if-better \
-./trailers.sh
-```
-
-Add only URL:
-
-```bash
-JF_BASE="http://server:8096" \
-JF_API_KEY="KEY" \
-TMDB_API_KEY="TMDB" \
-./trailersurl.sh
-```
-
-### Systemd Timer
-
-(Service + timer examples retained.)
 
 ---
 
