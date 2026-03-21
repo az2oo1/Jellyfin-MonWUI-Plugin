@@ -91,84 +91,43 @@ The concept of the JMS slider, as well as its integration into Jellyfin’s inde
 
 ## ⚙️ Installation
 
-### Installation with a plugin
+### 📦 Install via Plugin
 
-* Log in to your Jellyfin admin dashboard.
-* Go to the Plugins section.
-* Open the Catalog tab.
-* Add a new repository with this URL:
+Follow these steps to install **JMS-Fusion**:
+
+1. Open your **Jellyfin Dashboard**.
+2. Go to **Plugins → Repositories**.
+3. Add the following repository URL:
 
 ```
 https://raw.githubusercontent.com/G-grbz/Jellyfin-MonWUI-Plugin/main/manifest.json
 ```
 
-* Install **JMS-Fusion**.
-* Restart Jellyfin.
-* Refresh homepage with **Ctrl + F5**.
+4. Navigate to **Plugins → Available**.
+5. Find and install **JMSFusion**.
+6. Restart Jellyfin.
 
-### Manual Installation
+> ⚠️ If the **MonWUI slider** does not appear after installation:
+> Go to the homepage and refresh it a few times using **Ctrl + F5**.
 
-#### Windows
+---
 
-* Extract the archive
-* Run `install.bat` as admin
-* Clear browser cookies
+## ❌ Uninstall
 
-Uninstall: run `uninstall.bat` as admin.
+To remove **JMSFusion**:
 
-#### Linux
+1. Go to **Jellyfin → Plugins**.
+2. Uninstall **JMSFusion**.
+3. Restart Jellyfin.
+4. Return to the homepage.
+5. Refresh the page a few times using **Ctrl + F5**.
 
-```bash
-git clone https://github.com/G-grbz/Jellyfin-MonWUI-Plugin
-cd Jellyfin-MonWUI-Plugin/Resources/slider/
-```
+---
 
-Run installer:
+## 💡 Notes
 
-```bash
-sudo chmod +x install.sh && sudo ./install.sh
-```
-
-Clear browser cookies.
-
-### List Update Script
-
-`listUpdate` updates lists at intervals.
-
-Edit `.env` for configuration.
-
-#### Script Options
-
-* `itemLimit:` Max item count
-* `garantiLimit:` Minimum guaranteed per content type
-* `listLimit:` Max stored old lists
-* `listRefresh:` Refresh interval (ms)
-* `listcustomQueryString:` Custom Jellyfin API parameters
-
-#### Permissions
-
-```bash
-sudo chmod -R a+rw /usr/share/jellyfin/web/slider/list && \
-sudo chmod -R a+rw /usr/share/jellyfin/web/slider/listUpdate
-```
-
-Install deps:
-
-```bash
-cd /usr/share/jellyfin/web/slider/listUpdate && npm install dotenv node-fetch
-```
-
-Run:
-
-```bash
-node updateList.mjs
-```
-
-Uninstall:
-
-```bash
-sudo chmod +x /usr/share/jellyfin/web/slider/uninstall.sh && sudo sh /usr/share/jellyfin/web/slider/uninstall.sh
-```
+* A hard refresh (**Ctrl + F5**) is required to clear cached assets.
+* It may take a couple of refresh attempts for UI changes to fully apply.
 
 ---
 
