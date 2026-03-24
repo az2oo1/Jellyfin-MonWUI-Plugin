@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 using MediaBrowser.Model.Plugins;
 
@@ -60,6 +61,12 @@ namespace Jellyfin.Plugin.JMSFusion
         [JsonPropertyName("fallbackLang")]
         public string FallbackLang { get; set; } = "en-US";
 
+        [JsonPropertyName("trailerMinResolution")]
+        public int TrailerMinResolution { get; set; } = 720;
+
+        [JsonPropertyName("trailerMaxResolution")]
+        public int TrailerMaxResolution { get; set; } = 1080;
+
         [JsonPropertyName("overwritePolicy")]
         [JsonConverter(typeof(JsonStringEnumConverter))]
         public OverwritePolicy OverwritePolicy { get; set; } = OverwritePolicy.Skip;
@@ -79,8 +86,84 @@ namespace Jellyfin.Plugin.JMSFusion
         [JsonPropertyName("sleepSecs")]
         public double SleepSecs { get; set; } = 1.0;
 
+        [JsonPropertyName("maxConcurrentDownloads")]
+        public int MaxConcurrentDownloads { get; set; } = 1;
+
         [JsonPropertyName("jfUserId")]
         public string? JFUserId { get; set; } = null;
+
+        [JsonPropertyName("radioStations")]
+        public List<SharedRadioStationEntry> RadioStations { get; set; } = new();
+
+        [JsonPropertyName("watchlistEntries")]
+        public List<WatchlistEntry> WatchlistEntries { get; set; } = new();
+
+        [JsonPropertyName("watchlistShares")]
+        public List<WatchlistShareEntry> WatchlistShares { get; set; } = new();
+
+        [JsonPropertyName("watchlistRevision")]
+        public long WatchlistRevision { get; set; } = 0;
+    }
+
+    public class SharedRadioStationEntry
+    {
+        public string? Id { get; set; }
+        public string? StationUuid { get; set; }
+        public string? Name { get; set; }
+        public string? Url { get; set; }
+        public string? UrlResolved { get; set; }
+        public string? Homepage { get; set; }
+        public string? Logo { get; set; }
+        public string? LogoUrl { get; set; }
+        public string? ImageUrl { get; set; }
+        public string? Favicon { get; set; }
+        public string? Country { get; set; }
+        public string? CountryCode { get; set; }
+        public string? State { get; set; }
+        public string? Language { get; set; }
+        public string? Tags { get; set; }
+        public string? Codec { get; set; }
+        public int Bitrate { get; set; }
+        public int ClickCount { get; set; }
+        public int Votes { get; set; }
+        public bool Hls { get; set; }
+        public string? Source { get; set; }
+        public string? CreatedAt { get; set; }
+        public string? AddedBy { get; set; }
+        public string? AddedByUserId { get; set; }
+    }
+
+    public class WatchlistEntry
+    {
+        public string? Id { get; set; }
+        public string? ItemId { get; set; }
+        public string? ItemType { get; set; }
+        public string? Name { get; set; }
+        public string? Overview { get; set; }
+        public int? ProductionYear { get; set; }
+        public long? RunTimeTicks { get; set; }
+        public double? CommunityRating { get; set; }
+        public string? OfficialRating { get; set; }
+        public List<string> Genres { get; set; } = new();
+        public string? AlbumArtist { get; set; }
+        public List<string> Artists { get; set; } = new();
+        public string? ParentName { get; set; }
+        public long AddedAtUtc { get; set; }
+        public string? OwnerUserId { get; set; }
+        public string? OwnerUserName { get; set; }
+    }
+
+    public class WatchlistShareEntry
+    {
+        public string? Id { get; set; }
+        public string? WatchlistEntryId { get; set; }
+        public string? ItemId { get; set; }
+        public string? OwnerUserId { get; set; }
+        public string? OwnerUserName { get; set; }
+        public string? TargetUserId { get; set; }
+        public string? TargetUserName { get; set; }
+        public string? Note { get; set; }
+        public long SharedAtUtc { get; set; }
     }
 
     public enum OverwritePolicy

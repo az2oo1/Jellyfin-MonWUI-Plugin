@@ -26,6 +26,9 @@ namespace Jellyfin.Plugin.JMSFusion
             {
                 var logger = app.ApplicationServices.GetRequiredService<ILogger<JMSStartupFilter>>();
                 var env    = app.ApplicationServices.GetRequiredService<IWebHostEnvironment>();
+                var trailerAutomation = app.ApplicationServices.GetRequiredService<TrailerAutomationService>();
+
+                trailerAutomation.StartBackgroundToolBootstrap();
 
                 app.UseMiddleware<PathRewriteMiddleware>();
 

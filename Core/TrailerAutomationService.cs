@@ -1,11 +1,15 @@
 using System.Diagnostics;
 using System.Globalization;
-using System.Reflection;
+using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
+using MediaBrowser.Common.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.JMSFusion.Core;
 
@@ -19,6 +23,13 @@ public sealed class TrailerAutomationService
     private const double DefaultSleepSecs = 1.0;
     private const string DefaultPreferredLang = "tr-TR";
     private const string DefaultFallbackLang = "en-US";
+    private const int DefaultMaxConcurrentDownloads = 1;
+    private const int MinConcurrentDownloads = 1;
+    private const int MaxConcurrentDownloads = 8;
+    private const int DefaultTrailerMinResolution = 720;
+    private const int DefaultTrailerMaxResolution = 1080;
+    private const int MinTrailerResolution = 640;
+    private const int MaxTrailerResolution = 2160;
     private const string DefaultIncludeLangsWide = "tr,en,hi,de,ru,fr,it,es,ar,fa,pt,zh,ja,ko,nl,pl,sv,cs,uk,el,null";
     private const string DefaultWorkDirName = "trailers-dl";
     private const string DefaultToolDirName = "jmsfusion-tools";
@@ -27,12 +38,19 @@ public sealed class TrailerAutomationService
     private const long MinTrailerBytes = 2L * 1024L * 1024L;
     private const double MinTrailerDurationSeconds = 20d;
     private const long MinFreeMb = 1024;
+    private const string YtDlpLatestReleaseApi = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+    private const string DenoLatestReleaseApi = "https://api.github.com/repos/denoland/deno/releases/latest";
 
     private static readonly HttpClient Http = CreateHttpClient();
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
+    private static readonly SemaphoreSlim ToolBootstrapLock = new(1, 1);
+
+    private readonly IApplicationPaths _applicationPaths;
+    private readonly ILogger<TrailerAutomationService> _logger;
+    private ManagedToolSuite? _cachedManagedTools;
 
     public sealed class TrailerRunOptions
     {
@@ -41,9 +59,12 @@ public sealed class TrailerAutomationService
         public string TmdbApiKey { get; init; } = "CHANGE_ME";
         public string PreferredLang { get; init; } = DefaultPreferredLang;
         public string FallbackLang { get; init; } = DefaultFallbackLang;
+        public int TrailerMinResolution { get; init; } = DefaultTrailerMinResolution;
+        public int TrailerMaxResolution { get; init; } = DefaultTrailerMaxResolution;
         public string IncludeTypes { get; init; } = DefaultIncludeTypes;
         public int PageSize { get; init; } = DefaultPageSize;
         public double SleepSecs { get; init; } = DefaultSleepSecs;
+        public int MaxConcurrentDownloads { get; init; } = DefaultMaxConcurrentDownloads;
         public string? JfUserId { get; init; }
         public string OverwritePolicy { get; init; } = "skip";
         public int EnableThemeLink { get; init; }
@@ -79,6 +100,7 @@ public sealed class TrailerAutomationService
         private readonly StringBuilder _stdout = new();
         private readonly StringBuilder _stderr = new();
         private readonly Action<string, bool>? _onLine;
+        private readonly object _sync = new();
 
         public StepLogger(Action<string, bool>? onLine)
         {
@@ -88,16 +110,22 @@ public sealed class TrailerAutomationService
         public void Out(string line)
         {
             line ??= string.Empty;
-            _stdout.AppendLine(line);
-            _onLine?.Invoke(line, false);
+            lock (_sync)
+            {
+                _stdout.AppendLine(line);
+                _onLine?.Invoke(line, false);
+            }
         }
 
         public void Err(string line)
         {
             line ??= string.Empty;
-            _stderr.AppendLine(line);
-            _stdout.AppendLine(line);
-            _onLine?.Invoke(line, false);
+            lock (_sync)
+            {
+                _stderr.AppendLine(line);
+                _stdout.AppendLine(line);
+                _onLine?.Invoke(line, false);
+            }
         }
 
         public string Stdout => _stdout.ToString();
@@ -113,6 +141,7 @@ public sealed class TrailerAutomationService
         public string IncludeTypes => string.IsNullOrWhiteSpace(Options.IncludeTypes) ? DefaultIncludeTypes : Options.IncludeTypes;
         public int PageSize => Options.PageSize > 0 ? Options.PageSize : DefaultPageSize;
         public double SleepSecs => Options.SleepSecs >= 0 ? Options.SleepSecs : DefaultSleepSecs;
+        public int MaxConcurrentDownloads => NormalizeMaxConcurrentDownloads(Options.MaxConcurrentDownloads);
         public string WorkDir => Path.Combine(Path.GetTempPath(), DefaultWorkDirName);
     }
 
@@ -148,6 +177,31 @@ public sealed class TrailerAutomationService
     private sealed record TmdbVideo(string? Site, string? Type, string? Key);
 
     private sealed record ProcessRunResult(int ExitCode, string Stdout, string Stderr);
+    private sealed record GitHubReleaseResponse(
+        [property: JsonPropertyName("tag_name")] string? TagName,
+        [property: JsonPropertyName("assets")] List<GitHubReleaseAsset>? Assets);
+
+    private sealed record GitHubReleaseAsset(
+        [property: JsonPropertyName("name")] string? Name,
+        [property: JsonPropertyName("browser_download_url")] string? BrowserDownloadUrl);
+
+    private sealed record ManagedToolState(
+        string Name,
+        string InstallPath,
+        string? InstalledVersion,
+        string? LatestVersion,
+        bool Ready);
+
+    private sealed record ManagedToolSuite(
+        string ToolRoot,
+        ManagedToolState YtDlp,
+        ManagedToolState Deno);
+
+    public TrailerAutomationService(IApplicationPaths applicationPaths, ILogger<TrailerAutomationService> logger)
+    {
+        _applicationPaths = applicationPaths;
+        _logger = logger;
+    }
 
     private static HttpClient CreateHttpClient()
     {
@@ -190,10 +244,35 @@ public sealed class TrailerAutomationService
     {
         if (string.Equals(commandName, "yt-dlp", StringComparison.OrdinalIgnoreCase))
         {
-            return !string.IsNullOrWhiteSpace(ResolveYtDlpCommand());
+            return !string.IsNullOrWhiteSpace(GetManagedToolPath("yt-dlp")) || CommandExists("yt-dlp");
+        }
+
+        if (string.Equals(commandName, "deno", StringComparison.OrdinalIgnoreCase))
+        {
+            return !string.IsNullOrWhiteSpace(GetManagedToolPath("deno")) || CommandExists("deno");
         }
 
         return CommandExists(commandName);
+    }
+
+    public void StartBackgroundToolBootstrap()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var tools = await EnsureManagedToolSuiteAsync(CancellationToken.None).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "[JMSFusion] Tool bootstrap hazır. yt-dlp={YtDlpVersion} deno={DenoVersion} root={ToolRoot}",
+                    FirstNonEmpty(tools.YtDlp.InstalledVersion, "unknown"),
+                    FirstNonEmpty(tools.Deno.InstalledVersion, "unknown"),
+                    tools.ToolRoot);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[JMSFusion] Tool bootstrap başarısız.");
+            }
+        });
     }
 
     private async Task<TrailerStepResult> RunDownloaderAsync(TrailerRunOptions options, StepLogger logger, CancellationToken ct)
@@ -211,12 +290,21 @@ public sealed class TrailerAutomationService
             return new TrailerStepResult(DownloaderStep, 2, logger.Stdout, logger.Stderr);
         }
 
-        var ytDlpCommand = ResolveYtDlpCommand();
-        if (string.IsNullOrWhiteSpace(ytDlpCommand))
+        var tools = await EnsureManagedToolSuiteAsync(ct).ConfigureAwait(false);
+        if (!tools.YtDlp.Ready || !IsExecutableAvailable(tools.YtDlp.InstallPath))
         {
-            logger.Err("Hata: yt-dlp kurulu değil.");
+            logger.Err("Hata: yt-dlp hazırlanamadı.");
             return new TrailerStepResult(DownloaderStep, 1, logger.Stdout, logger.Stderr);
         }
+
+        if (!tools.Deno.Ready || !IsExecutableAvailable(tools.Deno.InstallPath))
+        {
+            logger.Err("Hata: deno hazırlanamadı.");
+            return new TrailerStepResult(DownloaderStep, 1, logger.Stdout, logger.Stderr);
+        }
+
+        var ytDlpCommand = tools.YtDlp.InstallPath;
+        var jsRuntimeArg = $"deno:{tools.Deno.InstallPath}";
 
         var hasFfprobe = CommandExists("ffprobe");
         if (!hasFfprobe)
@@ -235,11 +323,12 @@ public sealed class TrailerAutomationService
         }
 
         var resolvedUserId = await ResolveUserIdAsync(ctx, ct).ConfigureAwait(false);
-        var seenDirs = new HashSet<string>(StringComparer.Ordinal);
-        var seriesTmdbCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        var itemDetailsCache = new Dictionary<string, JellyfinItem?>(StringComparer.OrdinalIgnoreCase);
-        var imdbMapCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        var trailerCache = new Dictionary<string, IReadOnlyList<TrailerCandidate>>(StringComparer.OrdinalIgnoreCase);
+        var seenDirs = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        var handledDirs = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        var seriesTmdbCache = new ConcurrentDictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var itemDetailsCache = new ConcurrentDictionary<string, JellyfinItem?>(StringComparer.OrdinalIgnoreCase);
+        var imdbMapCache = new ConcurrentDictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var trailerCache = new ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>>(StringComparer.OrdinalIgnoreCase);
 
         var start = 0;
         var processed = 0;
@@ -247,6 +336,7 @@ public sealed class TrailerAutomationService
         var fail = 0;
         var skip = 0;
         var total = 0;
+        logger.Out($"[INFO] Eşzamanlı indirme limiti: {ctx.MaxConcurrentDownloads}");
 
         while (true)
         {
@@ -263,47 +353,56 @@ public sealed class TrailerAutomationService
             total = page.TotalRecordCount;
             logger.Out($"JMSF::TOTAL={total}");
 
-            foreach (var item in page.Items ?? Enumerable.Empty<JellyfinItem>())
+            var parallelOptions = new ParallelOptions
             {
-                ct.ThrowIfCancellationRequested();
+                CancellationToken = ct,
+                MaxDegreeOfParallelism = ctx.MaxConcurrentDownloads
+            };
 
-                var path = FirstNonEmpty(item.Path, item.MediaSources?.FirstOrDefault()?.Path);
-                if (string.IsNullOrWhiteSpace(path))
+            await Parallel.ForEachAsync(
+                page.Items ?? Enumerable.Empty<JellyfinItem>(),
+                parallelOptions,
+                async (item, itemCt) =>
                 {
-                    continue;
-                }
+                    var path = FirstNonEmpty(item.Path, item.MediaSources?.FirstOrDefault()?.Path);
+                    if (string.IsNullOrWhiteSpace(path))
+                    {
+                        return;
+                    }
 
-                var outcome = await ProcessDownloadItemAsync(
-                    ctx,
-                    resolvedUserId,
-                    item,
-                    path,
-                    ytDlpCommand,
-                    overwritePolicy,
-                    hasFfprobe,
-                    seenDirs,
-                    seriesTmdbCache,
-                    itemDetailsCache,
-                    imdbMapCache,
-                    trailerCache,
-                    ct).ConfigureAwait(false);
+                    var outcome = await ProcessDownloadItemAsync(
+                        ctx,
+                        resolvedUserId,
+                        item,
+                        path,
+                        ytDlpCommand,
+                        jsRuntimeArg,
+                        overwritePolicy,
+                        hasFfprobe,
+                        seenDirs,
+                        handledDirs,
+                        seriesTmdbCache,
+                        itemDetailsCache,
+                        imdbMapCache,
+                        trailerCache,
+                        itemCt).ConfigureAwait(false);
 
-                processed++;
-                logger.Out($"JMSF::DONE={processed}");
+                    var done = Interlocked.Increment(ref processed);
+                    logger.Out($"JMSF::DONE={done}");
 
-                switch (outcome)
-                {
-                    case DownloadOutcome.Ok:
-                        ok++;
-                        break;
-                    case DownloadOutcome.Skip:
-                        skip++;
-                        break;
-                    default:
-                        fail++;
-                        break;
-                }
-            }
+                    switch (outcome)
+                    {
+                        case DownloadOutcome.Ok:
+                            Interlocked.Increment(ref ok);
+                            break;
+                        case DownloadOutcome.Skip:
+                            Interlocked.Increment(ref skip);
+                            break;
+                        default:
+                            Interlocked.Increment(ref fail);
+                            break;
+                    }
+                }).ConfigureAwait(false);
 
             start += ctx.PageSize;
             if (start >= total)
@@ -313,7 +412,7 @@ public sealed class TrailerAutomationService
         }
 
         logger.Out("[INFO] Geçici dosyalar temizleniyor...");
-        CleanupTemporaryFiles(seenDirs, ctx.WorkDir);
+        CleanupTemporaryFiles(seenDirs.Keys, ctx.WorkDir);
         logger.Out(string.Empty);
         logger.Out($"BİTTİ: işlenen={processed}");
         logger.Out($"ÖZET -> indirilen={ok}, başarısız={fail}, atlanan(zaten vardı)={skip}");
@@ -331,10 +430,10 @@ public sealed class TrailerAutomationService
         }
 
         var resolvedUserId = await ResolveUserIdAsync(ctx, ct).ConfigureAwait(false);
-        var seriesTmdbCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        var itemDetailsCache = new Dictionary<string, JellyfinItem?>(StringComparer.OrdinalIgnoreCase);
-        var imdbMapCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        var trailerCache = new Dictionary<string, IReadOnlyList<TrailerCandidate>>(StringComparer.OrdinalIgnoreCase);
+        var seriesTmdbCache = new ConcurrentDictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var itemDetailsCache = new ConcurrentDictionary<string, JellyfinItem?>(StringComparer.OrdinalIgnoreCase);
+        var imdbMapCache = new ConcurrentDictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var trailerCache = new ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>>(StringComparer.OrdinalIgnoreCase);
 
         var start = 0;
         var totalProcessed = 0;
@@ -456,13 +555,15 @@ public sealed class TrailerAutomationService
         JellyfinItem item,
         string path,
         string ytDlpCommand,
+        string jsRuntimeArg,
         string overwritePolicy,
         bool hasFfprobe,
-        HashSet<string> seenDirs,
-        Dictionary<string, string?> seriesTmdbCache,
-        Dictionary<string, JellyfinItem?> itemDetailsCache,
-        Dictionary<string, string?> imdbMapCache,
-        Dictionary<string, IReadOnlyList<TrailerCandidate>> trailerCache,
+        ConcurrentDictionary<string, byte> seenDirs,
+        ConcurrentDictionary<string, byte> handledDirs,
+        ConcurrentDictionary<string, string?> seriesTmdbCache,
+        ConcurrentDictionary<string, JellyfinItem?> itemDetailsCache,
+        ConcurrentDictionary<string, string?> imdbMapCache,
+        ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>> trailerCache,
         CancellationToken ct)
     {
         var itemId = item.Id ?? string.Empty;
@@ -471,7 +572,13 @@ public sealed class TrailerAutomationService
         var year = item.ProductionYear?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
         var dir = ResolveItemDirectory(path, itemType);
         var outFile = Path.Combine(dir, "trailer.mp4");
-        seenDirs.Add(dir);
+        seenDirs.TryAdd(dir, 0);
+
+        if (!handledDirs.TryAdd(dir, 0))
+        {
+            ctx.Log.Out($"[ATLA] Aynı klasör bu çalıştırmada zaten işlendi: {dir}  ->  {name} ({year})");
+            return DownloadOutcome.Skip;
+        }
 
         if (!CheckDirectoryWritable(dir))
         {
@@ -592,21 +699,13 @@ public sealed class TrailerAutomationService
 
             var ytdlp = await RunProcessAsync(
                 ytDlpCommand,
-                [
-                    "--force-ipv4",
-                    "--no-part",
-                    "--no-progress",
-                    "--no-playlist",
-                    "--merge-output-format", "mp4",
-                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                    "-o", tmpPath,
-                    url
-                ],
+                BuildYtDlpArgs(jsRuntimeArg, tmpPath, url, ctx.Options.TrailerMinResolution, ctx.Options.TrailerMaxResolution),
                 ct).ConfigureAwait(false);
 
             if (ytdlp.ExitCode != 0 || !File.Exists(tmpPath))
             {
                 ctx.Log.Out($"[WARN] yt-dlp deneme #{tried} başarısız.");
+                LogProcessFailure(ctx.Log, ytdlp);
                 if (GetFreeMb(dir) <= 0)
                 {
                     ctx.Log.Out($"[HATA] Diskte yer kalmamış. Film atlanıyor: {name} ({year})");
@@ -705,10 +804,10 @@ public sealed class TrailerAutomationService
         string? resolvedUserId,
         JellyfinItem item,
         string path,
-        Dictionary<string, string?> seriesTmdbCache,
-        Dictionary<string, JellyfinItem?> itemDetailsCache,
-        Dictionary<string, string?> imdbMapCache,
-        Dictionary<string, IReadOnlyList<TrailerCandidate>> trailerCache,
+        ConcurrentDictionary<string, string?> seriesTmdbCache,
+        ConcurrentDictionary<string, JellyfinItem?> itemDetailsCache,
+        ConcurrentDictionary<string, string?> imdbMapCache,
+        ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>> trailerCache,
         CancellationToken ct)
     {
         var itemId = item.Id ?? string.Empty;
@@ -836,8 +935,8 @@ public sealed class TrailerAutomationService
         string itemType,
         string? tmdb,
         string path,
-        Dictionary<string, string?> seriesTmdbCache,
-        Dictionary<string, JellyfinItem?> itemDetailsCache,
+        ConcurrentDictionary<string, string?> seriesTmdbCache,
+        ConcurrentDictionary<string, JellyfinItem?> itemDetailsCache,
         CancellationToken ct)
     {
         if (itemType is not ("Series" or "Season" or "Episode"))
@@ -883,7 +982,7 @@ public sealed class TrailerAutomationService
     private async Task<IReadOnlyList<TrailerCandidate>> GetMovieCandidatesAsync(
         StepContext ctx,
         string tmdbId,
-        Dictionary<string, IReadOnlyList<TrailerCandidate>> cache,
+        ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>> cache,
         CancellationToken ct)
     {
         var cacheKey = $"movie:{tmdbId}";
@@ -912,7 +1011,7 @@ public sealed class TrailerAutomationService
         string tvId,
         int? seasonNumber,
         int? episodeNumber,
-        Dictionary<string, IReadOnlyList<TrailerCandidate>> cache,
+        ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>> cache,
         CancellationToken ct)
     {
         var cacheKey = $"tv:{tvId}:s{seasonNumber?.ToString(CultureInfo.InvariantCulture) ?? "-"}:e{episodeNumber?.ToString(CultureInfo.InvariantCulture) ?? "-"}";
@@ -954,7 +1053,7 @@ public sealed class TrailerAutomationService
 
     private async Task<IReadOnlyList<TrailerCandidate>> GetFirstCandidateSetAsync(
         string cacheKey,
-        Dictionary<string, IReadOnlyList<TrailerCandidate>> cache,
+        ConcurrentDictionary<string, IReadOnlyList<TrailerCandidate>> cache,
         IEnumerable<string> routes,
         CancellationToken ct)
     {
@@ -976,7 +1075,7 @@ public sealed class TrailerAutomationService
     private async Task<string?> ResolveMovieTmdbFromImdbAsync(
         StepContext ctx,
         string imdbId,
-        Dictionary<string, string?> cache,
+        ConcurrentDictionary<string, string?> cache,
         CancellationToken ct)
     {
         if (cache.TryGetValue(imdbId, out var cached))
@@ -1032,7 +1131,7 @@ public sealed class TrailerAutomationService
         StepContext ctx,
         string? resolvedUserId,
         string itemId,
-        Dictionary<string, JellyfinItem?> cache,
+        ConcurrentDictionary<string, JellyfinItem?> cache,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(itemId))
@@ -1118,13 +1217,13 @@ public sealed class TrailerAutomationService
         error = string.Empty;
         if (string.IsNullOrWhiteSpace(ctx.Options.JfApiKey) || string.Equals(ctx.Options.JfApiKey, "CHANGE_ME", StringComparison.OrdinalIgnoreCase))
         {
-            error = "Hata: JF_API_KEY ve TMDB_API_KEY ayarla.";
+            error = "Hata: Jellyfin oturum tokeni alınamadı.";
             return false;
         }
 
         if (requireTmdb && (string.IsNullOrWhiteSpace(ctx.Options.TmdbApiKey) || string.Equals(ctx.Options.TmdbApiKey, "CHANGE_ME", StringComparison.OrdinalIgnoreCase)))
         {
-            error = "Hata: JF_API_KEY ve TMDB_API_KEY ayarla.";
+            error = "Hata: TMDB_API_KEY ayarla.";
             return false;
         }
 
@@ -1141,14 +1240,74 @@ public sealed class TrailerAutomationService
             TmdbApiKey = options.TmdbApiKey?.Trim() ?? string.Empty,
             PreferredLang = string.IsNullOrWhiteSpace(options.PreferredLang) ? DefaultPreferredLang : options.PreferredLang.Trim(),
             FallbackLang = string.IsNullOrWhiteSpace(options.FallbackLang) ? DefaultFallbackLang : options.FallbackLang.Trim(),
+            TrailerMinResolution = NormalizeTrailerMinResolution(options.TrailerMinResolution, options.TrailerMaxResolution),
+            TrailerMaxResolution = NormalizeTrailerMaxResolution(options.TrailerMinResolution, options.TrailerMaxResolution),
             IncludeTypes = string.IsNullOrWhiteSpace(options.IncludeTypes) ? DefaultIncludeTypes : options.IncludeTypes.Trim(),
             PageSize = options.PageSize > 0 ? options.PageSize : DefaultPageSize,
             SleepSecs = options.SleepSecs >= 0 ? options.SleepSecs : DefaultSleepSecs,
+            MaxConcurrentDownloads = NormalizeMaxConcurrentDownloads(options.MaxConcurrentDownloads),
             JfUserId = string.IsNullOrWhiteSpace(options.JfUserId) ? null : options.JfUserId.Trim(),
             OverwritePolicy = string.IsNullOrWhiteSpace(options.OverwritePolicy) ? "skip" : options.OverwritePolicy.Trim(),
             EnableThemeLink = options.EnableThemeLink,
             ThemeLinkMode = string.IsNullOrWhiteSpace(options.ThemeLinkMode) ? "symlink" : options.ThemeLinkMode.Trim().ToLowerInvariant()
         };
+    }
+
+    private static List<string> BuildYtDlpArgs(
+        string jsRuntimeArg,
+        string tmpPath,
+        string url,
+        int minResolution,
+        int maxResolution)
+    {
+        var ytDlpArgs = new List<string>
+        {
+            "--force-ipv4",
+            "--no-part",
+            "--no-progress",
+            "--no-playlist",
+            "--js-runtimes", jsRuntimeArg
+        };
+
+        ytDlpArgs.Add("--merge-output-format");
+        ytDlpArgs.Add("mp4");
+        ytDlpArgs.Add("-f");
+        ytDlpArgs.Add(BuildPreferredTrailerFormatSelector(minResolution, maxResolution));
+        ytDlpArgs.Add("-o");
+        ytDlpArgs.Add(tmpPath);
+        ytDlpArgs.Add(url);
+        return ytDlpArgs;
+    }
+
+    private static string BuildPreferredTrailerFormatSelector(int minResolution, int maxResolution)
+        => $"bestvideo[ext=mp4][height<={maxResolution}][height>={minResolution}]+bestaudio[ext=m4a]/best[ext=mp4][height<={maxResolution}][height>={minResolution}]";
+
+    private static void LogProcessFailure(StepLogger log, ProcessRunResult result)
+    {
+        if (!string.IsNullOrWhiteSpace(result.Stderr))
+        {
+            foreach (var line in TailLines(result.Stderr, 6))
+            {
+                log.Out($"[WARN] yt-dlp stderr: {line}");
+            }
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.Stdout))
+        {
+            foreach (var line in TailLines(result.Stdout, 4))
+            {
+                log.Out($"[WARN] yt-dlp çıktı: {line}");
+            }
+        }
+    }
+
+    private static IEnumerable<string> TailLines(string text, int maxLines)
+    {
+        return text
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .TakeLast(Math.Max(1, maxLines));
     }
 
     private static bool TryNormalizeOverwritePolicy(string? value, out string normalized)
@@ -1161,6 +1320,29 @@ public sealed class TrailerAutomationService
 
         normalized = string.Empty;
         return false;
+    }
+
+    private static int NormalizeMaxConcurrentDownloads(int value)
+        => Math.Clamp(value > 0 ? value : DefaultMaxConcurrentDownloads, MinConcurrentDownloads, MaxConcurrentDownloads);
+
+    private static int NormalizeTrailerMinResolution(int minResolution, int maxResolution)
+    {
+        var normalizedMin = ClampTrailerResolution(minResolution, DefaultTrailerMinResolution);
+        var normalizedMax = ClampTrailerResolution(maxResolution, DefaultTrailerMaxResolution);
+        return Math.Min(normalizedMin, normalizedMax);
+    }
+
+    private static int NormalizeTrailerMaxResolution(int minResolution, int maxResolution)
+    {
+        var normalizedMin = ClampTrailerResolution(minResolution, DefaultTrailerMinResolution);
+        var normalizedMax = ClampTrailerResolution(maxResolution, DefaultTrailerMaxResolution);
+        return Math.Max(normalizedMin, normalizedMax);
+    }
+
+    private static int ClampTrailerResolution(int value, int fallback)
+    {
+        var effective = value > 0 ? value : fallback;
+        return Math.Clamp(effective, MinTrailerResolution, MaxTrailerResolution);
     }
 
     private static string ResolveItemDirectory(string path, string itemType)
@@ -1717,56 +1899,444 @@ public sealed class TrailerAutomationService
         return sb.ToString();
     }
 
-    private static string? ResolveYtDlpCommand()
+    private string? GetManagedToolPath(string toolName)
     {
-        foreach (var candidate in GetBundledYtDlpCandidates())
+        var fileName = GetManagedToolFileName(toolName);
+        if (string.IsNullOrWhiteSpace(fileName))
         {
-            var staged = StageExecutableFromFile(candidate, "yt-dlp");
-            if (!string.IsNullOrWhiteSpace(staged))
+            return null;
+        }
+
+        var candidate = Path.Combine(ResolveManagedToolRoot(), fileName);
+        return File.Exists(candidate) ? candidate : null;
+    }
+
+    private string ResolveManagedToolRoot()
+    {
+        var candidates = new[]
+        {
+            CombinePath(_applicationPaths.DataPath, "jmsfusion", DefaultToolDirName),
+            CombinePath(_applicationPaths.ProgramDataPath, "jmsfusion", DefaultToolDirName),
+            CombinePath(_applicationPaths.PluginsPath, "JMSFusion", DefaultToolDirName),
+            CombinePath(_applicationPaths.CachePath, "jmsfusion", DefaultToolDirName),
+            CombinePath(_applicationPaths.TempDirectory, DefaultToolDirName),
+            Path.Combine(Path.GetTempPath(), DefaultToolDirName)
+        };
+
+        foreach (var candidate in candidates.Where(path => !string.IsNullOrWhiteSpace(path)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (TryEnsureDirectory(candidate, out _) && CheckDirectoryWritable(candidate))
             {
-                return staged;
+                return candidate;
             }
         }
 
-        var stagedResource = StageExecutableFromResource(
-            ["Resources.slider.yt-dlp.yt-dlp", ".slider.yt-dlp.yt-dlp"],
-            "yt-dlp");
-        if (!string.IsNullOrWhiteSpace(stagedResource))
+        return Path.Combine(Path.GetTempPath(), DefaultToolDirName);
+    }
+
+    private async Task<ManagedToolSuite> EnsureManagedToolSuiteAsync(CancellationToken ct)
+    {
+        var cached = _cachedManagedTools;
+        if (cached != null && AreManagedToolsReady(cached))
         {
-            return stagedResource;
+            return cached;
         }
 
-        return CommandExists("yt-dlp") ? "yt-dlp" : null;
-    }
-
-    private static IEnumerable<string> GetBundledYtDlpCandidates()
-    {
-        var assemblyDir = Path.GetDirectoryName(typeof(TrailerAutomationService).Assembly.Location) ?? string.Empty;
-        var currentDir = Directory.GetCurrentDirectory();
-
-        return new[]
+        await ToolBootstrapLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            Path.Combine(currentDir, "Resources", "slider", "yt-dlp", "yt-dlp"),
-            Path.Combine(assemblyDir, "Resources", "slider", "yt-dlp", "yt-dlp"),
-            Path.Combine(AppContext.BaseDirectory, "Resources", "slider", "yt-dlp", "yt-dlp")
-        }.Distinct(StringComparer.OrdinalIgnoreCase);
+            cached = _cachedManagedTools;
+            if (cached != null && AreManagedToolsReady(cached))
+            {
+                return cached;
+            }
+
+            var toolRoot = ResolveManagedToolRoot();
+            if (!TryEnsureDirectory(toolRoot, out var dirError))
+            {
+                throw new IOException($"Tool dizini oluşturulamadı: {toolRoot}. {dirError}");
+            }
+
+            var ytDlp = await EnsureManagedYtDlpAsync(toolRoot, ct).ConfigureAwait(false);
+            var deno = await EnsureManagedDenoAsync(toolRoot, ct).ConfigureAwait(false);
+            var suite = new ManagedToolSuite(toolRoot, ytDlp, deno);
+
+            if (AreManagedToolsReady(suite))
+            {
+                _cachedManagedTools = suite;
+            }
+            else
+            {
+                _cachedManagedTools = null;
+            }
+
+            return suite;
+        }
+        finally
+        {
+            ToolBootstrapLock.Release();
+        }
     }
 
-    private static string? StageExecutableFromFile(string sourcePath, string fileName)
+    private static bool AreManagedToolsReady(ManagedToolSuite suite)
+    {
+        return suite.YtDlp.Ready &&
+               suite.Deno.Ready &&
+               IsExecutableAvailable(suite.YtDlp.InstallPath) &&
+               IsExecutableAvailable(suite.Deno.InstallPath);
+    }
+
+    private static bool IsExecutableAvailable(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        if (File.Exists(path))
+        {
+            return true;
+        }
+
+        return path.IndexOf(Path.DirectorySeparatorChar) < 0 &&
+               path.IndexOf(Path.AltDirectorySeparatorChar) < 0 &&
+               CommandExists(path);
+    }
+
+    private async Task<ManagedToolState> EnsureManagedYtDlpAsync(string toolRoot, CancellationToken ct)
+    {
+        var installPath = Path.Combine(toolRoot, GetManagedToolFileName("yt-dlp"));
+        var installedVersion = await TryGetYtDlpVersionAsync(installPath, ct).ConfigureAwait(false);
+        var release = await TryGetLatestGitHubReleaseAsync(YtDlpLatestReleaseApi, ct).ConfigureAwait(false);
+        var latestVersion = NormalizeVersion(release?.TagName);
+
+        if (!string.IsNullOrWhiteSpace(installedVersion) &&
+            string.Equals(installedVersion, latestVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            return new ManagedToolState("yt-dlp", installPath, installedVersion, latestVersion, true);
+        }
+
+        var downloadUrl = ResolveYtDlpDownloadUrl(release);
+        if (!string.IsNullOrWhiteSpace(downloadUrl))
+        {
+            await DownloadBinaryAsync(downloadUrl!, installPath, ct).ConfigureAwait(false);
+            installedVersion = await TryGetYtDlpVersionAsync(installPath, ct).ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(installedVersion) && File.Exists(installPath))
+        {
+            return new ManagedToolState("yt-dlp", installPath, installedVersion, latestVersion, true);
+        }
+
+        if (CommandExists("yt-dlp"))
+        {
+            var fallbackVersion = await TryGetYtDlpVersionAsync("yt-dlp", ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(fallbackVersion))
+            {
+                return new ManagedToolState("yt-dlp", "yt-dlp", fallbackVersion, latestVersion, true);
+            }
+        }
+
+        return new ManagedToolState("yt-dlp", installPath, installedVersion, latestVersion, false);
+    }
+
+    private async Task<ManagedToolState> EnsureManagedDenoAsync(string toolRoot, CancellationToken ct)
+    {
+        var installPath = Path.Combine(toolRoot, GetManagedToolFileName("deno"));
+        var installedVersion = await TryGetDenoVersionAsync(installPath, ct).ConfigureAwait(false);
+        var release = await TryGetLatestGitHubReleaseAsync(DenoLatestReleaseApi, ct).ConfigureAwait(false);
+        var latestVersion = NormalizeVersion(release?.TagName);
+
+        if (!string.IsNullOrWhiteSpace(installedVersion) &&
+            string.Equals(installedVersion, latestVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            return new ManagedToolState("deno", installPath, installedVersion, latestVersion, true);
+        }
+
+        var downloadUrl = ResolveDenoDownloadUrl(release);
+        if (!string.IsNullOrWhiteSpace(downloadUrl))
+        {
+            await DownloadZipExecutableAsync(downloadUrl!, GetManagedToolFileName("deno"), installPath, ct).ConfigureAwait(false);
+            installedVersion = await TryGetDenoVersionAsync(installPath, ct).ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(installedVersion) && IsSupportedDenoVersion(installedVersion) && File.Exists(installPath))
+        {
+            return new ManagedToolState("deno", installPath, installedVersion, latestVersion, true);
+        }
+
+        if (CommandExists("deno"))
+        {
+            var fallbackVersion = await TryGetDenoVersionAsync("deno", ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(fallbackVersion) && IsSupportedDenoVersion(fallbackVersion))
+            {
+                return new ManagedToolState("deno", "deno", fallbackVersion, latestVersion, true);
+            }
+        }
+
+        return new ManagedToolState("deno", installPath, installedVersion, latestVersion, false);
+    }
+
+    private static string GetManagedToolFileName(string toolName)
+    {
+        var normalized = toolName.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "yt-dlp" when OperatingSystem.IsWindows() => "yt-dlp.exe",
+            "yt-dlp" => "yt-dlp",
+            "deno" when OperatingSystem.IsWindows() => "deno.exe",
+            "deno" => "deno",
+            _ => normalized
+        };
+    }
+
+    private static string CombinePath(string? root, params string[] segments)
+    {
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return string.Empty;
+        }
+
+        return Path.Combine([root, .. segments]);
+    }
+
+    private static string NormalizeVersion(string? version)
+    {
+        return string.IsNullOrWhiteSpace(version)
+            ? string.Empty
+            : version.Trim().TrimStart('v', 'V');
+    }
+
+    private static bool IsSupportedDenoVersion(string version)
+    {
+        var normalized = NormalizeVersion(version);
+        return Version.TryParse(normalized, out var parsed) && parsed >= new Version(2, 0, 0);
+    }
+
+    private async Task<GitHubReleaseResponse?> TryGetLatestGitHubReleaseAsync(string apiUrl, CancellationToken ct)
     {
         try
         {
-            if (!File.Exists(sourcePath))
+            using var req = new HttpRequestMessage(HttpMethod.Get, apiUrl);
+            req.Headers.TryAddWithoutValidation("User-Agent", "JMSFusion/2.0");
+            req.Headers.TryAddWithoutValidation("Accept", "application/vnd.github+json");
+
+            using var resp = await Http.SendAsync(req, ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("[JMSFusion] Release sorgusu başarısız: {ApiUrl} status={StatusCode}", apiUrl, (int)resp.StatusCode);
+                return null;
+            }
+
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            return await JsonSerializer.DeserializeAsync<GitHubReleaseResponse>(stream, JsonOptions, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[JMSFusion] Release bilgisi alınamadı: {ApiUrl}", apiUrl);
+            return null;
+        }
+    }
+
+    private static string? ResolveYtDlpDownloadUrl(GitHubReleaseResponse? release)
+    {
+        if (release?.Assets == null || release.Assets.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var assetName in GetPreferredYtDlpAssetNames())
+        {
+            var asset = release.Assets.FirstOrDefault(a => string.Equals(a.Name, assetName, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(asset?.BrowserDownloadUrl))
+            {
+                return asset.BrowserDownloadUrl;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> GetPreferredYtDlpAssetNames()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            yield return RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.Arm64 => "yt-dlp_arm64.exe",
+                Architecture.X86 => "yt-dlp_x86.exe",
+                _ => "yt-dlp.exe"
+            };
+            yield break;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            yield return RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.Arm64 => "yt-dlp_linux_aarch64",
+                Architecture.Arm => "yt-dlp_linux_armv7l",
+                _ => "yt-dlp_linux"
+            };
+            yield return "yt-dlp";
+            yield break;
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            yield return "yt-dlp_macos";
+            yield break;
+        }
+
+        yield return OperatingSystem.IsWindows() ? "yt-dlp.exe" : "yt-dlp";
+    }
+
+    private static string? ResolveDenoDownloadUrl(GitHubReleaseResponse? release)
+    {
+        if (release?.Assets == null || release.Assets.Count == 0)
+        {
+            return null;
+        }
+
+        var assetName = GetPreferredDenoAssetName();
+        if (string.IsNullOrWhiteSpace(assetName))
+        {
+            return null;
+        }
+
+        var asset = release.Assets.FirstOrDefault(a => string.Equals(a.Name, assetName, StringComparison.OrdinalIgnoreCase));
+        return asset?.BrowserDownloadUrl;
+    }
+
+    private static string? GetPreferredDenoAssetName()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            return RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.X64 => "deno-x86_64-unknown-linux-gnu.zip",
+                Architecture.Arm64 => "deno-aarch64-unknown-linux-gnu.zip",
+                _ => null
+            };
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            return RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.Arm64 => "deno-aarch64-apple-darwin.zip",
+                Architecture.X64 => "deno-x86_64-apple-darwin.zip",
+                _ => null
+            };
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            return RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.Arm64 => "deno-aarch64-pc-windows-msvc.zip",
+                Architecture.X64 => "deno-x86_64-pc-windows-msvc.zip",
+                _ => null
+            };
+        }
+
+        return null;
+    }
+
+    private async Task DownloadBinaryAsync(string url, string installPath, CancellationToken ct)
+    {
+        var tempPath = Path.Combine(Path.GetDirectoryName(installPath) ?? ".", $".{Path.GetFileName(installPath)}.{Guid.NewGuid():N}.tmp");
+        TryDeleteFile(tempPath);
+
+        try
+        {
+            await DownloadToFileAsync(url, tempPath, ct).ConfigureAwait(false);
+            EnsureExecutable(tempPath);
+            if (!TryMoveReplace(tempPath, installPath))
+            {
+                throw new IOException($"Tool dosyası güncellenemedi: {installPath}");
+            }
+
+            EnsureExecutable(installPath);
+        }
+        finally
+        {
+            TryDeleteFile(tempPath);
+        }
+    }
+
+    private async Task DownloadZipExecutableAsync(string url, string entryName, string installPath, CancellationToken ct)
+    {
+        var tempZip = Path.Combine(Path.GetDirectoryName(installPath) ?? ".", $".{Path.GetFileName(installPath)}.{Guid.NewGuid():N}.zip");
+        var tempExtract = Path.Combine(Path.GetDirectoryName(installPath) ?? ".", $".{Path.GetFileName(installPath)}.{Guid.NewGuid():N}.tmp");
+        TryDeleteFile(tempZip);
+        TryDeleteFile(tempExtract);
+
+        try
+        {
+            await DownloadToFileAsync(url, tempZip, ct).ConfigureAwait(false);
+
+            using var archive = ZipFile.OpenRead(tempZip);
+            var entry = archive.Entries
+                .FirstOrDefault(item => string.Equals(Path.GetFileName(item.FullName), entryName, StringComparison.OrdinalIgnoreCase));
+
+            if (entry == null)
+            {
+                throw new FileNotFoundException($"Zip içinde beklenen dosya yok: {entryName}");
+            }
+
+            entry.ExtractToFile(tempExtract, overwrite: true);
+            EnsureExecutable(tempExtract);
+
+            if (!TryMoveReplace(tempExtract, installPath))
+            {
+                throw new IOException($"Zip tool dosyası güncellenemedi: {installPath}");
+            }
+
+            EnsureExecutable(installPath);
+        }
+        finally
+        {
+            TryDeleteFile(tempZip);
+            TryDeleteFile(tempExtract);
+        }
+    }
+
+    private async Task DownloadToFileAsync(string url, string destinationPath, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.TryAddWithoutValidation("User-Agent", "JMSFusion/2.0");
+
+        using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+
+        await using var input = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        await using var output = File.Create(destinationPath);
+        await input.CopyToAsync(output, ct).ConfigureAwait(false);
+    }
+
+    private async Task<string?> TryGetYtDlpVersionAsync(string commandPath, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(commandPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var result = await RunProcessAsync(commandPath, ["--version"], timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode != 0)
             {
                 return null;
             }
 
-            var targetDir = Path.Combine(Path.GetTempPath(), DefaultToolDirName);
-            Directory.CreateDirectory(targetDir);
-            var targetPath = Path.Combine(targetDir, fileName);
-            File.Copy(sourcePath, targetPath, overwrite: true);
-            EnsureExecutable(targetPath);
-            return targetPath;
+            var version = result.Stdout
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
+
+            return NormalizeVersion(version);
         }
         catch
         {
@@ -1774,36 +2344,34 @@ public sealed class TrailerAutomationService
         }
     }
 
-    private static string? StageExecutableFromResource(IEnumerable<string> suffixCandidates, string fileName)
+    private async Task<string?> TryGetDenoVersionAsync(string commandPath, CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(commandPath))
+        {
+            return null;
+        }
+
         try
         {
-            var assembly = typeof(TrailerAutomationService).Assembly;
-            var resourceName = assembly.GetManifestResourceNames()
-                .FirstOrDefault(name => suffixCandidates.Any(suffix => name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)));
-
-            if (string.IsNullOrWhiteSpace(resourceName))
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var result = await RunProcessAsync(commandPath, ["--version"], timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode != 0)
             {
                 return null;
             }
 
-            var targetDir = Path.Combine(Path.GetTempPath(), DefaultToolDirName);
-            Directory.CreateDirectory(targetDir);
-            var targetPath = Path.Combine(targetDir, fileName);
+            var line = result.Stdout
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
 
-            using var source = assembly.GetManifestResourceStream(resourceName);
-            if (source == null)
+            if (string.IsNullOrWhiteSpace(line))
             {
                 return null;
             }
 
-            using (var destination = File.Create(targetPath))
-            {
-                source.CopyTo(destination);
-            }
-
-            EnsureExecutable(targetPath);
-            return targetPath;
+            var match = Regex.Match(line, @"^deno\s+([^\s]+)", RegexOptions.IgnoreCase);
+            return match.Success ? NormalizeVersion(match.Groups[1].Value) : null;
         }
         catch
         {
