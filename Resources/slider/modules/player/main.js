@@ -30,6 +30,73 @@ export async function ensureGmmpInit({ show = true } = {}) {
   }
 }
 
+export async function destroyGmmp({ reason = "manual" } = {}) {
+  try {
+    const [
+      stateMod,
+      playbackMod,
+      progressMod,
+      mediaSessionMod,
+      controlsMod,
+      playlistModalMod,
+      playerUiMod,
+      artistModalMod,
+      genreFilterMod,
+      notificationMod
+    ] = await Promise.all([
+      import("./core/state.js").catch(() => null),
+      import("./player/playback.js").catch(() => null),
+      import("./player/progress.js").catch(() => null),
+      import("./core/mediaSession.js").catch(() => null),
+      import("./ui/controls.js").catch(() => null),
+      import("./ui/playlistModal.js").catch(() => null),
+      import("./ui/playerUI.js").catch(() => null),
+      import("./ui/artistModal.js").catch(() => null),
+      import("./ui/genreFilterModal.js").catch(() => null),
+      import("./ui/notification.js").catch(() => null)
+    ]);
+
+    const musicPlayerState = stateMod?.musicPlayerState;
+    if (!musicPlayerState) return false;
+
+    await playbackMod?.stopPlayback?.({ resetSource: true }).catch(() => false);
+
+    try { progressMod?.cleanupProgressControls?.(); } catch {}
+    try { progressMod?.cleanupMediaSession?.(); } catch {}
+    try { mediaSessionMod?.cleanupMediaSession?.(); } catch {}
+    try { controlsMod?.destroyControls?.(); } catch {}
+    try { playlistModalMod?.destroyPlaylistModal?.(); } catch {}
+    try { genreFilterMod?.closeModalSafe?.(); } catch {}
+    try { artistModalMod?.destroyArtistModal?.(); } catch {}
+    try { playerUiMod?.destroyModernPlayerUI?.(); } catch {}
+
+    [
+      "#gmmp-radio-modal",
+      "#music-stats-modal"
+    ].forEach((selector) => {
+      try { document.querySelector(selector)?.remove?.(); } catch {}
+    });
+
+    try { notificationMod?.destroyNotificationSystem?.(); } catch {}
+
+    musicPlayerState.isPlayerVisible = false;
+    musicPlayerState.modernPlayer = null;
+    musicPlayerState.favoriteBtn = null;
+    musicPlayerState.playlistModal = null;
+    musicPlayerState.playlistItemsContainer = null;
+    musicPlayerState.playlistSearchInput = null;
+    musicPlayerState.radioModal = null;
+    musicPlayerState.mediaSessionInitialized = false;
+    try { musicPlayerState.selectedTracks?.clear?.(); } catch {}
+    musicPlayerState.selectedTracks = new Set();
+
+    return true;
+  } catch (err) {
+    console.warn("GMMP destroy failed:", { reason, err });
+    return false;
+  }
+}
+
 let stylesInjected = false;
 function ensurePointerStylesInjected() {
   if (stylesInjected) return;
@@ -227,6 +294,7 @@ if (typeof window !== "undefined") {
   Object.assign(window.__GMMP, {
     playTrackById,
     playAlbumById,
-    ensureInit: ensureGmmpInit
+    ensureInit: ensureGmmpInit,
+    destroy: destroyGmmp
   });
 }

@@ -6,6 +6,7 @@ import { showNotification } from "../ui/notification.js";
 import { updateModernTrackInfo, playTrack } from "../player/playback.js";
 import { updatePlaylistModal } from "../ui/playlistModal.js";
 import { makeApiRequest } from "../../api.js";
+import { isRadioTrack } from "./radio.js";
 
 const config = getConfig();
 const BATCH_SIZE = config.gruplimit;
@@ -339,7 +340,17 @@ export async function saveCurrentPlaylistToJellyfin(
     return;
   }
 
-  const itemIds = tracksToSave.map((track) => track.Id);
+  const playableTracks = tracksToSave.filter((track) => !isRadioTrack(track));
+  if (!playableTracks.length) {
+    showNotification(
+      `<i class="fas fa-info-circle"></i> ${config.languageLabels.radioSaveNotSupported || "Radyo istasyonlari Jellyfin oynatma listesine kaydedilemez"}`,
+      2500,
+      "addlist"
+    );
+    return;
+  }
+
+  const itemIds = playableTracks.map((track) => track.Id);
   const userId = window.ApiClient.getCurrentUserId();
 
   try {
@@ -347,8 +358,8 @@ export async function saveCurrentPlaylistToJellyfin(
       const existingItems = await getPlaylistItems(existingPlaylistId);
       const existingItemIds = new Set(existingItems.map((item) => item.Id));
 
-      const alreadyInPlaylist = tracksToSave.filter((track) => existingItemIds.has(track.Id));
-      const tracksToActuallyAdd = tracksToSave.filter((track) => !existingItemIds.has(track.Id));
+      const alreadyInPlaylist = playableTracks.filter((track) => existingItemIds.has(track.Id));
+      const tracksToActuallyAdd = playableTracks.filter((track) => !existingItemIds.has(track.Id));
 
       if (alreadyInPlaylist.length > 0) {
         const names = alreadyInPlaylist.map((track) => track.Name);

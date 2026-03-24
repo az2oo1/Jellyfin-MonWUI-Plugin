@@ -1,6 +1,7 @@
 import { musicPlayerState } from "../core/state.js";
 import { handleSongEnd } from "./playback.js";
 import { updateSyncedLyrics } from "../lyrics/lyrics.js";
+import { getConfig } from "../../config.js";
 
 let uiEvtCtrl = null;
 let mediaCtrl = null;
@@ -10,6 +11,10 @@ let isClick = false;
 let dragStartX = 0;
 let dragStartTime = 0;
 let lastUpdateTime = 0;
+
+function getLiveLabel() {
+  return getConfig()?.languageLabels?.radioLiveLabel || "LIVE";
+}
 
 function resetUiEvtCtrl() {
   if (uiEvtCtrl) {
@@ -34,6 +39,10 @@ export function formatTime(seconds) {
 }
 
 function getEffectiveDuration() {
+  if (musicPlayerState.isLiveStream) {
+    return Number.NaN;
+  }
+
   const { audio } = musicPlayerState;
 
   if (audio && isFinite(audio.duration) && audio.duration > 0) {
@@ -47,6 +56,7 @@ function getEffectiveDuration() {
 
 function updateMediaPositionState() {
   if ("mediaSession" in navigator && musicPlayerState.audio) {
+    if (musicPlayerState.isLiveStream) return;
     try {
       navigator.mediaSession.setPositionState({
         duration: getEffectiveDuration(),
@@ -132,9 +142,12 @@ export function setupAudioListeners() {
     updateProgress();
     updateMediaPositionState();
   };
+  const onLyricsTimeUpdate = () => {
+    updateSyncedLyrics(audio.currentTime);
+  };
 
   audio.addEventListener("timeupdate", timeupdateCombined, { signal });
-  audio.addEventListener("timeupdate", updateSyncedLyrics, { signal });
+  audio.addEventListener("timeupdate", onLyricsTimeUpdate, { signal });
   const onEnded = () => {
     try {
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "none";
@@ -237,6 +250,7 @@ function endDrag() {
 function seekToPosition(clientX) {
   const { audio, progressBar, progressHandle, durationEl } = musicPlayerState;
   if (!audio || !progressBar) return;
+  if (musicPlayerState.isLiveStream) return;
 
   const rect = progressBar.getBoundingClientRect();
   const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
@@ -265,6 +279,27 @@ export function updateProgress() {
 
   if (!progress || !currentTimeEl || !durationEl) return;
 
+  if (musicPlayerState.isLiveStream) {
+    progress.style.width = `100%`;
+    if (progressHandle) {
+      progressHandle.style.left = `100%`;
+      progressHandle.style.display = `none`;
+    }
+    if (musicPlayerState.progressBar) {
+      musicPlayerState.progressBar.style.cursor = "default";
+    }
+    currentTimeEl.textContent = formatTime(audio?.currentTime || 0);
+    durationEl.textContent = getLiveLabel();
+    return;
+  }
+
+  if (progressHandle) {
+    progressHandle.style.display = "";
+  }
+  if (musicPlayerState.progressBar) {
+    musicPlayerState.progressBar.style.cursor = "";
+  }
+
   if (!isFinite(dur) || dur <= 0) {
     progress.style.width = `0%`;
     if (progressHandle) progressHandle.style.left = `0%`;
@@ -290,6 +325,10 @@ export function updateProgress() {
 export function updateDuration() {
   const { durationEl } = musicPlayerState;
   if (!durationEl) return;
+  if (musicPlayerState.isLiveStream) {
+    durationEl.textContent = getLiveLabel();
+    return;
+  }
   const dur = getEffectiveDuration();
   durationEl.textContent = formatTime(dur);
 }
@@ -329,6 +368,7 @@ function handleWheel(e) {
   e.preventDefault();
   const { audio } = musicPlayerState;
   if (!audio) return;
+  if (musicPlayerState.isLiveStream) return;
 
   const delta = e.deltaY > 0 ? -1 : 1;
   const seekAmount = 1;

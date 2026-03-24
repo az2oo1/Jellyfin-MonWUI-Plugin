@@ -21,6 +21,7 @@ export const musicPlayerState = {
   progressContainer: null,
   progressBar: null,
   currentTrackName: null,
+  currentTrack: null,
   progress: null,
   currentTimeEl: null,
   durationEl: null,
@@ -50,6 +51,11 @@ export const musicPlayerState = {
   isShuffled: false,
   genreFilter: null,
   selectedGenres: [],
+  isLiveStream: false,
+  radioSharedStations: [],
+  radioSearchResults: [],
+  radioModal: null,
+  radioNowPlayingSource: null,
   audio: (() => {
     const audio = new Audio();
     audio.preload = "metadata";

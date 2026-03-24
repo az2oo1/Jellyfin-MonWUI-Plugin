@@ -11,6 +11,7 @@ import { shuffleArray } from "../utils/domUtils.js";
 import { showStatsModal } from "./statsModal.js";
 import { updatePlaylistModal } from "./playlistModal.js";
 import { withServer, withParams, getServerBaseCached } from "../../jfUrl.js";
+import { isRadioTrack } from "../core/radio.js";
 
 console.log("[artistModal] loaded", { hasMusicDB: !!musicDB, hasAddOrUpdate: !!musicDB?.addOrUpdateTracks });
 window.__musicDB = musicDB;
@@ -1816,6 +1817,7 @@ export function setupArtistClickHandler() {
     if (!artistName || artistName === config.languageLabels.artistUnknown) return;
 
     const currentTrack = musicPlayerState.playlist?.[musicPlayerState.currentIndex];
+    if (isRadioTrack(currentTrack)) return;
     const artistId =
       currentTrack?.ArtistItems?.[0]?.Id ||
       currentTrack?.AlbumArtistId ||

@@ -4,27 +4,28 @@ import { getAuthToken, apiUrl } from "../core/auth.js";
 import { musicDB } from "../utils/db.js";
 import { showNotification } from "../ui/notification.js";
 import { parseID3Tags } from "./id3Reader.js";
+import { isRadioTrack } from "../core/radio.js";
+import { hasLyricsPayload, normalizeLyricsPayload } from "./normalizer.js";
 
 const config = getConfig();
 
 let fetchAbort = null;
 let currentRequestKey = null;
-let rafId = null;
 let audioEndedHandlerAttached = false;
 let lastActiveIdx = -1;
 let lastNextIdx = -1;
 let settingsInitialized = false;
 let settingsRefs = null;
 let contentContainer = null;
-
-const ENABLE_KARAOKE = Boolean(config.enableKaraokeWords);
+let requestSequence = 0;
 
 function safeClear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
 function buildRequestKey(trackId, source) {
-  return `${trackId}::${source}`;
+  requestSequence += 1;
+  return `${trackId}::${source}::${requestSequence}`;
 }
 
 function cancelOngoingFetch() {
@@ -32,6 +33,10 @@ function cancelOngoingFetch() {
     try { fetchAbort.abort(); } catch {}
   }
   fetchAbort = null;
+}
+
+function getCurrentLyricsTrack(trackOverride = null) {
+  return trackOverride || musicPlayerState.currentTrack || musicPlayerState.playlist[musicPlayerState.currentIndex] || null;
 }
 
 function ensureSettingsUI() {
@@ -182,7 +187,7 @@ function ensureSettingsUI() {
   updateBtn.title = config.languageLabels.updateLyrics || "Şarkı sözünü güncelle";
   updateBtn.innerHTML = '<i class="fa-solid fa-rotate"></i>';
   updateBtn.addEventListener("click", () => {
-    const track = musicPlayerState.playlist[musicPlayerState.currentIndex];
+    const track = getCurrentLyricsTrack();
     if (track) updateSingleTrackLyrics(track.Id);
   });
 
@@ -218,12 +223,12 @@ function setLoading() {
   contentContainer.appendChild(loading);
 }
 
-function setNoLyrics() {
+function setNoLyrics(message = "") {
   ensureSettingsUI();
   safeClear(contentContainer);
   const n = document.createElement("div");
   n.className = "lyrics-not-found";
-  n.textContent = config.languageLabels.noLyricsFound || "Şarkı sözü yok";
+  n.textContent = message || config.languageLabels.noLyricsFound || "Şarkı sözü yok";
   contentContainer.appendChild(n);
 }
 
@@ -258,9 +263,9 @@ async function fetchLyricsFromServer(trackId, signal) {
       }
 
       const data = (type === "json") ? await res.json() : await res.text();
-      const lyrics = (typeof data === "string") ? data : (data?.Lyrics || data?.lyrics || null);
+      const lyrics = normalizeLyricsPayload(data);
 
-      if (lyrics && lyrics.length > 0) {
+      if (lyrics) {
         return lyrics;
       }
     } catch (err) {
@@ -271,63 +276,75 @@ async function fetchLyricsFromServer(trackId, signal) {
   return null;
 }
 
-export async function fetchLyrics() {
-  const currentTrack = musicPlayerState.playlist[musicPlayerState.currentIndex];
-  if (!currentTrack) return;
+export async function fetchLyrics(trackOverride = null) {
+  const currentTrack = getCurrentLyricsTrack(trackOverride);
+  if (!currentTrack) return null;
+
+  if (isRadioTrack(currentTrack)) {
+    setNoLyrics(config.languageLabels.radioNoLyrics || "Canli radyo yayini icin sarki sozu yok");
+    return null;
+  }
 
   updateSettingsUIFromStorage();
   stopLyricsSync();
   setLoading();
+  const reqKey = buildRequestKey(currentTrack.Id, "fetchLyrics");
+  currentRequestKey = reqKey;
 
-  const cached = musicPlayerState.lyricsCache[currentTrack.Id];
+  const cached = normalizeLyricsPayload(musicPlayerState.lyricsCache[currentTrack.Id]);
+  if (reqKey !== currentRequestKey) return null;
   if (cached) {
+    musicPlayerState.lyricsCache[currentTrack.Id] = cached;
     displayLyrics(cached);
     startLyricsSync();
-    return;
+    return cached;
   }
 
-  const dbLyrics = await musicDB.getLyrics(currentTrack.Id);
+  const dbLyrics = normalizeLyricsPayload(await musicDB.getLyrics(currentTrack.Id));
+  if (reqKey !== currentRequestKey) return null;
   if (dbLyrics) {
     musicPlayerState.lyricsCache[currentTrack.Id] = dbLyrics;
     displayLyrics(dbLyrics);
     startLyricsSync();
-    return;
+    return dbLyrics;
   }
 
   cancelOngoingFetch();
   fetchAbort = new AbortController();
-  const reqKey = buildRequestKey(currentTrack.Id, "fetchLyrics");
   currentRequestKey = reqKey;
 
   try {
-    const serverLyrics = await fetchLyricsFromServer(currentTrack.Id, fetchAbort.signal);
-    if (reqKey !== currentRequestKey) return;
-    if (serverLyrics && serverLyrics.trim()) {
+    const serverLyrics = normalizeLyricsPayload(await fetchLyricsFromServer(currentTrack.Id, fetchAbort.signal));
+    if (reqKey !== currentRequestKey) return null;
+    if (serverLyrics) {
       musicPlayerState.lyricsCache[currentTrack.Id] = serverLyrics;
       try { await musicDB.saveLyrics(currentTrack.Id, serverLyrics); } catch {}
       displayLyrics(serverLyrics);
       startLyricsSync();
-      return;
+      return serverLyrics;
     }
   } catch (e) {
   }
   try {
-    const embedded = await getEmbeddedLyrics(currentTrack.Id);
-    if (embedded?.trim()) {
+    const embedded = normalizeLyricsPayload(await getEmbeddedLyrics(currentTrack.Id));
+    if (reqKey !== currentRequestKey) return null;
+    if (embedded) {
       musicPlayerState.lyricsCache[currentTrack.Id] = embedded;
       try { await musicDB.saveLyrics(currentTrack.Id, embedded); } catch {}
       displayLyrics(embedded);
       startLyricsSync();
-      return;
+      return embedded;
     }
   } catch {
   }
+  if (reqKey !== currentRequestKey) return null;
   setNoLyrics();
+  return null;
 }
 
 export async function getEmbeddedLyrics(trackId) {
   try {
-    const inMem = musicPlayerState.lyricsCache[trackId];
+    const inMem = normalizeLyricsPayload(musicPlayerState.lyricsCache[trackId]);
     if (inMem) return inMem;
 
     cancelOngoingFetch();
@@ -341,7 +358,7 @@ export async function getEmbeddedLyrics(trackId) {
     if (!response.ok) throw new Error("Stream alınamadı");
 
     const buffer = await response.arrayBuffer();
-    const lyrics = await parseID3Tags(buffer);
+    const lyrics = normalizeLyricsPayload(await parseID3Tags(buffer));
     if (lyrics) musicPlayerState.lyricsCache[trackId] = lyrics;
     return lyrics || null;
   } catch (err) {
@@ -350,6 +367,12 @@ export async function getEmbeddedLyrics(trackId) {
 }
 
 export function displayLyrics(data) {
+  const normalized = normalizeLyricsPayload(data);
+  if (!normalized) {
+    setNoLyrics();
+    return;
+  }
+
   ensureSettingsUI();
   safeClear(contentContainer);
 
@@ -360,17 +383,13 @@ export function displayLyrics(data) {
   lastActiveIdx = -1;
   lastNextIdx = -1;
 
-  if (typeof data === "string" && data.trim().startsWith("{")) {
-    try { data = JSON.parse(data); } catch {}
-  }
-
-  if (typeof data === "object" && Array.isArray(data?.Lyrics)) {
-    renderStructuredLyrics(data.Lyrics, contentContainer);
-  } else if (typeof data === "string") {
-    if (data.includes("[")) {
-      renderTimedTextLyrics(data, contentContainer);
+  if (typeof normalized === "object" && Array.isArray(normalized.Lyrics)) {
+    renderStructuredLyrics(normalized.Lyrics, contentContainer);
+  } else if (typeof normalized === "string") {
+    if (normalized.includes("[")) {
+      renderTimedTextLyrics(normalized, contentContainer);
     } else {
-      renderPlainText(data, contentContainer);
+      renderPlainText(normalized, contentContainer);
     }
   }
 }
@@ -400,11 +419,7 @@ function renderStructuredLyrics(lyricsArray, container) {
 
     const textEl = document.createElement("div");
     textEl.className = "lyrics-text";
-    if (ENABLE_KARAOKE) {
-      appendKaraokeWords(textEl, text);
-    } else {
-      textEl.textContent = text;
-    }
+    textEl.textContent = text;
     lineContainer.appendChild(textEl);
 
     frag.appendChild(lineContainer);
@@ -415,16 +430,6 @@ function renderStructuredLyrics(lyricsArray, container) {
   musicPlayerState.currentLyrics = lines;
   musicPlayerState.syncedLyrics.lines = lines;
   musicPlayerState.syncedLyrics.currentLine = -1;
-}
-
-function appendKaraokeWords(target, text) {
-  const words = text.trim().split(/\s+/);
-  for (let i = 0; i < words.length; i++) {
-    const span = document.createElement("span");
-    span.className = "karaoke-word";
-    span.textContent = words[i] + (i === words.length - 1 ? "" : " ");
-    target.appendChild(span);
-  }
 }
 
 function renderTimedTextLyrics(text, container) {
@@ -450,11 +455,7 @@ function renderTimedTextLyrics(text, container) {
 
       const textEl = document.createElement("div");
       textEl.className = "lyrics-text";
-      if (ENABLE_KARAOKE) {
-        appendKaraokeWords(textEl, content.trim());
-      } else {
-        textEl.textContent = content.trim();
-      }
+      textEl.textContent = content.trim();
       lineContainer.appendChild(textEl);
 
       frag.appendChild(lineContainer);
@@ -498,13 +499,14 @@ export function toggleLyrics() {
   if (musicPlayerState.lyricsActive) {
     el.classList.add("lyrics-visible");
     el.classList.remove("lyrics-hidden");
-    musicPlayerState.lyricsBtn.innerHTML = '<i class="fas fa-align-left"></i>';
+    musicPlayerState.lyricsBtn.innerHTML = '<i class="fa-regular fa-closed-captioning"></i>';
     fetchLyrics();
   } else {
     el.classList.remove("lyrics-visible");
     el.classList.add("lyrics-hidden");
-    musicPlayerState.lyricsBtn.innerHTML = '<i class="fas fa-align-left"></i>';
+    musicPlayerState.lyricsBtn.innerHTML = '<i class="fa-regular fa-closed-captioning"></i>';
     stopLyricsSync();
+    currentRequestKey = null;
     cancelOngoingFetch();
   }
 }
@@ -513,12 +515,15 @@ export function showNoLyricsMessage() { setNoLyrics(); }
 export function showLyricsError(msg) { setError(msg); }
 
 export function updateSyncedLyrics(currentTime) {
+  const playbackTime = typeof currentTime === "number"
+    ? currentTime
+    : (musicPlayerState.audio?.currentTime || 0);
   const lines = musicPlayerState.currentLyrics;
   if (!lines || lines.length === 0) return;
 
   const delay = parseFloat(localStorage.getItem("lyricsDelay")) || 0;
   const duration = parseFloat(localStorage.getItem("lyricsDuration")) || 5;
-  const t = currentTime + delay;
+  const t = playbackTime + delay;
 
   if (t < lines[0].time) {
     setActiveLine(-1, 0);
@@ -628,21 +633,10 @@ export function startLyricsSync() {
     musicPlayerState.audio.addEventListener("ended", onEnded);
     audioEndedHandlerAttached = true;
   }
-
-  if (rafId != null) cancelAnimationFrame(rafId);
-  const tick = () => {
-    if (!musicPlayerState.audio) return;
-    updateSyncedLyrics(musicPlayerState.audio.currentTime);
-    rafId = requestAnimationFrame(tick);
-  };
-  rafId = requestAnimationFrame(tick);
+  updateSyncedLyrics(musicPlayerState.audio?.currentTime || 0);
 }
 
-function stopLyricsSync() {
-  if (rafId != null) {
-    cancelAnimationFrame(rafId);
-    rafId = null;
-  }
+export function stopLyricsSync() {
   if (audioEndedHandlerAttached && musicPlayerState.audio && musicPlayerState._lyricsOnEnded) {
     try {
       musicPlayerState.audio.removeEventListener("ended", musicPlayerState._lyricsOnEnded);
@@ -653,30 +647,25 @@ function stopLyricsSync() {
 }
 
 async function updateSingleTrackLyrics(trackId) {
+  if (String(trackId || "").startsWith("radio:")) {
+    setNoLyrics(config.languageLabels.radioNoLyrics || "Canli radyo yayini icin sarki sozu yok");
+    return false;
+  }
+
   try {
     delete musicPlayerState.lyricsCache[trackId];
     await musicDB.deleteLyrics(trackId);
-    const track = musicPlayerState.playlist.find(t => t.Id === trackId);
-    if (track) {
-      const originalIndex = musicPlayerState.currentIndex;
-      const originalPlaylist = [...musicPlayerState.playlist];
+    const track = musicPlayerState.playlist.find(t => t.Id === trackId)
+      || (musicPlayerState.currentTrack?.Id === trackId ? musicPlayerState.currentTrack : { Id: trackId });
+    const lyrics = await fetchLyrics(track);
 
-      musicPlayerState.playlist = [track];
-      musicPlayerState.currentIndex = 0;
-
-      await fetchLyrics();
-
-      musicPlayerState.playlist = originalPlaylist;
-      musicPlayerState.currentIndex = originalIndex;
-
-      if (musicPlayerState.lyricsCache[trackId]) {
-        showNotification(
-          `<i class="fas fa-closed-captioning"></i> ${config.languageLabels.syncSingle}`,
-          2000,
-          "db"
-        );
-        return true;
-      }
+    if (hasLyricsPayload(lyrics)) {
+      showNotification(
+        `<i class="fas fa-closed-captioning"></i> ${config.languageLabels.syncSingle}`,
+        2000,
+        "db"
+      );
+      return true;
     }
   } catch (err) {
     console.error("Şarkı sözü güncelleme hatası:", err);

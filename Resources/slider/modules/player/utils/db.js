@@ -1,4 +1,5 @@
 import { musicPlayerState } from "../core/state.js";
+import { buildLyricsRecord, normalizeLyricsPayload } from "../lyrics/normalizer.js";
 
 class MusicDB {
   constructor() {
@@ -302,11 +303,11 @@ class MusicDB {
 
   async saveLyrics(trackId, data) {
     await this._ensure();
+    const record = buildLyricsRecord(trackId, data);
+    if (!record) return;
+
     return new Promise((resolve, reject) => {
-      const req = this._tx(this.lyricsStoreName, "readwrite").put({
-        trackId,
-        ...data,
-      });
+      const req = this._tx(this.lyricsStoreName, "readwrite").put(record);
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
@@ -316,7 +317,7 @@ class MusicDB {
     await this._ensure();
     return new Promise((resolve) => {
       const req = this._tx(this.lyricsStoreName).get(trackId);
-      req.onsuccess = () => resolve(req.result || null);
+      req.onsuccess = () => resolve(normalizeLyricsPayload(req.result) || null);
       req.onerror = () => resolve(null);
     });
   }

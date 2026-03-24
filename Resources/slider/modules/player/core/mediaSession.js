@@ -2,6 +2,7 @@ import { musicPlayerState } from "./state.js";
 import { togglePlayPause, playPrevious, playNext } from "../player/playback.js";
 import { getServerAddress } from "../../config.js";
 import { makeCleanupBag, addEvent } from "../utils/cleanup.js";
+import { getRadioTrackArtistLine, getRadioTrackDisplayInfo, isRadioTrack, resolveRadioStationArtUrl } from "./radio.js";
 
 const DEFAULT_ARTWORK_URL = "./slider/src/images/defaultArt.png";
 
@@ -68,12 +69,14 @@ function setupHeadphoneControls() {
 function handleSeekBackward() {
   const a = musicPlayerState.audio;
   if (!a) return;
+  if (musicPlayerState.isLiveStream) return;
   a.currentTime = Math.max(0, a.currentTime - 10);
   updatePositionState();
 }
 function handleSeekForward() {
   const a = musicPlayerState.audio;
   if (!a) return;
+  if (musicPlayerState.isLiveStream) return;
   const dur = getEffectiveDuration();
   a.currentTime = Math.min(isFinite(dur) ? dur : a.duration || Infinity, a.currentTime + 10);
   updatePositionState();
@@ -81,6 +84,7 @@ function handleSeekForward() {
 function handleSeekTo(details) {
   const a = musicPlayerState.audio;
   if (!a) return;
+  if (musicPlayerState.isLiveStream) return;
   if (details?.seekTime != null) {
     a.currentTime = details.seekTime;
     updatePositionState();
@@ -98,6 +102,7 @@ export function updatePositionState() {
   if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
   const a = musicPlayerState.audio;
   if (!a) return;
+  if (musicPlayerState.isLiveStream) return;
 
   const duration = getEffectiveDuration();
   if (!isFinite(duration) || duration <= 0) return;
@@ -116,14 +121,22 @@ export async function updateMediaMetadata(track) {
   if (!("mediaSession" in navigator)) return;
 
   try {
+    const radioDisplay = isRadioTrack(track)
+      ? getRadioTrackDisplayInfo(track)
+      : null;
     const metadata = {
-      title: track?.Name || track?.title || "Unknown Track",
+      title: radioDisplay?.title || track?.Name || track?.title || "Unknown Track",
       artist:
+        radioDisplay?.artist
+        ||
+        (isRadioTrack(track) ? getRadioTrackArtistLine(track) : "")
+        ||
         track?.Artists?.join(", ") ||
         track?.ArtistItems?.map((a) => a.Name).join(", ") ||
+        track?.Country ||
         track?.artist ||
         "Unknown Artist",
-      album: track?.Album || "Unknown Album",
+      album: radioDisplay?.stationName || track?.Album || track?.Language || "Unknown Album",
       artwork: await getTrackArtwork(track)
     };
 
@@ -135,6 +148,20 @@ export async function updateMediaMetadata(track) {
 }
 
 async function getTrackArtwork(track) {
+  const safeRadioArtwork = isRadioTrack(track)
+    ? await resolveRadioStationArtUrl(track)
+    : null;
+
+  if (safeRadioArtwork) {
+    return [
+      {
+        src: safeRadioArtwork,
+        sizes: "512x512",
+        type: "image/png"
+      }
+    ];
+  }
+
   if (track?.AlbumPrimaryImageTag || track?.PrimaryImageTag) {
     const imageId = track.AlbumId || track.Id;
     const serverAddress = getServerAddress();
@@ -163,6 +190,10 @@ function updatePlaybackState() {
 
 function getEffectiveDuration() {
   const { audio, currentTrack } = musicPlayerState;
+
+  if (musicPlayerState.isLiveStream || isRadioTrack(currentTrack)) {
+    return Number.NaN;
+  }
 
   if (audio && isFinite(audio.duration) && audio.duration > 0) {
     return audio.duration;

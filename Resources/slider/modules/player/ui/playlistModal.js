@@ -8,6 +8,7 @@ import { readID3Tags } from "../lyrics/id3Reader.js";
 import { showGenreFilterModal } from "./genreFilterModal.js";
 import { withServer, withParams } from "../../jfUrl.js";
 import { getAuthToken } from "../core/auth.js";
+import { isRadioTrack, resolveRadioStationArtUrl } from "../core/radio.js";
 
 const config = getConfig();
 
@@ -494,6 +495,22 @@ function disconnectItemsObserver() {
   playlistItemsObserver = null;
 }
 
+export function destroyPlaylistModal() {
+  removeOutsideClickListener();
+  disconnectItemsObserver();
+  try { musicPlayerState.selectedTracks?.clear?.(); } catch {}
+  musicPlayerState.selectedTracks = new Set();
+
+  document.querySelectorAll(".playlist-save-modal").forEach((modal) => {
+    try { modal.remove(); } catch {}
+  });
+
+  try { musicPlayerState.playlistModal?.remove?.(); } catch {}
+  musicPlayerState.playlistModal = null;
+  musicPlayerState.playlistItemsContainer = null;
+  musicPlayerState.playlistSearchInput = null;
+}
+
 export async function updatePlaylistModal() {
   const itemsContainer = musicPlayerState.playlistItemsContainer;
   itemsContainer.innerHTML = "";
@@ -603,6 +620,14 @@ async function loadImageForItem(item, index) {
   img.style.backgroundImage = DEFAULT_ARTWORK;
 
   try {
+    if (isRadioTrack(track)) {
+      const radioArt = await resolveRadioStationArtUrl(track);
+      if (radioArt) {
+        img.style.backgroundImage = `url('${radioArt}')`;
+      }
+      return;
+    }
+
     const imageTag = track.AlbumPrimaryImageTag || track.PrimaryImageTag;
     if (imageTag) {
       const imageId = track.AlbumId || track.Id;
