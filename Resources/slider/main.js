@@ -30,6 +30,185 @@ import { initSubtitleCustomizer } from "./modules/subtitleCustomizer.js";
 import { initOsdHeaderRatings } from "./modules/osdHeaderRatings.js";
 import { openDetailsModal } from "./modules/detailsModal.js";
 const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 0));
+const MATERIAL_ICONS_REPAIR_STYLE_ID = "jms-material-icons-utf8-repair";
+const MATERIAL_ICONS_PROBE_CLASS = "_10k";
+const MATERIAL_ICONS_PROBE_CONTENT = "\ue951";
+let materialIconsRepairPromise = null;
+
+function stripComputedContentQuotes(value) {
+  return String(value || "").replace(/^['"]|['"]$/g, "");
+}
+
+function readMaterialIconsProbeState() {
+  const host = document.body || document.documentElement;
+  if (!host) return { ready: false, broken: false, content: "" };
+
+  const probe = document.createElement("span");
+  probe.className = `material-icons ${MATERIAL_ICONS_PROBE_CLASS}`;
+  probe.setAttribute("aria-hidden", "true");
+  probe.style.cssText = [
+    "position:absolute",
+    "left:-9999px",
+    "top:0",
+    "visibility:hidden",
+    "pointer-events:none"
+  ].join(";");
+
+  host.appendChild(probe);
+
+  let content = "";
+  try {
+    content = stripComputedContentQuotes(getComputedStyle(probe, "::before").content);
+  } catch {}
+
+  probe.remove();
+
+  if (!content || content === "none" || content === "normal") {
+    return { ready: false, broken: false, content };
+  }
+
+  const normalized = content.toLowerCase();
+  if (content === MATERIAL_ICONS_PROBE_CONTENT || normalized === "\\e951" || normalized === "\\ue951") {
+    return { ready: true, broken: false, content };
+  }
+
+  return {
+    ready: true,
+    broken: Array.from(content).length !== 1 || content !== MATERIAL_ICONS_PROBE_CONTENT,
+    content
+  };
+}
+
+function escapeNonAsciiCss(cssText) {
+  let out = "";
+  for (const ch of String(cssText || "")) {
+    const code = ch.codePointAt(0);
+    if (code === 9 || code === 10 || code === 13) {
+      out += ch;
+      continue;
+    }
+    if (code >= 0x20 && code <= 0x7e) {
+      out += ch;
+      continue;
+    }
+    out += `\\${code.toString(16)} `;
+  }
+  return out;
+}
+
+function scoreMaterialIconsHref(href) {
+  const text = String(href || "");
+  let score = 0;
+  if (/\/46967\./i.test(text)) score += 100;
+  if (/\/\d+\.[^/]+\.css(?:[?#].*)?$/i.test(text)) score += 25;
+  if (/main\.jellyfin\./i.test(text)) score -= 10;
+  return score;
+}
+
+async function loadMaterialIconsStylesheetUtf8() {
+  const links = Array.from(document.querySelectorAll('link[rel="stylesheet"][href]'));
+  const hrefs = [...new Set(
+    links
+      .map((link) => link.href)
+      .filter(Boolean)
+      .sort((a, b) => scoreMaterialIconsHref(b) - scoreMaterialIconsHref(a))
+  )];
+
+  for (const href of hrefs) {
+    try {
+      const response = await fetch(href, {
+        credentials: "same-origin",
+        cache: "force-cache"
+      });
+      if (!response.ok) continue;
+
+      const cssText = new TextDecoder("utf-8").decode(await response.arrayBuffer());
+      if (!/font-family\s*:\s*Material Icons/i.test(cssText)) continue;
+      return { href, cssText };
+    } catch {}
+  }
+
+  return null;
+}
+
+function injectMaterialIconsRepair(cssText, sourceHref) {
+  const doc = document;
+  const root = doc.head || doc.documentElement;
+  if (!root) return false;
+
+  let style = doc.getElementById(MATERIAL_ICONS_REPAIR_STYLE_ID);
+  if (!style) {
+    style = doc.createElement("style");
+    style.id = MATERIAL_ICONS_REPAIR_STYLE_ID;
+    style.setAttribute("data-jms", "material-icons-utf8-repair");
+    root.appendChild(style);
+  }
+
+  if (sourceHref) {
+    style.setAttribute("data-source-href", sourceHref);
+  }
+  style.textContent = escapeNonAsciiCss(cssText);
+  return true;
+}
+
+async function ensureMaterialIconsUtf8Integrity() {
+  if (materialIconsRepairPromise) return materialIconsRepairPromise;
+
+  materialIconsRepairPromise = (async () => {
+    const state = readMaterialIconsProbeState();
+    if (!state.ready || !state.broken) return false;
+
+    const stylesheet = await loadMaterialIconsStylesheetUtf8();
+    if (!stylesheet?.cssText) return false;
+
+    const repaired = injectMaterialIconsRepair(stylesheet.cssText, stylesheet.href);
+    if (repaired) {
+      console.warn("[jms] Material Icons UTF-8 repair applied", {
+        source: stylesheet.href,
+        brokenContent: state.content
+      });
+    }
+    return repaired;
+  })().finally(() => {
+    materialIconsRepairPromise = null;
+  });
+
+  return materialIconsRepairPromise;
+}
+
+function installMaterialIconsUtf8Guard() {
+  if (window.__jmsMaterialIconsUtf8GuardInstalled) return;
+  window.__jmsMaterialIconsUtf8GuardInstalled = true;
+
+  const scheduleCheck = (delay = 0) => {
+    setTimeout(() => {
+      ensureMaterialIconsUtf8Integrity().catch(() => {});
+    }, delay);
+  };
+
+  [0, 250, 1200, 3000].forEach(scheduleCheck);
+  window.addEventListener("load", () => scheduleCheck(0), { once: true });
+
+  try {
+    const head = document.head || document.documentElement;
+    if (!head) return;
+    const observer = new MutationObserver(() => {
+      clearTimeout(window.__jmsMaterialIconsUtf8GuardTimer);
+      window.__jmsMaterialIconsUtf8GuardTimer = setTimeout(() => {
+        ensureMaterialIconsUtf8Integrity().catch(() => {});
+      }, 80);
+    });
+    observer.observe(head, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "rel", "media", "disabled"]
+    });
+    window.__jmsMaterialIconsUtf8GuardObserver = observer;
+  } catch {}
+}
+
+installMaterialIconsUtf8Guard();
 
 function installHomeTabSliderOnlyGate() {
   if (window.__homeTabSliderOnlyGateInstalled) return;
