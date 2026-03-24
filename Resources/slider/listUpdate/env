@@ -1,2 +1,0 @@
-export JELLYFIN_URL="http://jellyfin-url:port"
-export JELLYFIN_TOKEN="api-key"
