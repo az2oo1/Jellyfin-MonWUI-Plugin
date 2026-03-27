@@ -222,7 +222,8 @@ function applyLiteFeatureSelection(baseConfig) {
   cfg.enableDirectorRows = false;
   cfg.enableRecentRows = false;
   cfg.enablePersonalRecommendations = false;
-  cfg.enableStudioHubs = false;
+  cfg.enableGenreHubs = false;
+  cfg.enableStudioHubs = true;
   cfg.enableContinueMovies = false;
   cfg.enableContinueSeries = false;
   cfg.enableRecentMoviesRow = false;
