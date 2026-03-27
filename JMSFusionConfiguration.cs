@@ -40,6 +40,12 @@ namespace Jellyfin.Plugin.JMSFusion
         [JsonPropertyName("enableTransformEngine")]
         public bool EnableTransformEngine { get; set; } = true;
 
+        [JsonPropertyName("useExternalFileTransformation")]
+        public bool UseExternalFileTransformation { get; set; } = true;
+
+        [JsonPropertyName("enableLegacyIndexInjection")]
+        public bool EnableLegacyIndexInjection { get; set; } = false;
+
         [JsonPropertyName("enableTrailerDownloader")]
         public bool EnableTrailerDownloader { get; set; } = false;
 

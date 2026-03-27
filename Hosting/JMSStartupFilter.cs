@@ -54,105 +54,108 @@ namespace Jellyfin.Plugin.JMSFusion
                     }
                 }
 
-                app.Use(async (ctx, nextMiddleware) =>
+                if (JMSFusionPlugin.Instance?.Configuration.EnableLegacyIndexInjection == true)
                 {
-                    if (!HttpMethods.IsGet(ctx.Request.Method))
+                    app.Use(async (ctx, nextMiddleware) =>
                     {
-                        await nextMiddleware();
-                        return;
-                    }
-
-                    if (!IsIndexRequest(ctx.Request.Path))
-                    {
-                        await nextMiddleware();
-                        return;
-                    }
-
-                    var reqLogger = ctx.RequestServices.GetRequiredService<ILogger<JMSStartupFilter>>();
-                    var originalAcceptEncoding = ctx.Request.Headers["Accept-Encoding"].ToString();
-                    ctx.Request.Headers["Accept-Encoding"] = "identity";
-
-                    var originalBody = ctx.Response.Body;
-                    await using var mem = new MemoryStream();
-                    ctx.Response.Body = mem;
-
-                    try
-                    {
-                        await nextMiddleware();
-
-                        if (ctx.Response.StatusCode != StatusCodes.Status200OK)
+                        if (!HttpMethods.IsGet(ctx.Request.Method))
                         {
-                            mem.Position = 0;
-                            await mem.CopyToAsync(originalBody);
+                            await nextMiddleware();
                             return;
                         }
 
-                        var contentType = ctx.Response.ContentType ?? string.Empty;
-                        if (!contentType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase))
+                        if (!IsIndexRequest(ctx.Request.Path))
                         {
-                            mem.Position = 0;
-                            await mem.CopyToAsync(originalBody);
+                            await nextMiddleware();
                             return;
                         }
 
-                        if (ctx.Response.Headers.ContainsKey("Content-Encoding"))
-                        {
-                            ctx.Response.Headers.Remove("Content-Encoding");
-                        }
+                        var reqLogger = ctx.RequestServices.GetRequiredService<ILogger<JMSStartupFilter>>();
+                        var originalAcceptEncoding = ctx.Request.Headers["Accept-Encoding"].ToString();
+                        ctx.Request.Headers["Accept-Encoding"] = "identity";
 
-                        mem.Position = 0;
-                        string html;
-                        using (var reader = new StreamReader(
-                                mem,
-                                Encoding.UTF8,
-                                detectEncodingFromByteOrderMarks: true,
-                                bufferSize: 8192,
-                                leaveOpen: true))
-                        {
-                            html = await reader.ReadToEndAsync();
-                        }
+                        var originalBody = ctx.Response.Body;
+                        await using var mem = new MemoryStream();
+                        ctx.Response.Body = mem;
 
-                        if (html.IndexOf("<!-- SL-INJECT BEGIN -->", StringComparison.OrdinalIgnoreCase) < 0)
+                        try
                         {
-                            var pathBase = ctx.Request.PathBase.HasValue ? ctx.Request.PathBase.Value : null;
-                            var snippet = JMSFusionPlugin.Instance.BuildScriptsHtml(pathBase);
+                            await nextMiddleware();
 
-                            var headEnd = html.IndexOf("</head>", StringComparison.OrdinalIgnoreCase);
-                            if (headEnd >= 0)
+                            if (ctx.Response.StatusCode != StatusCodes.Status200OK)
                             {
-                                html = html.Insert(headEnd, "\n" + snippet + "\n");
+                                mem.Position = 0;
+                                await mem.CopyToAsync(originalBody);
+                                return;
+                            }
+
+                            var contentType = ctx.Response.ContentType ?? string.Empty;
+                            if (!contentType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase))
+                            {
+                                mem.Position = 0;
+                                await mem.CopyToAsync(originalBody);
+                                return;
+                            }
+
+                            if (ctx.Response.Headers.ContainsKey("Content-Encoding"))
+                            {
+                                ctx.Response.Headers.Remove("Content-Encoding");
+                            }
+
+                            mem.Position = 0;
+                            string html;
+                            using (var reader = new StreamReader(
+                                    mem,
+                                    Encoding.UTF8,
+                                    detectEncodingFromByteOrderMarks: true,
+                                    bufferSize: 8192,
+                                    leaveOpen: true))
+                            {
+                                html = await reader.ReadToEndAsync();
+                            }
+
+                            if (html.IndexOf("<!-- SL-INJECT BEGIN -->", StringComparison.OrdinalIgnoreCase) < 0)
+                            {
+                                var pathBase = ctx.Request.PathBase.HasValue ? ctx.Request.PathBase.Value : null;
+                                var snippet = JMSFusionPlugin.Instance.BuildScriptsHtml(pathBase);
+
+                                var headEnd = html.IndexOf("</head>", StringComparison.OrdinalIgnoreCase);
+                                if (headEnd >= 0)
+                                {
+                                    html = html.Insert(headEnd, "\n" + snippet + "\n");
+                                }
+                                else
+                                {
+                                    html = html + "\n" + snippet + "\n";
+                                }
+                            }
+
+                            var outBytes = Encoding.UTF8.GetBytes(html);
+                            ctx.Response.ContentLength = outBytes.Length;
+
+                            await originalBody.WriteAsync(outBytes, 0, outBytes.Length, ctx.RequestAborted);
+                        }
+                        catch (Exception ex)
+                        {
+                            reqLogger.LogWarning(ex, "[JMSFusion] In-memory index.html injection failed, falling back to original body.");
+                            mem.Position = 0;
+                            await mem.CopyToAsync(originalBody);
+                        }
+                        finally
+                        {
+                            if (string.IsNullOrEmpty(originalAcceptEncoding))
+                            {
+                                ctx.Request.Headers.Remove("Accept-Encoding");
                             }
                             else
                             {
-                                html = html + "\n" + snippet + "\n";
+                                ctx.Request.Headers["Accept-Encoding"] = originalAcceptEncoding;
                             }
-                        }
 
-                        var outBytes = Encoding.UTF8.GetBytes(html);
-                        ctx.Response.ContentLength = outBytes.Length;
-
-                        await originalBody.WriteAsync(outBytes, 0, outBytes.Length, ctx.RequestAborted);
-                    }
-                    catch (Exception ex)
-                    {
-                        reqLogger.LogWarning(ex, "[JMSFusion] In-memory index.html injection failed, falling back to original body.");
-                        mem.Position = 0;
-                        await mem.CopyToAsync(originalBody);
-                    }
-                    finally
-                    {
-                        if (string.IsNullOrEmpty(originalAcceptEncoding))
-                        {
-                            ctx.Request.Headers.Remove("Accept-Encoding");
+                            ctx.Response.Body = originalBody;
                         }
-                        else
-                        {
-                            ctx.Request.Headers["Accept-Encoding"] = originalAcceptEncoding;
-                        }
-
-                        ctx.Response.Body = originalBody;
-                    }
-                });
+                    });
+                }
 
                 next(app);
             };

@@ -210,6 +210,48 @@ function installMaterialIconsUtf8Guard() {
 
 installMaterialIconsUtf8Guard();
 
+const JMS_LITE_FEATURES_ONLY = true;
+
+function applyLiteFeatureSelection(baseConfig) {
+  if (!JMS_LITE_FEATURES_ONLY) return baseConfig || {};
+
+  const cfg = { ...(baseConfig || {}) };
+
+  cfg.enableSlider = false;
+  cfg.enableNotifications = false;
+  cfg.enableDirectorRows = false;
+  cfg.enableRecentRows = false;
+  cfg.enablePersonalRecommendations = false;
+  cfg.enableStudioHubs = false;
+  cfg.enableContinueMovies = false;
+  cfg.enableContinueSeries = false;
+  cfg.enableRecentMoviesRow = false;
+  cfg.enableRecentSeriesRow = false;
+  cfg.enableRecentMusicRow = false;
+  cfg.enableRecentMusicTracksRow = false;
+  cfg.enableRecentEpisodesRow = false;
+  cfg.enableBecauseYouWatched = false;
+  cfg.enabledGmmp = false;
+  cfg.enableSubtitleCustomizer = false;
+
+  cfg.enableProfileChooser = true;
+  cfg.createAvatar = true;
+  cfg.previewModal = true;
+  cfg.allPreviewModal = true;
+  cfg.globalPreviewMode = "modal";
+  cfg.preferTrailersInPreviewModal = true;
+  cfg.onlyTrailerInPreviewModal = false;
+  cfg.disableAllPlayback = false;
+  cfg.enableTrailerThenVideo = true;
+
+  cfg.pauseOverlay = {
+    ...(cfg.pauseOverlay || {}),
+    showAgeBadge: true,
+  };
+
+  return cfg;
+}
+
 function installHomeTabSliderOnlyGate() {
   if (window.__homeTabSliderOnlyGateInstalled) return;
   window.__homeTabSliderOnlyGateInstalled = true;
@@ -696,7 +738,10 @@ function getSlideDurationMs() {
   }
 })();
 
-const config = getConfig();
+const config = applyLiteFeatureSelection(getConfig());
+if (JMS_LITE_FEATURES_ONLY) {
+  window.__JMS_GLOBAL_CONFIG__ = config;
+}
 syncProfileChooserHeaderButtonVisibility(config?.enableProfileChooser !== false);
 
 function isSliderEnabled() {
@@ -823,17 +868,28 @@ function runNonCriticalUiBootOnce() {
   }, 7000);
 }
 
-forceSkinHeaderPointerEvents();
-forceHomeSectionsTop();
+if (!JMS_LITE_FEATURES_ONLY) {
+  forceSkinHeaderPointerEvents();
+  forceHomeSectionsTop();
+}
 const cleanupAvatarPicker = initUserProfileAvatarPicker();
 window.cleanupAvatarPicker = cleanupAvatarPicker;
-const cleanupSubtitleCustomizer = initSubtitleCustomizer();
-window.cleanupSubtitleCustomizer = cleanupSubtitleCustomizer;
+if (!window.cleanupAvatarSystem) {
+  try {
+    window.cleanupAvatarSystem = initAvatarSystem();
+  } catch {}
+}
+if (!JMS_LITE_FEATURES_ONLY) {
+  const cleanupSubtitleCustomizer = initSubtitleCustomizer();
+  window.cleanupSubtitleCustomizer = cleanupSubtitleCustomizer;
+}
 const cleanupOsdHeaderRatings = initOsdHeaderRatings();
 window.cleanupOsdHeaderRatings = cleanupOsdHeaderRatings;
 
 const NOTIF_ENABLED = !!(config && config.enableNotifications);
-forcejfNotifBtnPointerEvents();
+if (!JMS_LITE_FEATURES_ONLY) {
+  forcejfNotifBtnPointerEvents();
+}
 try {
   if (!window.cleanupProfileChooser) {
     window.cleanupProfileChooser = initProfileChooser();
